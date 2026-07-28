@@ -1,0 +1,68 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync fork with upstream
+        run: |
+          git remote add upstream https://github.com/thedotmack/claude-mem.git
+          git fetch upstream --tags --force
+
+          # Fast-forward default branch
+          git checkout main
+          git merge upstream/main --ff-only || echo "Cannot fast-forward main, skipping branch sync"
+          git push origin main --tags || echo "Push failed, may need manual resolution"
+
+      - name: Check for new tags
+        id: new_tags
+        run: |
+          git fetch origin --tags
+          git fetch upstream --tags
+
+          # Find tags in upstream that don't exist in origin
+          NEW_TAGS=""
+          for tag in $(git tag -l 'v*' --sort=-v:refname | head -5); do
+            if ! git ls-remote --tags origin "$tag" | grep -q "$tag"; then
+              NEW_TAGS="$tag $NEW_TAGS"
+            fi
+          done
+
+          if [ -n "$NEW_TAGS" ]; then
+            echo "new_tags=$NEW_TAGS" >> "$GITHUB_OUTPUT"
+            LATEST=$(echo "$NEW_TAGS" | tr ' ' '\n' | sort -V | tail -1)
+            echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
+            echo "Found new tags: $NEW_TAGS"
+          else
+            echo "No new tags found"
+          fi
+
+      - name: Trigger Docker build for new tags
+        if: steps.new_tags.outputs.latest != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const tags = '${{ steps.new_tags.outputs.new_tags }}'.trim().split(/\s+/).filter(Boolean);
+            for (const tag of tags) {
+              console.log(`Triggering Docker build for ${tag}`);
+              await github.rest.actions.createWorkflowDispatch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: 'docker-build.yml',
+                ref: 'main',
+                inputs: { version: tag }
+              });
+            }
