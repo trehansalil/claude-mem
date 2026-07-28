@@ -50,6 +50,7 @@ jobs:
         with:
           context: .
           file: docker/claude-mem/Dockerfile
+          platforms: linux/amd64
           push: true
           tags: |
             ghcr.io/trehansalil/claude-mem:${{ steps.version.outputs.tag }}
