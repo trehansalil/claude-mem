@@ -81,6 +81,21 @@ const DEFAULT_CACHE_TTL_SECONDS = 60;
 const MAX_OPS_PER_PUSH = 500; // mirrors the getChanges page cap
 const MAX_PUSH_BODY_BYTES = 8_000_000;
 const CANONICAL_DECIMAL = /^(?:0|[1-9][0-9]*)$/;
+// Scheduled repair is deliberately incremental. One page is at most 100 ops or
+// 4 MB, so a deeply lagging user cannot monopolize a cron request or keep the
+// per-user projection lease busy while every other user waits.
+const REPAIR_DRAIN_MAX_PAGES = 1;
+
+/**
+ * Poll/kill-switch request-path budget. A page is ≤100 ops, so 8 pages covers
+ * one max push (500) plus the 40–200 seq lags seen when #4140 skipped drain
+ * entirely. Remaining catch-up is waitUntil + client retry, never a 200 with
+ * head_seq > projected_seq.
+ */
+export const POLL_PUSH_DRAIN_MAX_PAGES = 8;
+
+/** waitUntil continuation after a bounded poll-mode push that still lags. */
+export const POLL_CATCHUP_MAX_PAGES = 32;
 
 /**
  * Pro declares a 60-second maximum duration. Abort the complete response-body
@@ -310,6 +325,10 @@ async function handlePushOps(
 	userId: string,
 	deviceId: string,
 	deviceName: string | null,
+	options: {
+		pollMode?: boolean;
+		waitUntil?: (promise: Promise<unknown>) => void;
+	} = {},
 ): Promise<Response> {
 	const raw = await request.text();
 	// Deliberate 413s (see the cap constants above): an oversize batch must
@@ -347,20 +366,58 @@ async function handlePushOps(
 		if ("refused" in result) {
 			return errorResponse(result.error === DEVICE_LIMIT_ERROR ? 409 : 400, result.error);
 		}
-		const projection = await drainProjection(env, userId, result.head_seq);
-		if (!projection.ok) {
-			return json(projection.httpStatus, {
-				error: projection.error,
+		// Hypothesis: logging sample cut ≠ customer pain. #4140
+		// skipProjectionDrain under kill-switch left head_seq ahead of
+		// projected_seq and still returned 200; CloudSync rejects that
+		// (head_seq <= projected_seq). 1% Workers Logs never advanced the
+		// checkpoint. The cost cuts that stay: refuse WS (idle DO pin),
+		// drop extra getProjectionState/heartbeat knocks inside drain.
+		// Poll mode (PLAN.md path A) bounds the request-path drain and
+		// continues via waitUntil — it never lies with a lagged 200.
+		const projection = await drainProjection(env, userId, result.head_seq, {
+			...(options.pollMode ? { maxPages: POLL_PUSH_DRAIN_MAX_PAGES } : {}),
+		});
+		if (projection.ok && decimalAtLeast(projection.projectedSeq, result.head_seq)) {
+			return json(200, { ...result, projected_seq: projection.projectedSeq });
+		}
+		if (projection.ok) {
+			scheduleProjectionCatchUp(env, userId, result.head_seq, options.waitUntil);
+			return json(503, {
+				error: "projection_catching_up",
 				durable: true,
-				retryable: projection.retryable,
+				retryable: true,
 				head_seq: result.head_seq,
 				projected_seq: projection.projectedSeq,
 			});
 		}
-		return json(200, { ...result, projected_seq: projection.projectedSeq });
+		return json(projection.httpStatus, {
+			error: projection.error,
+			durable: true,
+			retryable: projection.retryable,
+			head_seq: result.head_seq,
+			projected_seq: projection.projectedSeq,
+		});
 	} catch (e) {
 		return mapHubError(e);
 	}
+}
+
+function scheduleProjectionCatchUp(
+	env: Env,
+	userId: string,
+	targetSeq: string,
+	waitUntil?: (promise: Promise<unknown>) => void,
+): void {
+	if (!waitUntil) return;
+	waitUntil((async () => {
+		try {
+			await drainProjection(env, userId, targetSeq, {
+				maxPages: POLL_CATCHUP_MAX_PAGES,
+			});
+		} catch (error) {
+			console.error("sync-hub poll-mode projection catch-up failed:", error);
+		}
+	})());
 }
 
 async function handleGetChanges(
@@ -591,6 +648,8 @@ export interface ProjectionDrainDependencies {
 	fetchImpl?: ProjectionFetch;
 	/** Test seam for deterministic Durable Object lease timestamps. */
 	now?: () => number;
+	/** Optional page budget. Omitted client-triggered drains still reach target. */
+	maxPages?: number;
 }
 
 function projectionNow(dependencies: ProjectionDrainDependencies): number | undefined {
@@ -600,6 +659,13 @@ function projectionNow(dependencies: ProjectionDrainDependencies): number | unde
 /**
  * Drain one user's authoritative Hub checkpoint through targetSeq. The DO
  * only leases/pages/CAS-advances; all outbound I/O remains in this Worker.
+ *
+ * RPC budget (deliberate): one getProjectionState, one acquire, then per page
+ * getProjectionPage + advanceProjectionCheckpoint. acquire already returns
+ * projected_seq, getProjectionPage already renews the 90s lease, and
+ * advance returns the new checkpoint — extra getProjectionState /
+ * heartbeatProjectionLease round-trips were waking SQLite DOs for no
+ * fencing value.
  */
 export async function drainProjection(
 	env: Env,
@@ -607,6 +673,12 @@ export async function drainProjection(
 	targetSeq: string,
 	dependencies: ProjectionDrainDependencies = {},
 ): Promise<DrainResult> {
+	if (
+		dependencies.maxPages !== undefined
+		&& (!Number.isSafeInteger(dependencies.maxPages) || dependencies.maxPages < 1)
+	) {
+		throw new Error("projection maxPages must be a positive safe integer");
+	}
 	const stub = env.SYNC_HUB.getByName(userId);
 	let state = await stub.getProjectionState();
 	if (decimalAtLeast(state.projected_seq, targetSeq)) {
@@ -625,15 +697,20 @@ export async function drainProjection(
 	const lease = acquiredAt === undefined
 		? await stub.acquireProjectionLease(targetSeq)
 		: await stub.acquireProjectionLease(targetSeq, acquiredAt);
-	if (!lease.acquired || !lease.lease_token) {
-		state = await stub.getProjectionState();
-		if (decimalAtLeast(state.projected_seq, targetSeq)) {
-			return { ok: true, projectedSeq: state.projected_seq };
+	// acquire already returns the authoritative checkpoint. A predecessor may
+	// have finished between the initial read and this RPC — use that snapshot
+	// instead of another getProjectionState round-trip.
+	if (decimalAtLeast(lease.projected_seq, targetSeq)) {
+		if (lease.acquired && lease.lease_token) {
+			await stub.releaseProjectionLease(lease.lease_token);
 		}
+		return { ok: true, projectedSeq: lease.projected_seq };
+	}
+	if (!lease.acquired || !lease.lease_token) {
 		return {
 			ok: false,
 			error: "projection_busy",
-			projectedSeq: state.projected_seq,
+			projectedSeq: lease.projected_seq,
 			httpStatus: 503,
 			retryable: true,
 		};
@@ -641,16 +718,13 @@ export async function drainProjection(
 
 	const token = lease.lease_token;
 	let releaseLeaseEarly = false;
+	let projectedPages = 0;
+	let projectedSeq = lease.projected_seq;
 	try {
 		for (;;) {
-			state = await stub.getProjectionState();
-			if (decimalAtLeast(state.projected_seq, targetSeq)) {
-				// A predecessor may have checkpointed and released between our
-				// initial state read and lease acquisition. The authoritative Hub
-				// checkpoint proves it finished, so this otherwise redundant lease
-				// is safe to release immediately.
+			if (decimalAtLeast(projectedSeq, targetSeq)) {
 				releaseLeaseEarly = true;
-				return { ok: true, projectedSeq: state.projected_seq };
+				return { ok: true, projectedSeq };
 			}
 			const pageAt = projectionNow(dependencies);
 			const page = pageAt === undefined
@@ -673,7 +747,7 @@ export async function drainProjection(
 				return {
 					ok: false,
 					error: "projection_page_empty",
-					projectedSeq: state.projected_seq,
+					projectedSeq,
 					httpStatus: 503,
 					retryable: true,
 				};
@@ -689,16 +763,14 @@ export async function drainProjection(
 				return {
 					ok: false,
 					error: "projection_page_too_large",
-					projectedSeq: state.projected_seq,
+					projectedSeq,
 					httpStatus: 503,
 					retryable: true,
 				};
 			}
-			// Renew immediately before the bounded outbound request. The token is
-			// then checked again by advanceProjectionCheckpoint's fenced CAS.
-			const heartbeatAt = projectionNow(dependencies);
-			if (heartbeatAt === undefined) await stub.heartbeatProjectionLease(token);
-			else await stub.heartbeatProjectionLease(token, heartbeatAt);
+			// getProjectionPage already renews the 90s fencing lease. A second
+			// heartbeat RPC here was waking the SQLite DO again for no extra
+			// fencing: Hub abort (45s) is already strictly inside that window.
 			// From this point until a deterministic response/checkpoint outcome,
 			// the upstream may still be applying the request even if our fetch
 			// rejects. Never let a successor overlap that ambiguous predecessor.
@@ -717,7 +789,7 @@ export async function drainProjection(
 					return {
 						ok: false,
 						error: error.message,
-						projectedSeq: state.projected_seq,
+						projectedSeq,
 						httpStatus: 503,
 						retryable: true,
 					};
@@ -725,7 +797,7 @@ export async function drainProjection(
 				return {
 					ok: false,
 					error: "projection_upstream_unreachable",
-					projectedSeq: state.projected_seq,
+					projectedSeq,
 					httpStatus: 503,
 					retryable: true,
 				};
@@ -738,7 +810,7 @@ export async function drainProjection(
 					return {
 						ok: false,
 						error: "projection_upstream_409",
-						projectedSeq: state.projected_seq,
+						projectedSeq,
 						httpStatus: 409,
 						retryable: false,
 					};
@@ -746,7 +818,7 @@ export async function drainProjection(
 				return {
 					ok: false,
 					error: `projection_upstream_${response.status}`,
-					projectedSeq: state.projected_seq,
+					projectedSeq,
 					httpStatus: 503,
 					retryable: true,
 				};
@@ -756,7 +828,7 @@ export async function drainProjection(
 				return {
 					ok: false,
 					error: "projection_response_not_json",
-					projectedSeq: state.projected_seq,
+					projectedSeq,
 					httpStatus: 503,
 					retryable: true,
 				};
@@ -770,7 +842,7 @@ export async function drainProjection(
 				return {
 					ok: false,
 					error: "projection_response_mismatch",
-					projectedSeq: state.projected_seq,
+					projectedSeq,
 					httpStatus: 503,
 					retryable: true,
 				};
@@ -790,7 +862,16 @@ export async function drainProjection(
 					page.through_seq,
 					checkpointAt,
 				);
+			projectedSeq = state.projected_seq;
 			releaseLeaseEarly = true;
+			projectedPages++;
+			if (
+				dependencies.maxPages !== undefined
+				&& projectedPages >= dependencies.maxPages
+				&& !decimalAtLeast(projectedSeq, targetSeq)
+			) {
+				return { ok: true, projectedSeq };
+			}
 		}
 	} catch (error) {
 		return {
@@ -831,7 +912,9 @@ async function handleRepairDrain(request: Request, env: Env): Promise<Response> 
 	if (decimalAtLeast(target, state.head_seq) && target !== state.head_seq) {
 		return errorResponse(400, "through_seq exceeds Hub head_seq");
 	}
-	const drained = await drainProjection(env, record.user_id, target);
+	const drained = await drainProjection(env, record.user_id, target, {
+		maxPages: REPAIR_DRAIN_MAX_PAGES,
+	});
 	const finalState = await stub.getProjectionState();
 	if (!drained.ok) {
 		return json(drained.httpStatus, {
@@ -843,7 +926,13 @@ async function handleRepairDrain(request: Request, env: Env): Promise<Response> 
 			projected_through_seq: finalState.projected_seq,
 		});
 	}
-	return json(200, {
+	// A bounded repair that checkpointed one page is successful progress, but it
+	// is not a completed request until the original target has been reached.
+	// HTTP 202 preserves the existing JSON schema while giving the Pro caller an
+	// explicit continuation signal. Explicit through_seq callers are complete
+	// once their requested target is reached even if newer ops arrived meanwhile.
+	const complete = decimalAtLeast(finalState.projected_seq, target);
+	return json(complete ? 200 : 202, {
 		protocol_version: 1,
 		user_id: record.user_id,
 		epoch: finalState.epoch,
@@ -853,7 +942,7 @@ async function handleRepairDrain(request: Request, env: Env): Promise<Response> 
 }
 
 export default {
-	async fetch(request, env): Promise<Response> {
+	async fetch(request, env, ctx): Promise<Response> {
 		const url = new URL(request.url);
 		const { pathname } = url;
 		if (pathname === "/internal/v1/projection/drain") {
@@ -885,12 +974,14 @@ export default {
 		// Kill switch (plan Phase 5 task 2): one KV read per request, through
 		// the per-isolate cache (KILL_SWITCH_CACHE_MS). Tripped ⇒ WS upgrades
 		// refused below and every HTTP sync response is stamped
-		// `X-Sync-Mode: poll` — the pushes and pulls themselves KEEP WORKING
-		// (poll mode degrades latency, never correctness). Read BEFORE
-		// authenticate so auth-FAILURE responses are stamped too: incidents
-		// correlate, and a tripped switch during a degraded verify upstream
-		// (everything 401/503ing) must still tell clients "poll" — an
-		// unstamped error response must never read as "switch cleared".
+		// `X-Sync-Mode: poll` — the pushes and pulls themselves KEEP WORKING,
+		// including the push-path projection drain that satisfies
+		// head_seq <= projected_seq (poll mode degrades socket latency, never
+		// correctness). Read BEFORE authenticate so auth-FAILURE responses
+		// are stamped too: incidents correlate, and a tripped switch during a
+		// degraded verify upstream (everything 401/503ing) must still tell
+		// clients "poll" — an unstamped error response must never read as
+		// "switch cleared".
 		const killSwitch = await readKillSwitch(env);
 
 		const auth = await authenticateRequest(request, env);
@@ -935,7 +1026,10 @@ export default {
 			if (pathname === "/v1/sync/ops") {
 				if (request.method !== "POST") return errorResponse(405, "use POST");
 				if (!auth.deviceId) return errorResponse(400, "missing X-Device-Id header");
-				return handlePushOps(request, env, auth.userId, auth.deviceId, auth.deviceName);
+				return handlePushOps(request, env, auth.userId, auth.deviceId, auth.deviceName, {
+					pollMode: killSwitch.tripped,
+					waitUntil: (promise) => ctx.waitUntil(promise),
+				});
 			}
 
 			if (pathname === "/v1/sync/changes") {

@@ -3,9 +3,14 @@
  *
  * One KV flag. Tripped ⇒ the front Worker refuses WebSocket upgrades (503 +
  * a JSON body clients recognize) and stamps `X-Sync-Mode: poll` on every HTTP
- * sync response; clients fall back to the Phase 3 poll path. The product
- * stays COMPLETE in poll mode (~$0.03/user/mo indefinitely) — the switch
- * degrades latency, never correctness (prime directive #5: watchdog → poll
+ * sync response. That un-pins idle Durable Objects; it must not skip the
+ * push-path projection drain. Clients require `head_seq <= projected_seq` on
+ * every 200, so poll mode still drains on an active push (bounded pages +
+ * waitUntil catch-up) and still exposes `/internal/v1/projection/drain`.
+ * Extra getProjectionState / heartbeatProjectionLease RPCs stay gone — those
+ * were automated DO storage knocks with no fencing value. The product stays
+ * COMPLETE in poll mode (~$0.03/user/mo indefinitely) — the switch degrades
+ * socket latency, never correctness (prime directive #5: watchdog → poll
  * mode, never "stop working").
  *
  * STORAGE CHOICE — reuse AUTH_CACHE with a distinct `control:` key, not a
