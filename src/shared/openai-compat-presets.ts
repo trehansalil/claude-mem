@@ -71,6 +71,24 @@ export const OPENAI_COMPAT_PRESETS: readonly OpenAICompatPreset[] = [
     hint: 'One sk-orca- key for provider-scoped model ids such as anthropic/claude-haiku-4.5.',
   },
   {
+    id: 'api-route',
+    label: 'API Route (api-route.com)',
+    baseUrl: 'https://global.api-route.com/v1',
+    defaultModel: '',
+    requiresApiKey: true,
+    hint: 'API Route key; select a chat-completions model from your account catalog. Model ids are passed verbatim.',
+  },
+  {
+    id: 'opper',
+    label: 'Opper (opper.ai)',
+    baseUrl: 'https://api.opper.ai/v3/compat',
+    // A pooled model id: Opper picks the route per request. A small model for
+    // the same reason as NVIDIA's default, extraction is high volume.
+    defaultModel: 'gpt-5.4-mini',
+    requiresApiKey: true,
+    hint: 'EU-hosted gateway. One Opper key for pooled model ids such as claude-haiku-4-5; a provider/model id pins one route.',
+  },
+  {
     id: 'deepseek',
     label: 'DeepSeek',
     baseUrl: 'https://api.deepseek.com/v1',
@@ -125,6 +143,14 @@ export const OPENAI_COMPAT_PRESETS: readonly OpenAICompatPreset[] = [
     defaultModel: 'MiniMax-M3',
     requiresApiKey: true,
     hint: 'Mainland-China accounts (platform.minimaxi.com).',
+  },
+  {
+    id: 'iflytek',
+    label: 'iFlytek Spark (Astron MaaS)',
+    baseUrl: 'https://maas-api.cn-huabei-1.xf-yun.com/v2',
+    defaultModel: 'spark-x2.5',
+    requiresApiKey: true,
+    hint: 'Pay-as-you-go MaaS key. Token Plan keys only work on https://maas-token-api.cn-huabei-1.xf-yun.com/v2.',
   },
   {
     id: 'ollama',
