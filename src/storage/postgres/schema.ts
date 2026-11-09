@@ -5,6 +5,10 @@ import type { PostgresQueryable } from './utils.js';
 
 export const SERVER_POSTGRES_SCHEMA_VERSION = 1;
 
+// Arbitrary constant key for the transaction-scoped advisory lock that serializes
+// concurrent schema bootstraps.
+const SERVER_SCHEMA_BOOTSTRAP_LOCK_KEY = 1668572525001;
+
 // Phase 1b (cmem-sdk rename): the TS constant is renamed but the table-name
 // strings remain on `server_beta_*` since they are persisted DDL identifiers.
 // Plan §1d will migrate the table names in a coordinated DDL change.
@@ -51,6 +55,10 @@ export async function bootstrapServerPostgresSchema(
 
   await client.query('BEGIN');
   try {
+    // Concurrent starters (server-beta, gen-worker, local-gen) otherwise race on the
+    // new-database check and the CREATE TABLE/INDEX DDL below. Released automatically
+    // on COMMIT or ROLLBACK.
+    await client.query('SELECT pg_advisory_xact_lock($1)', [SERVER_SCHEMA_BOOTSTRAP_LOCK_KEY]);
     const createVectors = vectors === 'on' || (vectors === 'auto' && await isNewOrVectorDatabase(client));
     await applyPhase1Migration(client);
     await applyBm25Index(client);
