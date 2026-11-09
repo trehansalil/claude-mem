@@ -26,7 +26,9 @@ jobs:
 
       - name: Install dependencies and build
         run: |
-          npm install --legacy-peer-deps
+          # Skip native install scripts (tree-sitter grammars fail to build on the runner);
+          # the Docker image installs its own runtime deps.
+          npm install --legacy-peer-deps --ignore-scripts
           npm run build
 
       - uses: docker/setup-buildx-action@v3
