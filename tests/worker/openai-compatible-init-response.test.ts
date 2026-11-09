@@ -1,18 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from 'bun:test';
+import codeMode from '../../plugin/modes/code.json';
 import { ModeManager } from '../../src/services/domain/ModeManager.js';
 import { OpenAICompatibleProvider, type ProviderQueryResult } from '../../src/services/worker/OpenAICompatibleProvider.js';
 import { CodexProvider } from '../../src/services/worker/CodexProvider.js';
 import type { DatabaseManager } from '../../src/services/worker/DatabaseManager.js';
 import type { SessionManager } from '../../src/services/worker/SessionManager.js';
 import type { ActiveSession, ConversationMessage } from '../../src/services/worker-types.js';
+import { sessionDbWithoutMedia } from '../fixtures/worker/session-db-without-media.js';
 
 const mockMode = {
   name: 'code',
-  prompts: {
-    init: 'init prompt',
-    observation: 'obs prompt',
-    summary: 'summary prompt',
-  },
+  prompts: codeMode.prompts,
   observation_types: [{ id: 'discovery' }],
   observation_concepts: [],
 };
@@ -104,7 +102,7 @@ describe('OpenAICompatibleProvider init response', () => {
     dbManager = {
       getSessionStore: () => ({
         storeObservations,
-        ensureMemorySessionIdRegistered: mock(() => {}),
+        db: sessionDbWithoutMedia(), ensureMemorySessionIdRegistered: mock(() => {}),
         updateMemorySessionId: mock(() => {}),
       }),
       getChromaSync: () => ({
@@ -151,7 +149,7 @@ describe('OpenAICompatibleProvider init response', () => {
     provider.getConfig = () => ({ apiKey: 'native', model: '', reasoningEffort: null, codexPath: 'codex' });
     let call = 0;
     const turns = mock(async () => ({ content: call++ === 0 ? '' : observationXml }));
-    provider.appServer.runTurn = turns;
+    for (const client of provider.appServer.clients) client.runTurn = turns;
     const session = makeSession({ currentProvider: 'codex' });
 
     await provider.startSession(session);
@@ -177,7 +175,7 @@ describe('OpenAICompatibleProvider init response', () => {
     provider.getConfig = () => ({ apiKey: 'native', model: '', reasoningEffort: null, codexPath: 'codex' });
     let call = 0;
     const turns = mock(async () => ({ content: call++ === 0 ? 'ready' : '' }));
-    provider.appServer.runTurn = turns;
+    for (const client of provider.appServer.clients) client.runTurn = turns;
 
     await provider.startSession(session);
 

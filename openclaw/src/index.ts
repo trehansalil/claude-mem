@@ -195,6 +195,8 @@ interface ClaudeMemPluginConfig {
 const MAX_SSE_BUFFER_SIZE = 1024 * 1024; 
 const DEFAULT_WORKER_PORT = 37777;
 const DEFAULT_WORKER_HOST = "127.0.0.1";
+// Stamped on every session post so OpenClaw memory is not stored as Claude Code's.
+const PLATFORM_SOURCE = "openclaw";
 
 const EMOJI_POOL = [
   "🔧","📐","🔍","💻","🧪","🐛","🛡️","☁️","📦","🎯",
@@ -772,6 +774,7 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
       contentSessionId,
       project: projectName,
       prompt: promptText,
+      platformSource: PLATFORM_SOURCE,
     }, api.logger);
 
     api.logger.info(`[claude-mem] Session initialized via ${via}: contentSessionId=${contentSessionId} project=${projectName}`);
@@ -852,6 +855,7 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
       tool_input: toolInput,
       tool_response: toolResponseText,
       cwd: workspaceDir,
+      platformSource: PLATFORM_SOURCE,
     }, api.logger);
   });
 
@@ -879,6 +883,7 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
     await workerPost(workerPort, "/api/sessions/summarize", {
       contentSessionId,
       last_assistant_message: lastAssistantMessage,
+      platformSource: PLATFORM_SOURCE,
     }, api.logger);
   });
 
@@ -952,20 +957,16 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
     },
   });
 
-  function summarizeSearchResults(items: unknown[], limit = 5): string {
-    if (!Array.isArray(items) || items.length === 0) {
-      return "No results found.";
-    }
-
-    return items
-      .slice(0, limit)
-      .map((item, index) => {
-        const row = item as Record<string, unknown>;
-        const title = String(row.title || row.subtitle || row.text || "Untitled");
-        const project = row.project ? ` [${String(row.project)}]` : "";
-        return `${index + 1}. ${title}${project}`;
-      })
-      .join("\n");
+  // The worker's search, recent-context and timeline routes answer in the MCP
+  // tool shape ({ content: [{ type: "text", text }] }) with the rendered result.
+  function workerResultText(data: Record<string, unknown>): string {
+    const content = Array.isArray(data.content) ? data.content : [];
+    const text = content
+      .filter((block: any) => block?.type === "text" && typeof block.text === "string")
+      .map((block: any) => block.text)
+      .join("\n")
+      .trim();
+    return text || "No results found.";
   }
 
   function parseLimit(arg: string | undefined, fallback = 10): number {
@@ -1019,7 +1020,8 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
 
       const pieces = raw.split(/\s+/);
       const maybeLimit = pieces[pieces.length - 1];
-      const hasTrailingLimit = /^\d+$/.test(maybeLimit);
+      // A lone number is the query (a PR number, port or year), not a limit, as in /claude-mem-timeline.
+      const hasTrailingLimit = pieces.length >= 2 && /^\d+$/.test(maybeLimit);
       const limit = hasTrailingLimit ? parseLimit(maybeLimit, 10) : 10;
       const query = hasTrailingLimit ? pieces.slice(0, -1).join(" ") : raw;
 
@@ -1033,10 +1035,9 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
         return "Claude-Mem search failed (worker unavailable or invalid response).";
       }
 
-      const items = Array.isArray(data.items) ? data.items : [];
       return [
         `Claude-Mem Search: \"${query}\"`,
-        summarizeSearchResults(items, limit),
+        workerResultText(data),
       ].join("\n");
     },
   });
@@ -1067,15 +1068,10 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
         return "Claude-Mem recent context failed (worker unavailable or invalid response).";
       }
 
-      const summaries = Array.isArray(data.session_summaries) ? data.session_summaries : [];
-      const observations = Array.isArray(data.recent_observations) ? data.recent_observations : [];
-
       return [
         "Claude-Mem Recent Context",
         `Project: ${project || "(auto)"}`,
-        `Session summaries: ${summaries.length}`,
-        `Recent observations: ${observations.length}`,
-        summarizeSearchResults(observations, Math.min(5, observations.length || 5)),
+        workerResultText(data),
       ].join("\n");
     },
   });
@@ -1104,7 +1100,6 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
       const query = parts.join(" ");
       const params = new URLSearchParams({
         query,
-        mode: "auto",
         depth_before: String(depthBefore),
         depth_after: String(depthAfter),
       });
@@ -1119,13 +1114,9 @@ export default function claudeMemPlugin(api: OpenClawPluginApi): void {
         return "Claude-Mem timeline lookup failed (worker unavailable or invalid response).";
       }
 
-      const timeline = Array.isArray(data.timeline) ? data.timeline : [];
-      const anchor = data.anchor ? String(data.anchor) : "(none)";
-
       return [
         `Claude-Mem Timeline: \"${query}\"`,
-        `Anchor: ${anchor}`,
-        summarizeSearchResults(timeline, 8),
+        workerResultText(data),
       ].join("\n");
     },
   });

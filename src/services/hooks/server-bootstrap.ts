@@ -11,8 +11,8 @@
 //   2. Find or create a "local-hook" team and project so the api_key has
 //      proper tenant scope.
 //   3. Generate a `cmem_<random>` key, hash with SHA-256, insert into
-//      `api_keys` with the scopes hooks need: events:write, sessions:write,
-//      observations:read, jobs:read.
+//      `api_keys` with the scopes the /v1 routes actually require:
+//      memories:read and memories:write.
 //   4. Persist the plaintext key to ~/.claude-mem/settings.json under
 //      `CLAUDE_MEM_SERVER_API_KEY` (the new canonical key after the
 //      server-beta → server rename). Reads in `runtime-selector.ts`
@@ -23,12 +23,14 @@
 // The plaintext key is NEVER written into the generated bundle and never
 // logged.
 
-import { createHash, randomBytes } from 'crypto';
+import { randomBytes } from 'crypto';
+import { apiKeyPrefix, hashApiKey as hashApiKeyStorage } from '../../server/auth/api-key-hash.js';
 import { logger } from '../../utils/logger.js';
 import { updateSettingsDocument } from '../../shared/settings-document.js';
 import { createPostgresPool, type PostgresPool } from '../../storage/postgres/pool.js';
 import { parsePostgresConfig } from '../../storage/postgres/config.js';
 import { PostgresAuthRepository } from '../../storage/postgres/auth.js';
+import { ensureApiKeySchema } from '../../storage/postgres/schema.js';
 import { PostgresProjectsRepository } from '../../storage/postgres/projects.js';
 import { PostgresTeamsRepository } from '../../storage/postgres/teams.js';
 
@@ -36,11 +38,15 @@ const LOCAL_HOOK_TEAM_NAME = 'local-hook-team';
 const LOCAL_HOOK_PROJECT_NAME = 'local-hook-project';
 const LOCAL_HOOK_ACTOR_ID = 'system:local-hook-bootstrap';
 
+// The /v1 routes gate reads on `memories:read` and writes on `memories:write`
+// (see ServerV1PostgresRoutes.ts), and the auth middleware matches scopes by
+// exact membership with no alias or expansion. A bootstrapped hook key must
+// therefore carry both, or every request it authenticates is refused with
+// `403 Forbidden — Invalid API key or insufficient scope`. This mirrors
+// DEFAULT_LOCAL_API_KEY_SCOPES (the SQLite path's equivalent, #2428).
 export const HOOK_API_KEY_SCOPES: readonly string[] = Object.freeze([
-  'events:write',
-  'sessions:write',
-  'observations:read',
-  'jobs:read',
+  'memories:read',
+  'memories:write',
 ]);
 
 export interface BootstrapResult {
@@ -63,15 +69,22 @@ export async function bootstrapServerApiKey(
   const pool = deps.pool ?? buildPoolFromEnv();
 
   try {
+    // The standalone key commands (`server api-key create`, `keys rotate`)
+    // run before any updated server process has bootstrapped the schema, and
+    // createApiKey writes key_prefix. Apply the idempotent upgrade first so an
+    // existing database gets the column before these queries touch it.
+    await ensureApiKeySchema(pool);
     const teamId = await findOrCreateTeam(pool);
     const projectId = await findOrCreateProject(pool, teamId);
 
     const rawKey = createRawApiKey();
     const keyHash = hashApiKey(rawKey);
+    const keyPrefix = apiKeyPrefix(rawKey);
 
     const repo = new PostgresAuthRepository(pool);
     const created = await repo.createApiKey({
       keyHash,
+      keyPrefix,
       teamId,
       projectId,
       actorId: LOCAL_HOOK_ACTOR_ID,
@@ -195,11 +208,20 @@ export interface ServerKeyRotationState {
 export function readServerKeyRotationState(flat: Record<string, unknown> | null | undefined): ServerKeyRotationState {
   const nonEmpty = (value: unknown): string | null =>
     typeof value === 'string' && value.length > 0 ? value : null;
+  // The first non-blank, trimmed candidate: the same pick runtime-selector
+  // makes for the key hooks authenticate with. Settings seeded from defaults
+  // hold the canonical key as "", which must not hide a legacy key.
+  const firstNonBlank = (...values: unknown[]): string | null => {
+    for (const value of values) {
+      if (typeof value === 'string' && value.trim().length > 0) return value.trim();
+    }
+    return null;
+  };
   return {
     pendingRevocationKeyId: nonEmpty(flat?.CLAUDE_MEM_SERVER_PREVIOUS_API_KEY_ID),
     // The canonical key first, then the pre-rename CLAUDE_MEM_SERVER_BETA_* name.
-    currentApiKey: nonEmpty(flat?.CLAUDE_MEM_SERVER_API_KEY ?? flat?.CLAUDE_MEM_SERVER_BETA_API_KEY),
-    currentProjectId: nonEmpty(flat?.CLAUDE_MEM_SERVER_PROJECT_ID ?? flat?.CLAUDE_MEM_SERVER_BETA_PROJECT_ID),
+    currentApiKey: firstNonBlank(flat?.CLAUDE_MEM_SERVER_API_KEY, flat?.CLAUDE_MEM_SERVER_BETA_API_KEY),
+    currentProjectId: firstNonBlank(flat?.CLAUDE_MEM_SERVER_PROJECT_ID, flat?.CLAUDE_MEM_SERVER_BETA_PROJECT_ID),
   };
 }
 
@@ -208,7 +230,7 @@ export function createRawApiKey(): string {
 }
 
 export function hashApiKey(rawKey: string): string {
-  return createHash('sha256').update(rawKey).digest('hex');
+  return hashApiKeyStorage(rawKey);
 }
 
 async function findOrCreateTeam(pool: PostgresPool): Promise<string> {

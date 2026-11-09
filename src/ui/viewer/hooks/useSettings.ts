@@ -1,4 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
+import { useI18n } from '../../i18n';
+import { translateSettingsStatus } from '../../i18n/errors';
 import { Settings } from '../types';
 import { DEFAULT_SETTINGS } from '../constants/settings';
 import { API_ENDPOINTS } from '../constants/api';
@@ -13,17 +15,28 @@ export interface SubmitSettingsDependencies {
   setStatusTimeout?: (callback: () => void, delay: number) => void;
 }
 
+/**
+ * POST the settings. With `loaded` (what this tab last read or saved), only
+ * the keys that differ from it are sent, so a save from a tab opened earlier
+ * doesn't put back values changed elsewhere since (#4597).
+ */
 export async function submitSettings(
   newSettings: Settings,
   deps: SubmitSettingsDependencies,
+  loaded?: Settings,
 ): Promise<void> {
   // CLAUDE_CODE_PATH is file/env only (spawn binary). Never POST it, even
   // when GET echoed it into local state.
   const { CLAUDE_CODE_PATH: _fileOnly, ...writableSettings } = newSettings;
+  const posted = loaded
+    ? Object.fromEntries(Object.entries(writableSettings).filter(
+      ([key, value]) => value !== loaded[key as keyof Settings],
+    ))
+    : writableSettings;
   const response = await deps.fetchImpl(API_ENDPOINTS.SETTINGS, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(writableSettings)
+    body: JSON.stringify(posted)
   });
 
   if (!response.ok) {
@@ -49,12 +62,13 @@ export async function submitSettings(
 export async function saveSettings(
   newSettings: Settings,
   deps: SubmitSettingsDependencies,
+  loaded?: Settings,
 ): Promise<void> {
   deps.setIsSaving(true);
   deps.setSaveStatus('Saving...');
 
   try {
-    await submitSettings(newSettings, deps);
+    await submitSettings(newSettings, deps, loaded);
   } catch (error) {
     console.error('Failed to save settings:', error);
     deps.setSaveStatus(`✗ Error: ${error instanceof Error ? error.message : 'Network error'}`);
@@ -64,6 +78,7 @@ export async function saveSettings(
 }
 
 export function useSettings() {
+  const { t } = useI18n();
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
   // `settings` holds DEFAULT_SETTINGS until the first GET succeeds. A save
   // before then would post those defaults over settings.json (provider,
@@ -105,15 +120,15 @@ export function useSettings() {
   return {
     settings,
     isLoaded,
-    loadError,
+    loadError: loadError === null ? null : translateSettingsStatus(loadError, t),
     reload,
     saveSettings: (newSettings: Settings) => saveSettings(newSettings, {
       fetchImpl: fetch.bind(globalThis) as typeof fetch,
       setSettings,
       setSaveStatus,
       setIsSaving,
-    }),
+    }, settings),
     isSaving,
-    saveStatus,
+    saveStatus: translateSettingsStatus(saveStatus, t),
   };
 }
