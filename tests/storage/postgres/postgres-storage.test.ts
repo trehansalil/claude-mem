@@ -63,6 +63,22 @@ describe('server beta postgres schema bootstrap', () => {
     expect(queries.at(-1)).toBe('COMMIT');
   });
 
+  it('takes a transaction-scoped advisory lock right after BEGIN, before any DDL', async () => {
+    const queries: string[] = [];
+    const client = {
+      async query(text: string) {
+        queries.push(text);
+        return { rows: [], rowCount: 0 };
+      }
+    };
+
+    await bootstrapServerPostgresSchema(client);
+
+    expect(queries[0]).toBe('BEGIN');
+    expect(queries[1]).toContain('pg_advisory_xact_lock');
+    expect(queries.at(-1)).toBe('COMMIT');
+  });
+
   it('bootstraps platform-scoped server session identity indexes', async () => {
     const queries: string[] = [];
     const client = {
