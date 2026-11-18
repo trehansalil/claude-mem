@@ -21,6 +21,12 @@ jobs:
           repository: thedotmack/claude-mem
           ref: ${{ inputs.version }}
 
+      # Upstream's Dockerfile uses node:20 (Debian bookworm, glibc 2.36), but the
+      # tree-sitter-cli binary pulled in by npm install needs glibc >= 2.39.
+      # Remove once upstream fixes its base image.
+      - name: Patch Dockerfile base image (glibc >= 2.39)
+        run: sed -i 's|^FROM node:20$|FROM node:20-trixie|' docker/claude-mem/Dockerfile && grep -n '^FROM' docker/claude-mem/Dockerfile
+
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
