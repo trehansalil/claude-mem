@@ -7,14 +7,19 @@
 // The live wiring copies claude-mem v15.0.1 plugin/ui/work-view/app.js:180-261 (`accept`, `refresh`, the
 // EventSource handlers, the 1s connection timer and the 60s aging timer). The check copies app.js:125-138 (`saveReview`).
 import { getConnectionStatus, type ConnectionStatus } from './connection-status.ts'
-import { isServedFromCloud } from './served-from.ts'
+import { browserHostname, browserVisibility, isServedFromCloud, type PageVisibility } from './served-from.ts'
 import { conflictReason, readReviewResponse, readSaveReceipt, type ReviewResult } from './review-response.ts'
 import { toWorkModel } from './to-work-model.ts'
-import type { MappedWorkModel, RuleSaveResult, WorkDataSource, WorkModel } from './work-data-source.ts'
-import { SaveRefusedError } from '../data.ts'
+import type { ConversationContinuationEvent, MappedWorkModel, RuleSaveResult, WorkDataSource, WorkModel } from './work-data-source.ts'
+import { applySseFrame } from './parse-sse-frame.ts'
+import {
+  conversationRouteFailureSentence, readConversationContinuationAnswer, readConversationContinuationNotice, readConversationExchangeAnswer,
+  readOpenedInAppAnswer, unreachableWorkerSentence, unreadableAnswerSentence,
+} from './conversation-continuation.ts'
+import { RefreshNotStartedError, SaveRefusedError } from '../data.ts'
 import type { Request as WorkRequest } from '../data.ts'
 import type { WorkViewSnapshot, WorkViewSource } from './work-view-api-types.ts'
-import { expandWorkViewOverview, type WorkViewOverview, type WorkViewRequestDetail } from './work-view-overview.ts'
+import { expandWorkViewOverview, type WorkViewOverview, type WorkViewOverviewModel, type WorkViewRequestDetail } from './work-view-overview.ts'
 import { mergeRequestDetail } from './request-detail-state.ts'
 import { isSyncStatus, type SyncStatusForDisplay } from '../../../viewer/utils/sync-presentation.ts'
 import { startViewerActivity, type ViewerActivityOptions } from '../../../viewer/utils/viewer-activity.ts'
@@ -26,11 +31,26 @@ export interface LocalSourceOptions {
   bootstrapTimeoutMs?: number
   requestTimeoutMs?: number
   activityOptions?: Omit<ViewerActivityOptions, 'fetchImpl' | 'enabled'>
+  /** Whether the tab is on screen (default `document`). Only a cloud page reads it; see subscribeToLiveUpdates. */
+  visibility?: PageVisibility
+  /** Where the browser says the page is being unloaded, with 'pagehide' (default `window`). See openConversationInApp. */
+  pageUnload?: PageUnload
 }
+
+/** What fires 'pagehide' as this page is unloaded: a reload, a closed tab, or a navigation away. */
+export interface PageUnload {
+  addEventListener(type: 'pagehide', listener: () => void): void
+  removeEventListener(type: 'pagehide', listener: () => void): void
+}
+
+/** This page's `window`; undefined outside a browser. */
+const browserWindow = () => (globalThis as { window?: PageUnload }).window
 
 /** Separate instances make the actual transport/race behavior testable without shared browser globals. */
 export function createLocalSource(options: LocalSourceOptions = {}): WorkDataSource {
-  const fetchImpl = options.fetchImpl ?? fetch
+  // Looked up per call, not captured here: this module builds `localSource` as it loads, and
+  // the local API token wrapper (install-local-api-token) replaces `window.fetch` around then.
+  const fetchImpl = options.fetchImpl ?? (((input, init) => fetch(input, init)) as typeof fetch)
   const createEventSource = options.eventSourceFactory ?? ((url: string) => new EventSource(url))
   const bootstrapTimeoutMs = options.bootstrapTimeoutMs ?? 10_000
   const requestTimeoutMs = options.requestTimeoutMs ?? 20_000
@@ -45,13 +65,23 @@ export function createLocalSource(options: LocalSourceOptions = {}): WorkDataSou
   const WORK_VIEW_LOAD_RULES_URL = '/api/work-view/rules/load-in-claude-code'
   const WORK_VIEW_REFRESH_URL = '/api/work-view/refresh'
   const WORK_VIEW_MARK_AGENT_FINISHED_URL = '/api/work-view/agents/mark-finished'
+  const WORK_VIEW_CONVERSATION_CONTINUATION_URL = '/api/work-view/conversations/continuation'
+  const WORK_VIEW_CONTINUE_CONVERSATION_URL = '/api/work-view/conversations/continue'
+  const WORK_VIEW_STOP_CONVERSATION_CONTINUATION_URL = '/api/work-view/conversations/stop'
+  const WORK_VIEW_OPEN_CONVERSATION_IN_APP_URL = '/api/work-view/conversations/open-in-app'
+  const WORK_VIEW_STOP_OPENING_CONVERSATION_IN_APP_URL = '/api/work-view/conversations/open-in-app/stop'
   const CONTENT_FINGERPRINT_PATTERN = /^[a-f0-9]{64}$/
   const CONNECTION_TICK_MS = 1000
-  const SOURCE_KIND = isServedFromCloud(options.hostname ?? (globalThis as { location?: { hostname: string } }).location?.hostname ?? 'localhost') ? 'cloud' : 'local'
+  const SOURCE_KIND = isServedFromCloud(options.hostname ?? browserHostname() ?? 'localhost') ? 'cloud' : 'local'
   const AGING_TICK_MS = 60_000
   const STALE_FALLBACK_INTERVAL_MS = 120_000
   /** The worker's SSE `retry: 1000`. */
   const STREAM_REOPEN_AFTER_MS = 1000
+  // A cloud viewer's machine sleeps only while nothing reaches it, so a hidden cloud tab holds no stream and makes no
+  // timed request. The page on this computer never reads visibility: its behaviour does not change.
+  const visibility = SOURCE_KIND === 'cloud' ? options.visibility ?? browserVisibility() : undefined
+  const pageHidden = () => visibility?.visibilityState === 'hidden'
+  const pageUnload = options.pageUnload ?? browserWindow()
 
   /** The evidence getConnectionStatus reads. Times are performance.now(); see connection-status.ts. */
   const connectionEvidence = {
@@ -70,6 +100,7 @@ export function createLocalSource(options: LocalSourceOptions = {}): WorkDataSou
   /** The newest snapshot accepted, kept so the aging timer can re-map it as time passes. */
   let latestSnapshot: WorkViewSnapshot | null = null
   let latestModel: MappedWorkModel | null = null
+  let latestOverviewSignature: string | null = null
   let legacyMode = false
   // All accepted models count, including HTTP reads and saves: an older response must not rewind either.
   let modelVersion = 0
@@ -85,12 +116,26 @@ export function createLocalSource(options: LocalSourceOptions = {}): WorkDataSou
   const MAX_CACHED_DETAILS = 8
   /** The content of the last model handed to the screens, so an unchanged snapshot or a quiet minute is not sent again. */
   let lastDeliveredSignature: string | null = null
-  const modelSignature = (model: MappedWorkModel) => JSON.stringify([model.agents, model.requests, model.requestReadErrors, model.unlinkedWorkCount, model.sourceHealth, model.focusAreas, model.otherAsks, model.currentPeriod, model.pastPeriods, model.goalsReadError, model.lastRuns, model.refresh, model.rules, model.ruleScopes, model.rulesLearning, model.rulesFile, model.rulesReadError, model.buildStory])
+  // Accepted models are immutable. Connection-only wrappers share their content signature,
+  // so bootstrap and publication do not serialize the same request list again.
+  const modelSignatures = new WeakMap<object, string>()
+  function modelSignature(model: MappedWorkModel | WorkViewOverviewModel): string {
+    let signature = modelSignatures.get(model)
+    if (signature === undefined) {
+      signature = JSON.stringify([model.agents, model.devices, model.people, model.requests, model.requestReadErrors, model.unlinkedWorkCount, model.sourceHealth, model.focusAreas, model.otherAsks, model.currentPeriod, model.pastPeriods, model.goalsReadError, model.lastRuns, model.refresh, model.rules, model.ruleScopes, model.rulesLearning, model.rulesFile, model.rulesReadError, model.buildStory, model.sharedState])
+      modelSignatures.set(model, signature)
+    }
+    return signature
+  }
 
   const currentConnectionStatus = (): ConnectionStatus =>
     getConnectionStatus({ ...connectionEvidence, now: performance.now(), wallNow: Date.now(), where: SOURCE_KIND })
 
-  const withConnection = (mapped: MappedWorkModel): WorkModel => ({ ...mapped, sourceKind: SOURCE_KIND, connection: currentConnectionStatus() })
+  const withConnection = (mapped: MappedWorkModel): WorkModel => {
+    const model: WorkModel = { ...mapped, sourceKind: SOURCE_KIND, connection: currentConnectionStatus() }
+    modelSignatures.set(model, modelSignature(mapped))
+    return model
+  }
 
   /** app.js `health`: only a payload whose source read succeeded counts as a successful check. */
   function recordSourceHealth(source: WorkViewSource | undefined, serverAt?: string) {
@@ -119,6 +164,7 @@ export function createLocalSource(options: LocalSourceOptions = {}): WorkDataSou
   function acceptSnapshot(snapshot: WorkViewSnapshot, fromEvent: boolean, expectedSyncVersion?: number): WorkModel {
     modelVersion++
     latestSnapshot = snapshot
+    latestOverviewSignature = null
     latestModel = toWorkModel(snapshot, Date.now())
     if (fromEvent || connectionEvidence.lastEventAt === null) recordSourceHealth(snapshot.source, snapshot.generatedAt)
     recordSync(snapshot.sync, expectedSyncVersion)
@@ -128,9 +174,15 @@ export function createLocalSource(options: LocalSourceOptions = {}): WorkDataSou
   function acceptOverview(overview: WorkViewOverview, fromEvent: boolean, expectedSyncVersion?: number): WorkModel {
     modelVersion++
     latestSnapshot = null
-    latestModel = expandWorkViewOverview(overview)
     if (fromEvent || connectionEvidence.lastEventAt === null) recordSourceHealth(overview.source, overview.generatedAt)
     recordSync(overview.sync, expectedSyncVersion)
+    // A transport revision does not include clock-derived labels. Compare the actual
+    // compact content, before allocating the full request shapes and empty detail arrays.
+    const signature = `overview:${modelSignature(overview.model)}`
+    if (latestModel && signature === latestOverviewSignature) return withConnection(latestModel)
+    latestOverviewSignature = signature
+    latestModel = expandWorkViewOverview(overview)
+    modelSignatures.set(latestModel, signature)
     const live = new Map(latestModel.requests.map((request) => [request.id, request.detailRevision ?? request.contentFingerprint ?? '']))
     for (const [id, cached] of detailCache) if (live.get(id) !== cached.fingerprint) detailCache.delete(id)
     return withConnection(latestModel)
@@ -195,7 +247,7 @@ export function createLocalSource(options: LocalSourceOptions = {}): WorkDataSou
   }
 
   /** POSTs to an origin-guarded work-view route that answers with the snapshot after the change. Anything else throws its reason. */
-  async function postForWorkModel(url: string, body: unknown, whatWasSaved: string): Promise<RuleSaveResult> {
+  async function postForWorkModel(url: string, body: unknown, whatWasSaved: string, keepReceipt = false): Promise<RuleSaveResult> {
     const versionBeforeSave = modelVersion
     const syncBeforeSave = syncVersion
     const generation = streamGeneration
@@ -215,16 +267,101 @@ export function createLocalSource(options: LocalSourceOptions = {}): WorkDataSou
       throw new Error(message)
     }
     if (!isWorkViewSnapshot(answer)) throw new Error(`${whatWasSaved} was saved, but the worker sent back something that is not a work snapshot. Reload to see it.`)
-    const model = latestModel && (modelVersion !== versionBeforeSave || generation !== streamGeneration)
-      ? withConnection(latestModel) : acceptSnapshot(answer, false, syncBeforeSave)
+    const newerModel = latestModel && (modelVersion !== versionBeforeSave || generation !== streamGeneration) ? latestModel : null
+    const model = newerModel ? withConnection(newerModel) : acceptSnapshot(answer, false, syncBeforeSave)
     lastDeliveredSignature = modelSignature(model)
+    // Undo needs this write's receipt, even if the live model has already moved on. Mapping the
+    // receipt separately must not replace the newer model used by the screen or detail reads.
+    const receipt = keepReceipt && newerModel ? withConnection(toWorkModel(answer, Date.now())) : model
     const { savedRuleId } = answer as { savedRuleId?: unknown }
     const save = readSaveReceipt(answer)
-    return { model, savedRuleId: typeof savedRuleId === 'string' ? savedRuleId : null, ...(save ? { save } : {}) }
+    return { model: receipt, savedRuleId: typeof savedRuleId === 'string' ? savedRuleId : null, ...(save ? { save } : {}) }
+  }
+
+  /** Rows showing a continued conversation (subscribeToConversationContinuations), one entry per subscription. */
+  const conversationContinuationListeners = new Set<(event: ConversationContinuationEvent) => void>()
+  /**
+   * Tells every row, even when one before it throws: a row that missed a 'replied' notice or a reopened stream would
+   * show 'Working…' until the stream next reopens. The throw is reported as that listener's own error, so it never reads
+   * as an unreadable frame (applySseFrame catches what its callback throws) and never escapes the stream's open handler.
+   */
+  const tellConversationContinuationListeners = (event: ConversationContinuationEvent) => {
+    for (const listener of [...conversationContinuationListeners]) {
+      try {
+        listener(event)
+      } catch (error) {
+        console.error('[work-view] A conversation-continuation listener threw. The other listeners are still told.', error)
+      }
+    }
+  }
+  /**
+   * Set once the event stream has opened. A notice sent while the stream was closed is lost, so after every open but the
+   * first (the browser reconnecting it, or a new stream), each row showing a continued conversation reads it again.
+   */
+  let eventStreamHasOpened = false
+
+  /**
+   * One call to a conversation route, answered as `readAnswer` reads it. Every failure rejects with one plain sentence
+   * the row shows as it is (conversation-continuation.ts). No deadline: giving up on a start would not stop the worker
+   * from starting the turn, and the read answers from the worker's memory.
+   */
+  async function callConversationRoute<Answer>(url: string, init: RequestInit, attemptedAction: string, readAnswer: (body: unknown) => Answer | null): Promise<Answer> {
+    let response: Response
+    try {
+      response = await fetchImpl(url, init)
+    } catch (error) {
+      throw new Error(unreachableWorkerSentence(attemptedAction, error))
+    }
+    let body: unknown = null
+    try { body = await response.json() } catch { /* Not JSON, such as Express's own error page: the status is worded instead. */ }
+    if (!response.ok) throw new Error(conversationRouteFailureSentence(response, body, attemptedAction))
+    const answer = readAnswer(body)
+    if (answer === null) throw new Error(unreadableAnswerSentence(response.status))
+    return answer
+  }
+  const postToConversationRoute = (body: object): RequestInit => ({ method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+
+  // Only the page this computer's worker serves can continue a conversation: a cloud-served page has no CLI here.
+  const conversationContinuation: Pick<WorkDataSource, 'loadConversationContinuation' | 'continueConversation' | 'stopConversationContinuation'
+    | 'subscribeToConversationContinuations' | 'openConversationInApp'> = SOURCE_KIND !== 'local' ? {} : {
+    loadConversationContinuation: (platform, conversationSessionId) => callConversationRoute(
+      `${WORK_VIEW_CONVERSATION_CONTINUATION_URL}?${new URLSearchParams({ platform, conversationSessionId })}`,
+      { cache: 'no-store' }, 'read this conversation', readConversationContinuationAnswer),
+    continueConversation: (platform, conversationSessionId, ownerMessage) => callConversationRoute(WORK_VIEW_CONTINUE_CONVERSATION_URL,
+      postToConversationRoute({ platform, conversationSessionId, ownerMessage }), 'send your message', readConversationExchangeAnswer),
+    stopConversationContinuation: (platform, conversationSessionId) => callConversationRoute(WORK_VIEW_STOP_CONVERSATION_CONTINUATION_URL,
+      postToConversationRoute({ platform, conversationSessionId }), 'stop this turn', readConversationExchangeAnswer),
+    subscribeToConversationContinuations(listener) {
+      // Wrapped, so one function subscribed twice is two subscriptions, and each unsubscribe ends only its own.
+      const subscription = (event: ConversationContinuationEvent) => listener(event)
+      conversationContinuationListeners.add(subscription)
+      return () => { conversationContinuationListeners.delete(subscription) }
+    },
+    async openConversationInApp(platform, conversationSessionId) {
+      // This click's own id (OPEN_IN_APP_CLICK_ID_PATTERN), sent with the open and with its stop, so the worker stops only
+      // the open this click started: not one another tab's click started, and not a newer one.
+      const clickedOpen = { platform, conversationSessionId, openInAppClickId: crypto.randomUUID() }
+      // The worker cannot see this request go away: Bun's node:http, which serves it, gives a POST whose page has gone no
+      // sign at all. So when the page is unloaded while the open still runs (a reload, a closed tab), the page asks the
+      // worker to stop the open's command. keepalive lets that request outlive the page.
+      const stopTheOpenAsThePageGoes = () => {
+        fetchImpl(WORK_VIEW_STOP_OPENING_CONVERSATION_IN_APP_URL, { ...postToConversationRoute(clickedOpen), keepalive: true }).catch((error: unknown) => {
+          console.error('[work-view] Could not ask the worker to stop opening a conversation in its app as this page closed.', error)
+        })
+      }
+      pageUnload?.addEventListener('pagehide', stopTheOpenAsThePageGoes)
+      try {
+        return await callConversationRoute(WORK_VIEW_OPEN_CONVERSATION_IN_APP_URL, postToConversationRoute(clickedOpen),
+          'open this conversation in its app', readOpenedInAppAnswer)
+      } finally {
+        pageUnload?.removeEventListener('pagehide', stopTheOpenAsThePageGoes)
+      }
+    },
   }
 
   const localSource: WorkDataSource = {
     sourceKind: SOURCE_KIND,
+    ...conversationContinuation,
 
     /** app.js `refresh`: when an SSE snapshot arrived while this read was in flight, the event's newer model wins. */
     async loadWorkModel() {
@@ -355,14 +492,14 @@ export function createLocalSource(options: LocalSourceOptions = {}): WorkDataSou
     },
 
     saveRuleChange: (change) => postForWorkModel(WORK_VIEW_RULES_URL, change, 'The rule change'),
-    saveFocusChange: async (change) => (await postForWorkModel(WORK_VIEW_FOCUS_URL, change, 'The focus change')).model,
+    saveFocusChange: async (change) => (await postForWorkModel(WORK_VIEW_FOCUS_URL, change, 'The focus change', true)).model,
     loadRulesInClaudeCode: async () => (await postForWorkModel(WORK_VIEW_LOAD_RULES_URL, {}, 'Loading your rules into Claude Code')).model,
     async refreshWork() {
       const response = await fetchImpl(WORK_VIEW_REFRESH_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
       if (!response.ok) {
-        let reason = `the worker answered ${response.status}`
-        try { const body = await response.json() as { error?: unknown }; if (typeof body.error === 'string') reason = body.error } catch { /* Keep the status as the reason. */ }
-        throw new Error(`Refresh could not start: ${reason}`)
+        let workerReason: string | null = null
+        try { const body = await response.json() as { error?: unknown }; if (typeof body.error === 'string') workerReason = body.error } catch { /* Keep the status as the reason. */ }
+        throw new RefreshNotStartedError(response.status, workerReason)
       }
       return await response.json() as { state: string }
     },
@@ -388,7 +525,7 @@ export function createLocalSource(options: LocalSourceOptions = {}): WorkDataSou
       }
       publishModel = sendIfChanged
 
-      let stream: EventSource
+      let stream: EventSource | null = null
       let reopenTimer: ReturnType<typeof setTimeout> | undefined
       const openStream = () => {
         if (generation !== streamGeneration) return
@@ -400,6 +537,10 @@ export function createLocalSource(options: LocalSourceOptions = {}): WorkDataSou
           connectionEvidence.transportConnected = true
           connectionEvidence.reconnecting = false
           reportConnection()
+          const reopened = eventStreamHasOpened
+          eventStreamHasOpened = true
+          // Notices may have been missed while the stream was closed, so every row showing a continued conversation reads it again.
+          if (reopened) tellConversationContinuationListeners('live-updates-reconnected')
         }
         stream.addEventListener('work-view', (event) => {
           if (!current()) return
@@ -443,6 +584,15 @@ export function createLocalSource(options: LocalSourceOptions = {}): WorkDataSou
           recordSync(status.sync)
           reportConnection()
         })
+        // An exchange sent from My Work started or ended. The notice names it and its state only: the row it concerns
+        // reads the rest through the guarded read. Like a sync diagnostic, it is no evidence about the work projection.
+        stream.addEventListener('conversation-continuation', (event) => {
+          if (!current()) return
+          applySseFrame('conversation-continuation', (event as MessageEvent).data, (frame: Record<string, unknown>) => {
+            const notice = readConversationContinuationNotice(frame)
+            if (notice) tellConversationContinuationListeners(notice)
+          }, (frame) => readConversationContinuationNotice(frame) !== null)
+        })
         stream.onerror = () => {
           if (!current()) return
           waiting.resolve(null)
@@ -451,16 +601,37 @@ export function createLocalSource(options: LocalSourceOptions = {}): WorkDataSou
           reportConnection()
           // EventSource retries a dropped connection by itself, but gives up for good after an HTTP error response
           // (the Vite proxy answers 500 while the worker is down). Reopen it at the server's retry interval.
-          if (stream.readyState === 2 /* EventSource.CLOSED */) reopenTimer = setTimeout(openStream, STREAM_REOPEN_AFTER_MS)
+          if (currentStream.readyState === 2 /* EventSource.CLOSED */) reopenTimer = setTimeout(openStream, STREAM_REOPEN_AFTER_MS)
         }
       }
-      openStream()
+      if (!pageHidden()) openStream()
+
+      // Cloud only. Hidden: close the stream and cancel a pending reopen (so none can open while hidden); the aging
+      // timer below skips its read. Shown: reopen the stream, whose first event is the current overview
+      // (WorkViewRoutes sends it on every new stream). No delay and no threshold: a quick tab switch just reconnects,
+      // and Fly takes minutes to stop a machine. A machine that slept answers 503 through the gate while its worker
+      // boots; the stream's error handler reopens it until the worker answers.
+      const followVisibility = () => {
+        if (generation !== streamGeneration) return
+        if (pageHidden()) {
+          clearTimeout(reopenTimer)
+          stream?.close()
+          stream = null
+          connectionEvidence.transportConnected = false
+          connectionEvidence.reconnecting = true
+          reportConnection()
+          return
+        }
+        if (!stream) openStream()
+      }
+      visibility?.addEventListener('visibilitychange', followVisibility)
 
       // Re-reads connection freshness every second: "live" expires on its own when messages stop.
       const connectionTimer = setInterval(reportConnection, CONNECTION_TICK_MS)
       // Legacy snapshots contain epochs we can age locally. Compact streams already send minute remaps;
       // an HTTP fallback is only needed while the feed is unhealthy, at most once per cache window.
       const agingTimer = setInterval(() => {
+        if (pageHidden()) return
         if (latestSnapshot) sendIfChanged(withConnection(toWorkModel(latestSnapshot, Date.now())))
         else if (latestModel && !currentConnectionStatus().isLive && performance.now() - lastOverviewReadAt >= STALE_FALLBACK_INTERVAL_MS) {
           void readOverview().then((model) => { if (generation === streamGeneration) sendIfChanged(model) }).catch(() => { /* Keep the last model; event freshness remains independent. */ })
@@ -470,7 +641,8 @@ export function createLocalSource(options: LocalSourceOptions = {}): WorkDataSou
       return () => {
         waiting.resolve(null)
         clearTimeout(reopenTimer)
-        stream.close()
+        visibility?.removeEventListener('visibilitychange', followVisibility)
+        stream?.close()
         clearInterval(connectionTimer)
         clearInterval(agingTimer)
         stopActivity()

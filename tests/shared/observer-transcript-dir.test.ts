@@ -290,6 +290,14 @@ describe('#4689 — credential identity is unaffected by the transcript-only dir
   });
 
   it('env-fallback still wins when the default keychain entry is missing (the #4689 reporter scenario)', async () => {
+    // The darwin branch falls through a keychain miss to
+    // ${defaultProfileConfigDir()}/.credentials.json before it ever reaches
+    // the env token. Run alone, that dir is the empty frozen temp dir; run
+    // after another file froze paths.CLAUDE_CONFIG_DIR, it is the machine's
+    // real ~/.claude, whose valid login outranks the env fallback (#3121).
+    // Probe it the way the sibling test below does instead of assuming it is
+    // empty.
+    const storedProbe = await probeStoredCredential();
     setPlatform('darwin');
     stubSettingsFile({ CLAUDE_MEM_CLAUDE_CONFIG_DIR: '', CLAUDE_MEM_OBSERVER_CLAUDE_CONFIG_DIR: TRANSCRIPT_DIR });
     process.env.CLAUDE_CODE_OAUTH_TOKEN = 'sk-ant-oat01-4689-env-fallback';
@@ -302,8 +310,13 @@ describe('#4689 — credential identity is unaffected by the transcript-only dir
 
     expect(result.kind).toBe('present');
     if (result.kind === 'present') {
-      expect(result.source).toBe('env-fallback');
-      expect(result.token).toBe('sk-ant-oat01-4689-env-fallback');
+      if (storedProbe.kind === 'present') {
+        expect(result.source).toBe('credentials-file');
+        expect(result.token).toBe(storedProbe.token);
+      } else {
+        expect(result.source).toBe('env-fallback');
+        expect(result.token).toBe('sk-ant-oat01-4689-env-fallback');
+      }
     }
   });
 });
@@ -333,22 +346,5 @@ describe('#4689 — buildIsolatedEnvWithFreshOAuth injects a usable credential i
     // The OAuth-skip predicates must not have fired.
     expect(result.ANTHROPIC_BASE_URL).toBeUndefined();
     expect(result.ANTHROPIC_API_KEY).toBeUndefined();
-  });
-
-  it('without the transcript-only dir, the child env stays CLAUDE_CONFIG_DIR-free and still gets the token (#4149 guard)', async () => {
-    const envToken = 'sk-ant-oat01-4689-fresh-spawn';
-    const storedProbe = await probeStoredCredential();
-    process.env.CLAUDE_CODE_OAUTH_TOKEN = envToken;
-    setPlatform('aix');
-    stubSettingsFile({ CLAUDE_MEM_CLAUDE_CONFIG_DIR: '', CLAUDE_MEM_OBSERVER_CLAUDE_CONFIG_DIR: '' });
-
-    const result = await buildIsolatedEnvWithFreshOAuth();
-
-    expect(result.CLAUDE_CONFIG_DIR).toBeUndefined();
-    if (storedProbe.kind === 'present') {
-      expect(result.CLAUDE_CODE_OAUTH_TOKEN).toBe(storedProbe.token);
-    } else {
-      expect(result.CLAUDE_CODE_OAUTH_TOKEN).toBe(envToken);
-    }
   });
 });

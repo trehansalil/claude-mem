@@ -10,6 +10,7 @@ import { AppError } from '../../../server/ErrorHandler.js';
 import { resolveDateBound } from '../../../../shared/date-bounds.js';
 import { scopedProjects } from '../../../sqlite/project-read-keys.js';
 import { validateBody } from '../middleware/validateBody.js';
+import { isForeignBrowserRead } from './SettingsRoutes.js';
 import { logger } from '../../../../utils/logger.js';
 import { groupByDate } from '../../../../shared/timeline-formatting.js';
 import {
@@ -27,7 +28,7 @@ import {
   type ContextCacheKeys,
 } from '../../../../shared/context-cache.js';
 import type { ContextCacheService, ContextVariantRender } from '../../ContextCacheService.js';
-import type { ContextReadWorkerClient } from '../../../context/ContextReadWorkerClient.js';
+import { ContextReadTimeoutError, type ContextReadWorkerClient } from '../../../context/ContextReadWorkerClient.js';
 import type { WorkStateEntry } from '../../../sqlite/work-state.js';
 
 interface ContextInjectRender {
@@ -40,6 +41,7 @@ interface ContextInjectRender {
 import { buildWorkStateContextSection } from '../../../context/sections/WorkStateRenderer.js';
 import { isWorkStateEnabled } from '../../../../shared/work-state-setting.js';
 import { SettingsDefaultsManager } from '../../../../shared/SettingsDefaultsManager.js';
+import { RUNTIME_SKILLS } from '../../../../shared/runtime-skills.js';
 import { getViewerBaseUrl } from '../../../../shared/worker-utils.js';
 import { USER_SETTINGS_PATH } from '../../../../shared/paths.js';
 import { currentUserSettingsSaveCount } from '../../../../shared/context-invalidation.js';
@@ -55,7 +57,7 @@ import { ProgressiveMemorySearch } from '../../ProgressiveMemorySearch.js';
 import { progressiveSearchToolResult, progressiveSearchToolError, type ProgressiveSearchInput } from '../../../../shared/progressive-search.js';
 import { parseProjectList } from '../../../../shared/project-list.js';
 
-const ONBOARDING_EXPLAINER_PATH: string = path.resolve(__dirname, '../skills/how-it-works/onboarding-explainer.md');
+const ONBOARDING_EXPLAINER_PATH: string = path.resolve(__dirname, '../skills', RUNTIME_SKILLS.howItWorks, 'onboarding-explainer.md');
 
 // Read on first request, not at import. Hook processes share this module but
 // never serve the onboarding explainer, so caching at import made every hook
@@ -101,8 +103,7 @@ Memory injection starts on your second session in a project.
 
 \`/learn-codebase\` is available if the user wants to front-load the entire repo into memory in a single pass (~5 minutes on a typical repo, optional). Otherwise memory builds passively as work happens.
 
-Live activity: {viewer_url}
-{pro_trial_line}
+Live activity: {viewer_url}{pro_trial_line}
 How it works: \`/how-it-works\`
 
 This message disappears once the first observation lands.
@@ -386,8 +387,35 @@ export class SearchRoutes extends BaseRouteHandler {
     res.send(contextText);
   });
 
+  /**
+   * The reader deadline (#5374) is expected on a slow database, and the client
+   * already opened a new reader: answer 500 with a warning, not an
+   * error-tracking exception. Returns false for any other error.
+   */
+  private answerContextReadTimeout(res: Response, error: unknown, context: Record<string, unknown>): boolean {
+    if (!(error instanceof ContextReadTimeoutError)) return false;
+    const { method, queuedMs, runningMs } = error;
+    logger.warn('HTTP', 'Context injection failed: a context read ran past the deadline',
+      { ...context, method, queuedMs, runningMs }, error);
+    res.status(500).json({ error: error.message });
+    return true;
+  }
+
   private handleContextInject = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
-    let projectsParam: unknown = req.query.projects || req.query.project;
+    // `cwd` below is resolved through getProjectContext, which runs `git` in it
+    // (findGitRepoRoot), so another browser page must not choose it, even with
+    // a no-cors fetch that sends no Origin. Hooks, the CLI and the MCP tool
+    // send no browser headers and keep working.
+    if (isForeignBrowserRead(req)) {
+      res.status(403).json({
+        error: 'Forbidden',
+        message: 'Context injection from another browser page is not allowed.',
+      });
+      return;
+    }
+    // The singular parameter names one exact key, even when it contains a comma.
+    // Repeated `project=` values arrive as an array; each one is an exact key.
+    let projectsParam: unknown = req.query.projects || (req.query.project ? [req.query.project].flat() : undefined);
     const hostCwd = typeof req.query.cwd === 'string' ? req.query.cwd : '';
     // "Include last message" picks the prior session's reply by excluding the
     // session that asks, so only then is its id used, and that answer stays live.
@@ -407,9 +435,15 @@ export class SearchRoutes extends BaseRouteHandler {
     // A host that cannot run the project resolver itself (the OMP hook) sends
     // its cwd instead: read the keys the CLI context hook sends for that checkout.
     if (!projectsParam && hostCwd.trim()) {
-      const resolvedProjects = this.contextReader
-        ? await this.contextReader.projectsForCwd(hostCwd)
-        : getProjectContext(hostCwd).allProjects;
+      let resolvedProjects: string[];
+      try {
+        resolvedProjects = this.contextReader
+          ? await this.contextReader.projectsForCwd(hostCwd)
+          : getProjectContext(hostCwd).allProjects;
+      } catch (error) {
+        if (this.answerContextReadTimeout(res, error, {})) return;
+        throw error;
+      }
       projectsParam = resolvedProjects.length > 0 ? resolvedProjects : undefined;
     }
     const forHuman = req.query.colors === 'true';
@@ -455,6 +489,7 @@ export class SearchRoutes extends BaseRouteHandler {
         outcome: 'error',
         duration_ms: Date.now() - injectStartedAt,
       });
+      if (this.answerContextReadTimeout(res, normalizedError, { projects, platformSource, full })) return;
       logger.error('HTTP', 'Context injection failed', { projects, platformSource, full }, normalizedError);
       throw error;
     }
@@ -579,9 +614,10 @@ export class SearchRoutes extends BaseRouteHandler {
       if (!await this.projectsHaveObservations(sessionStore, projects, platformSource)) {
         const port = process.env.CLAUDE_MEM_WORKER_PORT ?? settings.CLAUDE_MEM_WORKER_PORT;
         const viewerUrl = getViewerBaseUrl(port);
+        const promo = proTrialLine('welcome-hint', process.env.CLAUDE_MEM_PRO_PLAN ?? settings.CLAUDE_MEM_PRO_PLAN);
         const hintBody = WELCOME_HINT_TEMPLATE
           .replace('{viewer_url}', viewerUrl)
-          .replace('{pro_trial_line}', proTrialLine('welcome-hint'));
+          .replace('{pro_trial_line}', promo ? `\n${promo}` : '');
         // A project with zero observations is exactly where a failing observer
         // hides: without this the health warning (applied inside
         // generateContextWithStats) never reached the user this early-return serves.
@@ -776,7 +812,7 @@ export class SearchRoutes extends BaseRouteHandler {
         'INVALID_PROJECTS'
       );
     }
-    return scopedProjects({ projects: parseProjectList(entries) });
+    return scopedProjects({ projects: parseProjectList(value) });
   }
 
   private handleOnboardingExplainer = this.wrapHandler((_req: Request, res: Response): void => {

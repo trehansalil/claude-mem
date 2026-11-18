@@ -1,5 +1,6 @@
 // Sample data for the My Rules wireframe only (spec §14). The product shows real rule records or an empty state (§12).
 // Examples are neutral placeholders shaped like real standing preferences from instruction files and prompts.
+import type { WorkViewRule } from './live/work-view-api-types.ts'
 
 /** Scope hierarchy, in page order (§14): everywhere, then per repo, then per situation. A repo is a tag on a rule, never a grouping of work. */
 export type RuleTier = 'everywhere' | 'project' | 'situation'
@@ -19,12 +20,28 @@ export const SAMPLE_RULE_SCOPES: RuleScope[] = [
   { id: 'designs', tier: 'situation', name: 'When reviewing designs' },
 ]
 
-/** A dated quote. `kind` is the request-progress preference kind; instruction-file lines are directives. */
-export interface RuleQuote { at: string; quote: string; kind: 'directive' | 'correction' | 'praise' | 'frustration'; where: 'prompt' | 'CLAUDE.md' }
-/** The records a rule was built from: prompts, request-progress reviews, owner-goals runs, instruction files. */
-export interface RuleRecord { kind: 'Prompt' | 'Review' | 'Goals run' | 'Instructions'; label: string; at: string }
+/**
+ * A dated quote. `kind` is the request-progress preference kind; instruction-file lines are directives. `at` is null
+ * when its time is not recorded, a value My Rules words in the reader's language, never English text (workers before
+ * 16.0.0 wrote "Time not recorded" there, which recordedTime in live/to-work-model.ts reads as null, G19).
+ */
+/** `atIso`: `at`'s instant, the same instant as an ISO time, which My Rules words in the reader's language (lib/display-time.ts); absent in the sample's rules, which carry their words only. */
+export interface RuleQuote { at: string | null; atIso?: string; quote: string; kind: 'directive' | 'correction' | 'praise' | 'frustration'; where: 'prompt' | 'CLAUDE.md' }
+/**
+ * What a record mapped from the worker's rules is, as a value the screen words in the reader's language (Phase 0: no
+ * English mapper text shown as data): a prompt you typed (its words in full in `said`), the build story
+ * request-progress wrote, or My Rules on this computer, where you wrote or saved the rule.
+ */
+export type RuleRecordFact = 'your-prompt' | 'build-story' | 'written-here' | 'saved-here'
+/**
+ * The records a rule was built from: prompts, request-progress reviews, owner-goals runs, instruction files. `label`
+ * is the record in English; the screen shows the words for `fact` when the record has one, and the label otherwise
+ * (sample records, and workers before 16.0.0, which send no `fact`: G19).
+ */
+/** `atIso`: `at`'s instant, the same instant as an ISO time, which My Rules words in the reader's language (lib/display-time.ts); absent in the sample's rules, which carry their words only. */
+export interface RuleRecord { kind: 'Prompt' | 'Review' | 'Goals run' | 'Instructions'; label: string; at: string | null; atIso?: string; fact?: RuleRecordFact; said?: string }
 
-export type RuleStatus = 'on' | 'off' | 'suggested' | 'replaced' | 'dismissed'
+export type RuleStatus = WorkViewRule['status']
 export interface OwnerRule {
   id: string
   scopeId: string
@@ -33,13 +50,18 @@ export interface OwnerRule {
   when: string
   then: string
   quotes: RuleQuote[]
+  quotesOmitted?: WorkViewRule['quotesOmitted']
   timesSeen: number
-  latestAt: string
+  /** The latest time it was seen; null when not recorded (as RuleQuote's `at`). */
+  latestAt: string | null
+  /** `latestAt`'s instant: the same instant as an ISO time, which My Rules words in the reader's language (lib/display-time.ts); absent in the sample's rules, which carry their words only. */
+  latestAtIso?: string
   /** For the strength sort: times seen × recency (§14). */
   latestDaysAgo: number
   source: 'request-progress' | 'owner-goals' | 'you'
   status: RuleStatus
-  replacedBy?: { ruleId: string; at: string }
+  /** The rule now in force in its place, and when it was replaced (null when not recorded, as RuleQuote's `at`). */
+  replacedBy?: { ruleId: string; at: string | null; atIso?: string }
   records: RuleRecord[]
 }
 

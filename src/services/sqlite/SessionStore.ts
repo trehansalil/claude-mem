@@ -1,7 +1,7 @@
 import { emitContextInvalidation } from '../../shared/context-invalidation.js';
 import { Database, type SQLQueryBindings, type Statement } from 'bun:sqlite';
 import { createHash, randomUUID } from 'crypto';
-import { DATA_DIR, DB_PATH, ensureDir, OBSERVER_SESSIONS_PROJECT, USER_SETTINGS_PATH } from '../../shared/paths.js';
+import { DATA_DIR, DB_PATH, ensurePrivateDir, OBSERVER_SESSIONS_PROJECT, USER_SETTINGS_PATH } from '../../shared/paths.js';
 import { logger } from '../../utils/logger.js';
 import type { ProjectKeySource } from '../../utils/project-name.js';
 import { projectReadKeys, projectScopeSql, scopedProjects } from './project-read-keys.js';
@@ -17,7 +17,7 @@ import {
   LatestPromptResult
 } from '../../types/database.js';
 import type { ObservationSearchResult, SessionSummarySearchResult } from './types.js';
-import { computeObservationContentHash, hasStorableTitle } from './observations/store.js';
+import { computeObservationContentHash, computeLegacyObservationContentHash, computeObservationDetailsHash, hasStorableTitle, type ObservationDetails } from './observations/store.js';
 import { parseFileList, replaceObservationFileIndex } from './observations/files.js';
 import { seedReinforcement, reinforceObservation } from '../reinforcement/persist.js';
 import {
@@ -26,8 +26,10 @@ import {
   linkToolUsesToObservation as linkToolUsesToObservationRows,
   getToolUsesByIds as getToolUsesByIdsRows,
   queryToolUses as queryToolUsesRows,
+  queryToolUseIndex as queryToolUseIndexRows,
   countToolUses as countToolUsesRows,
   type ToolUseRow,
+  type ToolUseIndexRow,
   type UpsertToolUseInput,
   type ToolUseQueryFilters,
 } from './tool-uses.js';
@@ -210,12 +212,28 @@ export interface SessionCatalogRow {
   project: string;
   platform_source: string;
   custom_title: string | null;
+  /**
+   * What the session was about: the trimmed `request` of its newest summary (by created_at_epoch, then id) that
+   * has words. Null when the session has no such summary. The viewer titles a Sessions row with it.
+   */
+  summary_title: string | null;
   started_at_epoch: number;
   item_count: number;
 }
 
 const SESSION_CATALOG_DEFAULT_LIMIT = 200;
 const SESSION_CATALOG_MAX_LIMIT = 1000;
+
+/**
+ * The code points JavaScript's String.prototype.trim() removes (ECMAScript WhiteSpace and LineTerminator), as a
+ * SQLite char() call, so "a summary request with words" means the same in the catalog query and in the viewer.
+ * SQLite's one-argument TRIM() removes spaces only, so a request of "\n" would otherwise count as a title.
+ */
+const JS_TRIM_WHITESPACE_SQL = `char(${[
+  0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x20, 0xa0, 0x1680,
+  0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006, 0x2007, 0x2008, 0x2009, 0x200a,
+  0x2028, 0x2029, 0x202f, 0x205f, 0x3000, 0xfeff,
+].join(', ')})`;
 
 /** #3038 near-duplicate dedup tables/columns. v50–55 are taken on main (v53: sdk_sessions.cwd, #3525; v54: FTS trigger scoping, #3284; v55: NOCASE project indexes, #3536). */
 const DEDUP_SCHEMA_VERSION = 56;
@@ -254,7 +272,7 @@ export class SessionStore {
       this.db = dbPathOrDb;
     } else {
       if (dbPathOrDb !== ':memory:') {
-        ensureDir(DATA_DIR);
+        ensurePrivateDir(DATA_DIR);
       }
       this.db = new Database(dbPathOrDb);
     }
@@ -330,6 +348,7 @@ export class SessionStore {
     this.ensureDeliverablesTable();
     this.ensureHookSpoolConsumedTable();
     this.ensureProjectRecencyIndexes();
+    this.ensureSessionCatalogRecencyIndex();
     this.ensureMergedIntoProjectCoveringIndexes();
     this.ensureNativePromptIdentity();
     this.ensureObservationFileIndex();
@@ -384,6 +403,9 @@ export class SessionStore {
       }
       this.db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_user_prompts_native_identity
         ON user_prompts(session_db_id, native_prompt_id) WHERE native_prompt_id IS NOT NULL`);
+      // The feed checks only the next legacy retry window, not the whole session.
+      this.db.run(`CREATE INDEX IF NOT EXISTS idx_user_prompts_legacy_window
+        ON user_prompts(session_db_id, created_at_epoch) WHERE native_prompt_id IS NULL`);
     }).immediate();
   }
 
@@ -1106,10 +1128,11 @@ export class SessionStore {
       { table: 'session_summaries', kind: 'summary' },
       { table: 'user_prompts', kind: 'prompt' },
     ] as const;
+    // bun:sqlite returns null, not undefined, when no row matches.
     const exclusionTableExisted = this.db.prepare(`
       SELECT 1 AS present FROM sqlite_master
       WHERE type = 'table' AND name = 'sync_launch_exclusions'
-    `).get() !== undefined;
+    `).get() != null;
     this.db.run(SYNC_LAUNCH_EXCLUSIONS_DDL);
     this.widenSyncKindCheck('sync_launch_exclusions', SYNC_LAUNCH_EXCLUSIONS_DDL);
 
@@ -2106,6 +2129,7 @@ export class SessionStore {
   private ensureToolUsesTable(): void {
     createToolUsesSchema(this.db);
     this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(51, new Date().toISOString());
+    this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(75, new Date().toISOString());
   }
 
   // v61 — the agent's to-do lists and working state (./work-state.ts). Idempotent
@@ -2145,6 +2169,14 @@ export class SessionStore {
     this.db.run('CREATE INDEX IF NOT EXISTS idx_summaries_project_nocase_recent ON session_summaries(project COLLATE NOCASE, created_at_epoch DESC)');
     this.db.run('CREATE INDEX IF NOT EXISTS idx_summaries_merged_into_nocase_recent ON session_summaries(merged_into_project COLLATE NOCASE, created_at_epoch DESC)');
     this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(63, new Date().toISOString());
+  }
+
+  // A project-filtered viewer catalog needs only its next page. Include both
+  // ordering keys so SQLite can stop in index order instead of sorting every
+  // session in the project, including sessions tied at the same millisecond.
+  private ensureSessionCatalogRecencyIndex(): void {
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_sdk_sessions_project_nocase_recent
+      ON sdk_sessions(project COLLATE NOCASE, started_at_epoch DESC, id DESC)`);
   }
 
   // v64 — projectReadKeys (context cache, every SessionStart render) reads
@@ -2626,6 +2658,7 @@ export class SessionStore {
     this.db.run('CREATE UNIQUE INDEX IF NOT EXISTS idx_advisor_calls_tool_use ON advisor_calls(tool_use_id)');
     this.db.run('CREATE INDEX IF NOT EXISTS idx_advisor_calls_session ON advisor_calls(session_db_id)');
     this.db.run('CREATE INDEX IF NOT EXISTS idx_advisor_calls_project ON advisor_calls(project)');
+    this.db.run('CREATE INDEX IF NOT EXISTS idx_advisor_calls_project_nocase ON advisor_calls(project COLLATE NOCASE)');
     this.db.run('CREATE INDEX IF NOT EXISTS idx_advisor_calls_occurred ON advisor_calls(occurred_at_epoch DESC)');
 
     this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(58, new Date().toISOString());
@@ -2687,7 +2720,7 @@ export class SessionStore {
     const conditions: string[] = [];
 
     if (project) {
-      conditions.push('project = ?');
+      conditions.push('project COLLATE NOCASE = ?');
       params.push(project);
     } else {
       conditions.push('project != ?');
@@ -2872,6 +2905,17 @@ export class SessionStore {
       logger.debug('DB', 'Added metadata column to observations table (#2116)');
     }
 
+    // Match saveMemory's guarded JSON expression so replay checks can seek to
+    // a fingerprint while holding the write lock. Ordinary observations do not
+    // need an entry, and malformed legacy metadata must remain safe to read.
+    this.db.run(`
+      CREATE INDEX IF NOT EXISTS idx_observations_source_fingerprint ON observations(
+        project,
+        CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.sourceFingerprint') END,
+        id DESC
+      ) WHERE CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.sourceFingerprint') END IS NOT NULL
+    `);
+
     this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(30, new Date().toISOString());
   }
 
@@ -2897,8 +2941,9 @@ export class SessionStore {
         SET memory_session_id = ?
         WHERE session_db_id = ?
       `).run(memorySessionId, sessionDbId);
+      // The same-id guard must not skip a repair whose outbox write failed.
+      if (memorySessionId) this.requeuePromptSync(sessionDbId);
     })();
-    if (memorySessionId) this.requeuePromptSync(sessionDbId);
   }
 
   /**
@@ -3108,10 +3153,12 @@ export class SessionStore {
     // A deliberate change of identity is still available through
     // `updateMemorySessionId`. "Ensure registered" means make sure one exists.
     if (session.memory_session_id === null) {
-      this.db.prepare(`
-        UPDATE sdk_sessions SET memory_session_id = ? WHERE id = ?
-      `).run(memorySessionId, sessionDbId);
-      this.requeuePromptSync(sessionDbId);
+      this.db.transaction(() => {
+        this.db.prepare(`
+          UPDATE sdk_sessions SET memory_session_id = ? WHERE id = ?
+        `).run(memorySessionId, sessionDbId);
+        this.requeuePromptSync(sessionDbId);
+      })();
 
       logger.info('DB', 'Registered memory_session_id before storage (FK fix)', {
         sessionDbId,
@@ -3187,18 +3234,14 @@ export class SessionStore {
 
     const projects: string[] = [];
     const seenProjects = new Set<string>();
-    const projectsBySource: Record<string, string[]> = {};
+    const projectsBySource = new Map<string, Set<string>>();
 
     for (const row of rows) {
       const source = normalizePlatformSource(row.platform_source);
 
-      if (!projectsBySource[source]) {
-        projectsBySource[source] = [];
-      }
-
-      if (!projectsBySource[source].includes(row.project)) {
-        projectsBySource[source].push(row.project);
-      }
+      let sourceProjects = projectsBySource.get(source);
+      if (!sourceProjects) projectsBySource.set(source, sourceProjects = new Set());
+      sourceProjects.add(row.project);
 
       if (!seenProjects.has(row.project)) {
         seenProjects.add(row.project);
@@ -3206,13 +3249,13 @@ export class SessionStore {
       }
     }
 
-    const sources = sortPlatformSources(Object.keys(projectsBySource));
+    const sources = sortPlatformSources([...projectsBySource.keys()]);
 
     return {
       projects,
       sources,
       projectsBySource: Object.fromEntries(
-        sources.map(source => [source, projectsBySource[source] || []])
+        sources.map(source => [source, [...(projectsBySource.get(source) ?? [])]])
       )
     };
   }
@@ -3220,9 +3263,11 @@ export class SessionStore {
   /**
    * Session catalog for the viewer's Sessions view: newest first, one row per
    * (platform_source, content_session_id), with the session's combined
-   * observation + summary + prompt count. Paged by `limit`/`offset` and
-   * filterable by project and platform so the payload stays small on large
-   * databases; `hasMore` says whether older sessions follow this page.
+   * observation + summary + prompt count and its newest summary's request as
+   * `summary_title`. Paged by `limit`/`offset` and filterable by project and
+   * platform so the payload stays small on large databases; `hasMore` says
+   * whether older sessions follow this page. Read-only: every per-session
+   * subquery is an index search, never a table scan or a sort.
    */
   getSessionCatalog(
     options: { project?: string; platformSource?: string; limit?: number; offset?: number } = {}
@@ -3235,6 +3280,24 @@ export class SessionStore {
         s.project,
         COALESCE(s.platform_source, '${DEFAULT_PLATFORM_SOURCE}') as platform_source,
         s.custom_title,
+        -- Newest summary with words: its time is the MAX among them, and id breaks a tie in the
+        -- index's own rowid order. Same result as ORDER BY created_at_epoch DESC, id DESC LIMIT 1,
+        -- without a per-session sort (the plan stays free of temp B-trees, which
+        -- tests/sqlite/session-catalog-recency.test.ts checks).
+        (
+          SELECT TRIM(ss.request, ${JS_TRIM_WHITESPACE_SQL})
+          FROM session_summaries ss
+          WHERE ss.memory_session_id = s.memory_session_id
+            AND TRIM(ss.request, ${JS_TRIM_WHITESPACE_SQL}) != ''
+            AND ss.created_at_epoch = (
+              SELECT MAX(newest.created_at_epoch)
+              FROM session_summaries newest
+              WHERE newest.memory_session_id = s.memory_session_id
+                AND TRIM(newest.request, ${JS_TRIM_WHITESPACE_SQL}) != ''
+            )
+          ORDER BY ss.id DESC
+          LIMIT 1
+        ) as summary_title,
         s.started_at_epoch,
         (
           (SELECT COUNT(*) FROM observations o WHERE o.memory_session_id = s.memory_session_id)
@@ -3296,7 +3359,11 @@ export class SessionStore {
   }
 
   getRecentSessionsWithStatus(project: string, limit: number = 3, platformSource?: string): RecentSessionStatusRow[] {
-    const params: any[] = [project];
+    // Adoption retains the session's original project. Use the same complete
+    // merge chains as search, without promoting a partially adopted source.
+    const readKeys = this.getProjectReadKeys([project]);
+    const scope = projectScopeSql('s', readKeys.length ? readKeys : [project], { includeMerged: false });
+    const params: any[] = [...scope.params];
     let platformClause = '';
     if (platformSource) {
       platformClause = `AND COALESCE(NULLIF(s.platform_source, ''), '${DEFAULT_PLATFORM_SOURCE}') = ?`;
@@ -3312,12 +3379,11 @@ export class SessionStore {
           s.started_at,
           s.started_at_epoch,
           s.user_prompt,
-          CASE WHEN sum.memory_session_id IS NOT NULL THEN 1 ELSE 0 END as has_summary
+          EXISTS (SELECT 1 FROM session_summaries sum
+            WHERE sum.memory_session_id = s.memory_session_id) as has_summary
         FROM sdk_sessions s
-        LEFT JOIN session_summaries sum ON s.memory_session_id = sum.memory_session_id
-        WHERE s.project COLLATE NOCASE = ? AND s.memory_session_id IS NOT NULL
+        WHERE ${scope.sql} AND s.memory_session_id IS NOT NULL
         ${platformClause}
-        GROUP BY s.memory_session_id
         ORDER BY s.started_at_epoch DESC
         LIMIT ?
       )
@@ -3386,6 +3452,7 @@ export class SessionStore {
 
   linkToolUsesToObservation(params: {
     contentSessionId: string;
+    platformSource?: string;
     toolUseIds: string[];
     observationId: number;
     memorySessionId?: string | null;
@@ -3395,13 +3462,17 @@ export class SessionStore {
 
   getToolUsesByIds(
     ids: Array<number | string>,
-    options: { limit?: number; project?: string; platformSource?: string; contentSessionId?: string } = {}
+    options: { limit?: number; project?: string; projects?: string[]; platformSource?: string; contentSessionId?: string } = {}
   ): ToolUseRow[] {
     return getToolUsesByIdsRows(this.db, ids, options);
   }
 
   queryToolUses(filters: ToolUseQueryFilters = {}): ToolUseRow[] {
     return queryToolUsesRows(this.db, filters);
+  }
+
+  queryToolUseIndex(filters: ToolUseQueryFilters = {}): ToolUseIndexRow[] {
+    return queryToolUseIndexRows(this.db, filters);
   }
 
   appendWorkStateEntry(entry: { project: string; listName: string; fields: WorkStateFields; createdAtEpoch?: number }): number {
@@ -3448,8 +3519,9 @@ export class SessionStore {
     const orderClause = preserveIdOrder ? '' : `ORDER BY o.created_at_epoch ${direction}, o.id ${direction}`;
     const limitClause = limit && !preserveIdOrder ? 'LIMIT ?' : '';
 
-    const placeholders = ids.map(() => '?').join(',');
-    const params: any[] = [...ids];
+    // Corpus builds can select more rows than SQLite permits bind parameters.
+    // Keep one native ID membership query, with filters/order/limit applied once.
+    const params: any[] = [JSON.stringify(ids)];
     const additionalConditions: string[] = [];
 
     if (projects.length > 0) {
@@ -3509,8 +3581,8 @@ export class SessionStore {
     }
 
     const whereClause = additionalConditions.length > 0
-      ? `WHERE o.id IN (${placeholders}) AND ${additionalConditions.join(' AND ')}`
-      : `WHERE o.id IN (${placeholders})`;
+      ? `WHERE o.id IN (SELECT value FROM json_each(?)) AND ${additionalConditions.join(' AND ')}`
+      : `WHERE o.id IN (SELECT value FROM json_each(?))`;
     if (limitClause) params.push(limit);
 
     const stmt = this.db.prepare(`
@@ -3852,68 +3924,73 @@ export class SessionStore {
       this.validateSetTitleMutation(contentSessionId, normalizedPlatformSource, customTitle);
     }
 
-    const existing = this.db.prepare(`
-      SELECT id, platform_source
-      FROM sdk_sessions
-      WHERE COALESCE(NULLIF(platform_source, ''), ?) = ?
-        AND content_session_id = ?
-    `).get(DEFAULT_PLATFORM_SOURCE, normalizedPlatformSource, contentSessionId) as { id: number; platform_source: string | null } | undefined;
+    // The title has no independently synced session row: its outbox mutation
+    // is the only way another device learns it. Commit both together so a
+    // failed enqueue cannot leave a filled title that retries will skip.
+    return this.db.transaction(() => {
+      const existing = this.db.prepare(`
+        SELECT id, platform_source
+        FROM sdk_sessions
+        WHERE COALESCE(NULLIF(platform_source, ''), ?) = ?
+          AND content_session_id = ?
+      `).get(DEFAULT_PLATFORM_SOURCE, normalizedPlatformSource, contentSessionId) as { id: number; platform_source: string | null } | undefined;
 
-    if (existing) {
-      if (project) {
-        // 'unknown' is the placeholder ingest paths register when a payload has
-        // no cwd (#4772); a later init with the real project must repair it, but
-        // a real project is never demoted back to the placeholder. 'unknown' is
-        // also a legitimate path-mode project name — a non-git checkout literally
-        // named `unknown` resolves to it (#4774 review) — so only repair rows
-        // that provably hold the placeholder: every ingest/init path that
-        // resolves a real cwd also records it via setSessionCwd (first-write-wins,
-        // guarded on cwd IS NULL), so a stored 'unknown' with a NULL cwd can only
-        // come from a no-cwd payload.
-        this.db.prepare(`
-          UPDATE sdk_sessions SET project = ?
-          WHERE id = ? AND (project IS NULL OR project = '' OR (project = 'unknown' AND cwd IS NULL))
-        `).run(project, existing.id);
-      }
-      // A tool-first init persists the placeholder; the first real prompt repairs it.
-      // Real prompts are never overwritten by later real prompts.
-      if (storedUserPrompt && storedUserPrompt !== MEDIA_PROMPT_PLACEHOLDER) {
-        this.db.prepare(`
-          UPDATE sdk_sessions SET user_prompt = ?
-          WHERE id = ? AND (user_prompt IS NULL OR user_prompt = '' OR user_prompt = ?)
-        `).run(storedUserPrompt, existing.id, MEDIA_PROMPT_PLACEHOLDER);
-      }
-      if (customTitle) {
-        // SELECT-then-UPDATE, never a decision on `.run().changes`
-        // (bun:sqlite reports unreliable `changes` after RETURNING statements
-        // on this connection — see the note in SyncApply.applySetTitle). The
-        // set_title op is emitted only when the NULL-guarded fill actually
-        // landed, mirroring what replicas will apply.
-        const current = this.db.prepare(
-          'SELECT custom_title FROM sdk_sessions WHERE id = ?'
-        ).get(existing.id) as { custom_title: string | null } | undefined;
-        if (current && current.custom_title === null) {
+      if (existing) {
+        if (project) {
+          // 'unknown' is the placeholder ingest paths register when a payload has
+          // no cwd (#4772); a later init with the real project must repair it, but
+          // a real project is never demoted back to the placeholder. 'unknown' is
+          // also a legitimate path-mode project name — a non-git checkout literally
+          // named `unknown` resolves to it (#4774 review) — so only repair rows
+          // that provably hold the placeholder: every ingest/init path that
+          // resolves a real cwd also records it via setSessionCwd (first-write-wins,
+          // guarded on cwd IS NULL), so a stored 'unknown' with a NULL cwd can only
+          // come from a no-cwd payload.
           this.db.prepare(`
-            UPDATE sdk_sessions SET custom_title = ?
-            WHERE id = ? AND custom_title IS NULL
-          `).run(customTitle, existing.id);
-          this.enqueueSetTitleOp(contentSessionId, normalizedPlatformSource, customTitle);
+            UPDATE sdk_sessions SET project = ?
+            WHERE id = ? AND (project IS NULL OR project = '' OR (project = 'unknown' AND cwd IS NULL))
+          `).run(project, existing.id);
         }
+        // A tool-first init persists the placeholder; the first real prompt repairs it.
+        // Real prompts are never overwritten by later real prompts.
+        if (storedUserPrompt && storedUserPrompt !== MEDIA_PROMPT_PLACEHOLDER) {
+          this.db.prepare(`
+            UPDATE sdk_sessions SET user_prompt = ?
+            WHERE id = ? AND (user_prompt IS NULL OR user_prompt = '' OR user_prompt = ?)
+          `).run(storedUserPrompt, existing.id, MEDIA_PROMPT_PLACEHOLDER);
+        }
+        if (customTitle) {
+          // SELECT-then-UPDATE, never a decision on `.run().changes`
+          // (bun:sqlite reports unreliable `changes` after RETURNING statements
+          // on this connection — see the note in SyncApply.applySetTitle). The
+          // set_title op is emitted only when the NULL-guarded fill actually
+          // landed, mirroring what replicas will apply.
+          const current = this.db.prepare(
+            'SELECT custom_title FROM sdk_sessions WHERE id = ?'
+          ).get(existing.id) as { custom_title: string | null } | undefined;
+          if (current && current.custom_title === null) {
+            this.db.prepare(`
+              UPDATE sdk_sessions SET custom_title = ?
+              WHERE id = ? AND custom_title IS NULL
+            `).run(customTitle, existing.id);
+            this.enqueueSetTitleOp(contentSessionId, normalizedPlatformSource, customTitle);
+          }
+        }
+        return existing.id;
       }
-      return existing.id;
-    }
 
-    const result = this.db.prepare(`
-      INSERT INTO sdk_sessions
-      (content_session_id, memory_session_id, project, platform_source, user_prompt, custom_title, started_at, started_at_epoch, status)
-      VALUES (?, NULL, ?, ?, ?, ?, ?, ?, 'active')
-    `).run(contentSessionId, project, normalizedPlatformSource, storedUserPrompt, customTitle || null, now.toISOString(), nowEpoch);
+      const result = this.db.prepare(`
+        INSERT INTO sdk_sessions
+        (content_session_id, memory_session_id, project, platform_source, user_prompt, custom_title, started_at, started_at_epoch, status)
+        VALUES (?, NULL, ?, ?, ?, ?, ?, ?, 'active')
+      `).run(contentSessionId, project, normalizedPlatformSource, storedUserPrompt, customTitle || null, now.toISOString(), nowEpoch);
 
-    if (customTitle) {
-      this.enqueueSetTitleOp(contentSessionId, normalizedPlatformSource, customTitle);
-    }
+      if (customTitle) {
+        this.enqueueSetTitleOp(contentSessionId, normalizedPlatformSource, customTitle);
+      }
 
-    return Number(result.lastInsertRowid);
+      return Number(result.lastInsertRowid);
+    }).immediate();
   }
 
   // First write wins: cwd drifts when the agent `cd`s into a subdirectory, and
@@ -3933,6 +4010,17 @@ export class SessionStore {
       | { cwd: string | null }
       | null;
     return row?.cwd ?? null;
+  }
+
+  /**
+   * Whether this computer recorded the conversation a work-view conversation key names, and the checkout it was
+   * launched in (null when none was recorded). Served by the unique index ux_sdk_sessions_platform_content.
+   */
+  getRecordedFolderForConversation(platformSource: string, contentSessionId: string): { sessionIsRecorded: boolean; recordedFolder: string | null } {
+    const row = this.db.prepare('SELECT cwd FROM sdk_sessions WHERE platform_source = ? AND content_session_id = ?')
+      .get(platformSource, contentSessionId) as { cwd: string | null } | null | undefined;
+    if (!row) return { sessionIsRecorded: false, recordedFolder: null };
+    return { sessionIsRecorded: true, recordedFolder: row.cwd ?? null };
   }
 
   /**
@@ -4041,15 +4129,26 @@ export class SessionStore {
     platformSource: string; contentSessionId: string; project: string;
     nativePromptId: string; promptText: string; createdAtEpoch: number;
     hookTextVariants?: string[]; hookMatchWindowMs: number; claimedHookRowIds: Set<number>;
-  }): { reason: 'new' | 'already-imported' | 'recorded-by-hook' | 'private'; hookRowId?: number } {
+  }): { reason: 'new' | 'already-imported' | 'recorded-by-hook' | 'private' | 'deleted'; hookRowId?: number } {
     const text = normalizeStoredPromptText(prompt.promptText);
     if (!text) return { reason: 'private' };
     const platformSource = normalizePlatformSource(prompt.platformSource);
+    // A resumed conversation has a new session row, but its old transcript
+    // still contains the asks the owner deleted. Only later source times return.
+    if (this.isBeforeSessionDeletion(platformSource, prompt.contentSessionId, prompt.createdAtEpoch)) {
+      return { reason: 'deleted' };
+    }
     const session = this.db.prepare(`SELECT id FROM sdk_sessions
       WHERE COALESCE(NULLIF(platform_source, ''), ?) = ? AND content_session_id = ?`)
       .get(DEFAULT_PLATFORM_SOURCE, platformSource, prompt.contentSessionId) as { id: number } | null;
     let sessionDbId = session?.id;
-    if (sessionDbId !== undefined) {
+    const nativePromptId = `transcript:${prompt.nativePromptId}`;
+    // A replay already owns its native row. It must not claim a nearby hook
+    // row belonging to another turn; saveNativeUserPrompt below still checks
+    // the replay's full-text hash before reporting it as already imported.
+    const alreadyImported = sessionDbId !== undefined && this.db.prepare(`SELECT 1 FROM user_prompts
+      WHERE session_db_id = ? AND native_prompt_id = ?`).get(sessionDbId, nativePromptId);
+    if (sessionDbId !== undefined && !alreadyImported) {
       const texts = [text, ...(prompt.hookTextVariants ?? []).map(normalizeStoredPromptText).filter(Boolean)];
       const hookRows = this.db.prepare(`SELECT id, created_at_epoch FROM user_prompts
         WHERE session_db_id = ? AND native_prompt_id IS NULL
@@ -4062,7 +4161,7 @@ export class SessionStore {
         prompt.claimedHookRowIds.add(hookRow.id);
         return { reason: 'recorded-by-hook', hookRowId: hookRow.id };
       }
-    } else {
+    } else if (sessionDbId === undefined) {
       const at = new Date(prompt.createdAtEpoch).toISOString();
       const inserted = this.db.prepare(`INSERT INTO sdk_sessions
         (content_session_id, memory_session_id, project, platform_source, user_prompt, started_at, started_at_epoch, completed_at, completed_at_epoch, status)
@@ -4070,7 +4169,7 @@ export class SessionStore {
         .run(prompt.contentSessionId, prompt.project, platformSource, text, at, prompt.createdAtEpoch, at, prompt.createdAtEpoch);
       sessionDbId = Number(inserted.lastInsertRowid);
     }
-    const result = this.saveNativeUserPrompt(prompt.contentSessionId, sessionDbId, `transcript:${prompt.nativePromptId}`,
+    const result = this.saveNativeUserPrompt(prompt.contentSessionId, sessionDbId, nativePromptId,
       prompt.promptText, prompt.promptText, { createdAtEpoch: prompt.createdAtEpoch, reopenSession: false });
     return { reason: result.duplicate ? 'already-imported' : 'new' };
   }
@@ -4385,8 +4484,9 @@ export class SessionStore {
         RETURNING id
       `);
       const lookupExistingStmt = this.db.prepare(
-        'SELECT id FROM observations WHERE memory_session_id = ? AND content_hash = ?'
+        'SELECT id, type, subtitle, facts, concepts FROM observations WHERE memory_session_id = ? AND content_hash = ?'
       );
+      type ExistingObservation = ObservationDetails & { id: number };
 
       for (const observation of observations) {
         // Skip observations with an empty title (see hasStorableTitle). The worker
@@ -4396,7 +4496,37 @@ export class SessionStore {
           continue;
         }
 
-        const contentHash = computeObservationContentHash(memorySessionId, observation.title, observation.narrative);
+        const legacyHash = computeObservationContentHash(memorySessionId, observation.title, observation.narrative);
+        if (legacyHash.startsWith('tuple-')) {
+          const previousHash = computeLegacyObservationContentHash(memorySessionId, observation.title, observation.narrative);
+          const previousDetailsHash = computeObservationDetailsHash(previousHash, observation);
+          // Both old hashes are ambiguous. Reuse only a complete content match,
+          // never restore an old base hash that could select another variant.
+          const previous = (this.db.prepare(`SELECT id, type, subtitle, facts, concepts FROM observations
+            WHERE memory_session_id = ? AND content_hash IN (?, ?)
+              AND title IS ? AND COALESCE(narrative, '') = ?
+            ORDER BY content_hash = ? DESC`)
+            .all(memorySessionId, previousHash, previousDetailsHash,
+              observation.title, observation.narrative ?? '', previousDetailsHash) as ExistingObservation[])
+            .find(row => computeObservationDetailsHash(previousHash, row) === previousDetailsHash);
+          if (previous) {
+            reinforceObservation(this.db, previous.id, reconfirmedOn);
+            observationIds.push(previous.id);
+            mergedIntoExisting.push(false);
+            continue;
+          }
+        }
+        const detailsHash = computeObservationDetailsHash(legacyHash, observation);
+        let contentHash = legacyHash;
+        // A variant keeps its identity even if the row occupying the legacy
+        // hash was subsequently deleted. Check it before choosing a free hash.
+        const detailedRetry = lookupExistingStmt.get(memorySessionId, detailsHash) as ExistingObservation | null;
+        if (detailedRetry) {
+          reinforceObservation(this.db, detailedRetry.id, reconfirmedOn);
+          observationIds.push(detailedRetry.id);
+          mergedIntoExisting.push(false);
+          continue;
+        }
         const titleNormKey = computeTitleNormKey(
           project,
           sessionPlatform,
@@ -4409,7 +4539,11 @@ export class SessionStore {
         if (dedup.enabled) {
           // Retry idempotency: identical (session, content_hash) redelivery returns
           // the existing row without bumping occurrence_count (same as ON CONFLICT).
-          const retry = lookupExistingStmt.get(memorySessionId, contentHash) as { id: number } | null;
+          let retry = lookupExistingStmt.get(memorySessionId, contentHash) as ExistingObservation | null;
+          if (retry && computeObservationDetailsHash(legacyHash, retry) !== detailsHash) {
+            contentHash = detailsHash;
+            retry = null;
+          }
           if (retry) {
             reinforceObservation(this.db, retry.id, reconfirmedOn);
             observationIds.push(retry.id);
@@ -4419,7 +4553,7 @@ export class SessionStore {
 
           // Authored note revisions may keep a title while changing their facts.
           // They still dedupe exact content, but must not collapse by title alone.
-          const canonical = options.skipTitleDedup ? null : findTier0Canonical(this.db, project, titleNormKey);
+          const canonical = options.skipTitleDedup ? null : findTier0Canonical(this.db, project, titleNormKey, observation.title);
           if (canonical) {
             this.db.prepare('UPDATE observations SET occurrence_count = occurrence_count + 1 WHERE id = ?').run(canonical.id);
             reinforceObservation(this.db, canonical.id, reconfirmedOn);
@@ -4429,7 +4563,7 @@ export class SessionStore {
           }
         }
 
-        const inserted = (obsStmt.all(
+        const insertObservation = () => (obsStmt.all(
           memorySessionId,
           project,
           observation.type,
@@ -4454,6 +4588,17 @@ export class SessionStore {
           reinforcementSeed.lastReinforced
         ) as { id: number }[])[0] ?? null;
 
+        let inserted = insertObservation();
+        let existing = inserted ? null : lookupExistingStmt.get(memorySessionId, contentHash) as ExistingObservation | null;
+        // Equal title/narrative can still carry different structured content.
+        // Keep the legacy row's id/hash and store the other details separately.
+        if (existing && contentHash === legacyHash
+          && computeObservationDetailsHash(legacyHash, existing) !== detailsHash) {
+          contentHash = detailsHash;
+          inserted = insertObservation();
+          existing = inserted ? null : lookupExistingStmt.get(memorySessionId, contentHash) as ExistingObservation | null;
+        }
+
         if (inserted) {
           if (dedup.enabled) this.maintainDedupOnInsert(project, inserted.id, observation.title, dedup);
           this.indexObservationFiles(inserted.id, observation.files_read, observation.files_modified);
@@ -4463,7 +4608,6 @@ export class SessionStore {
           continue;
         }
 
-        const existing = lookupExistingStmt.get(memorySessionId, contentHash) as { id: number } | null;
         if (!existing) {
           throw new Error(
             `storeObservations: ON CONFLICT without existing row for content_hash=${contentHash}`
@@ -4588,8 +4732,12 @@ export class SessionStore {
       return { observationIds, mergedIntoExisting, insertedObservationIds, summaryId, createdAtEpoch: timestampEpoch, summaryUpdated };
     });
 
-    const stored = storeTx();
-    emitContextInvalidation({ projects: [project] }, 'storeObservations');
+    // Identity reads and their writes share the writer lock, avoiding a stale
+    // read snapshot if another connection commits before our first insert.
+    const stored = storeTx.immediate();
+    // A later stop replaces the same prompt's summary, including clearing
+    // completed next steps. Do not serve that previous text while rendering.
+    emitContextInvalidation({ projects: [project] }, 'storeObservations', stored.summaryUpdated ? 'removal' : 'additive');
     return stored;
   }
 
@@ -4602,13 +4750,27 @@ export class SessionStore {
    */
   updateDiscoveryTokens(observationIds: number[], summaryId: number | null, discoveryTokens: number): void {
     if (observationIds.length === 0 && summaryId === null) return;
+    const projects = new Set<string>();
     this.db.transaction(() => {
-      const observationStmt = this.db.prepare('UPDATE observations SET discovery_tokens = ? WHERE id = ?');
-      for (const id of observationIds) observationStmt.run(discoveryTokens, id);
+      // The assistant row may already have synced before the result corrects
+      // its usage. Mark changed payloads for the existing CloudSync snapshotter,
+      // which mints their next canonical revision against the acknowledged head.
+      const observationStmt = this.db.prepare(`UPDATE observations SET discovery_tokens = ?,
+        synced_at = CASE WHEN discovery_tokens IS NOT ? THEN NULL ELSE synced_at END
+        WHERE id = ? AND discovery_tokens IS NOT ? RETURNING project, merged_into_project`);
+      for (const id of observationIds) {
+        const changed = observationStmt.all(discoveryTokens, discoveryTokens, id, discoveryTokens) as Array<{ project: string; merged_into_project: string | null }>;
+        for (const row of changed) for (const project of importedRowProjects(row)) projects.add(project);
+      }
       if (summaryId !== null) {
-        this.db.prepare('UPDATE session_summaries SET discovery_tokens = MAX(COALESCE(discovery_tokens, 0), ?) WHERE id = ?').run(discoveryTokens, summaryId);
+        this.db.prepare(`UPDATE session_summaries SET discovery_tokens = MAX(COALESCE(discovery_tokens, 0), ?),
+          synced_at = CASE WHEN COALESCE(discovery_tokens, 0) < ? THEN NULL ELSE synced_at END WHERE id = ?`)
+          .run(discoveryTokens, discoveryTokens, summaryId);
       }
     })();
+    // A completed result can correct usage after the first context render.
+    // Refresh only blocks reading changed observations, after the write commits.
+    if (projects.size > 0) emitContextInvalidation({ projects: [...projects] }, 'updateDiscoveryTokens');
   }
 
   getSessionSummariesByIds(
@@ -4624,8 +4786,7 @@ export class SessionStore {
     const direction = orderBy === 'date_asc' ? 'ASC' : 'DESC';
     const orderClause = preserveIdOrder ? '' : `ORDER BY ss.created_at_epoch ${direction}, ss.id ${direction}`;
     const limitClause = limit && !preserveIdOrder ? 'LIMIT ?' : '';
-    const placeholders = ids.map(() => '?').join(',');
-    const params: any[] = [...ids];
+    const params: any[] = [JSON.stringify(ids)];
     const additionalConditions: string[] = [];
 
     if (projects.length > 0) {
@@ -4648,7 +4809,7 @@ export class SessionStore {
       SELECT ss.*
       FROM session_summaries ss
       LEFT JOIN sdk_sessions s ON s.memory_session_id = ss.memory_session_id
-      WHERE ss.id IN (${placeholders}) ${additionalFilter}
+      WHERE ss.id IN (SELECT value FROM json_each(?)) ${additionalFilter}
       ${orderClause}
       ${limitClause}
     `);
@@ -4674,8 +4835,7 @@ export class SessionStore {
     const direction = orderBy === 'date_asc' ? 'ASC' : 'DESC';
     const orderClause = preserveIdOrder ? '' : `ORDER BY up.created_at_epoch ${direction}, up.id ${direction}`;
     const limitClause = limit && !preserveIdOrder ? 'LIMIT ?' : '';
-    const placeholders = ids.map(() => '?').join(',');
-    const params: any[] = [...ids];
+    const params: any[] = [JSON.stringify(ids)];
     const additionalConditions: string[] = [];
 
     if (projects.length > 0) {
@@ -4702,7 +4862,7 @@ export class SessionStore {
         COALESCE(NULLIF(s.platform_source, ''), '${DEFAULT_PLATFORM_SOURCE}') as platform_source
       FROM user_prompts up
       JOIN sdk_sessions s ON up.session_db_id = s.id
-      WHERE up.id IN (${placeholders}) ${additionalFilter}
+      WHERE up.id IN (SELECT value FROM json_each(?)) ${additionalFilter}
       ${orderClause}
       ${limitClause}
     `);
@@ -4908,35 +5068,73 @@ export class SessionStore {
       }
     }
 
-    // `id` breaks created_at_epoch ties so a turn's rows (which share one epoch) render in the
-    // order they were written instead of whatever order the index scan returns them in.
-    const obsQuery = `
-      SELECT o.*
-      FROM observations o
-      LEFT JOIN sdk_sessions src ON src.memory_session_id = o.memory_session_id
-      WHERE o.created_at_epoch >= ? AND o.created_at_epoch <= ? ${observationScope.clause}
-      ORDER BY o.created_at_epoch ASC, o.id ASC
-    `;
+    // The rendered timeline counts all three record kinds. Observation-only
+    // bounds miss prompts and summaries outside the observation history (or
+    // every neighbor when a project has no observations). Probe those kinds
+    // with the same scope and include their requested boundary epochs too.
+    for (const source of [
+      { alias: 'ss', from: 'session_summaries ss LEFT JOIN sdk_sessions src ON src.memory_session_id = ss.memory_session_id', scope: summaryScope },
+      { alias: 'up', from: 'user_prompts up JOIN sdk_sessions s ON up.session_db_id = s.id', scope: promptScope },
+    ]) {
+      for (const side of [
+        { comparison: '<', order: 'DESC', depth: depthBefore },
+        { comparison: '>', order: 'ASC', depth: depthAfter },
+      ]) {
+        if (side.depth === 0) continue;
+        const rows = this.db.prepare(`
+          SELECT ${source.alias}.created_at_epoch
+          FROM ${source.from}
+          WHERE ${source.alias}.created_at_epoch ${side.comparison} ? ${source.scope.clause}
+          ORDER BY ${source.alias}.created_at_epoch ${side.order}
+          LIMIT ?
+        `).all(anchorEpoch, ...source.scope.params, side.depth) as Array<{ created_at_epoch: number }>;
+        const boundary = rows.at(-1)?.created_at_epoch ?? anchorEpoch;
+        startEpoch = Math.min(startEpoch, boundary);
+        endEpoch = Math.max(endEpoch, boundary);
+      }
+    }
 
-    const sessQuery = `
-      SELECT ss.*
-      FROM session_summaries ss
-      LEFT JOIN sdk_sessions src ON src.memory_session_id = ss.memory_session_id
-      WHERE ss.created_at_epoch >= ? AND ss.created_at_epoch <= ? ${summaryScope.clause}
-      ORDER BY ss.created_at_epoch ASC, ss.id ASC
-    `;
+    // A sparse category can stretch the shared time window over thousands of
+    // rows in a dense one. Only depthBefore/depthAfter neighbors per category
+    // can survive the final merged depth selection; apply those limits before
+    // hydrating full bodies. Keep the entire anchor epoch group, which an
+    // epoch/session anchor deliberately returns even with zero depth.
+    const readCandidates = <T>(
+      select: string,
+      from: string,
+      alias: string,
+      scope: { clause: string; params: any[] }
+    ): T[] => this.db.prepare(`
+      SELECT * FROM (
+        SELECT ${select} FROM ${from}
+        WHERE ${alias}.created_at_epoch >= ? AND ${alias}.created_at_epoch < ? ${scope.clause}
+        ORDER BY ${alias}.created_at_epoch DESC, ${alias}.id DESC LIMIT ?
+      )
+      UNION ALL
+      SELECT ${select} FROM ${from}
+      WHERE ${alias}.created_at_epoch = ? ${scope.clause}
+      UNION ALL
+      SELECT * FROM (
+        SELECT ${select} FROM ${from}
+        WHERE ${alias}.created_at_epoch > ? AND ${alias}.created_at_epoch <= ? ${scope.clause}
+        ORDER BY ${alias}.created_at_epoch ASC, ${alias}.id ASC LIMIT ?
+      )
+      ORDER BY created_at_epoch ASC, id ASC
+    `).all(
+      startEpoch, anchorEpoch, ...scope.params, depthBefore,
+      anchorEpoch, ...scope.params,
+      anchorEpoch, endEpoch, ...scope.params, depthAfter,
+    ) as T[];
 
-    const promptQuery = `
-      SELECT up.*, s.project, s.memory_session_id, COALESCE(NULLIF(s.platform_source, ''), '${DEFAULT_PLATFORM_SOURCE}') as platform_source
-      FROM user_prompts up
-      JOIN sdk_sessions s ON up.session_db_id = s.id
-      WHERE up.created_at_epoch >= ? AND up.created_at_epoch <= ? ${promptScope.clause}
-      ORDER BY up.created_at_epoch ASC, up.id ASC
-    `;
-
-    const observations = this.db.prepare(obsQuery).all(startEpoch, endEpoch, ...observationScope.params) as ObservationRecord[];
-    const sessions = this.db.prepare(sessQuery).all(startEpoch, endEpoch, ...summaryScope.params) as SessionSummaryRecord[];
-    const prompts = this.db.prepare(promptQuery).all(startEpoch, endEpoch, ...promptScope.params) as UserPromptRecord[];
+    const observations = readCandidates<ObservationRecord>('o.*',
+      'observations o LEFT JOIN sdk_sessions src ON src.memory_session_id = o.memory_session_id',
+      'o', observationScope);
+    const sessions = readCandidates<SessionSummaryRecord>('ss.*',
+      'session_summaries ss LEFT JOIN sdk_sessions src ON src.memory_session_id = ss.memory_session_id',
+      'ss', summaryScope);
+    const prompts = readCandidates<UserPromptRecord>(
+      `up.*, s.project, s.memory_session_id, COALESCE(NULLIF(s.platform_source, ''), '${DEFAULT_PLATFORM_SOURCE}') as platform_source`,
+      'user_prompts up JOIN sdk_sessions s ON up.session_db_id = s.id', 'up', promptScope);
 
     return {
       observations,
@@ -4964,31 +5162,69 @@ export class SessionStore {
   }
 
   getOrCreateManualSession(project: string, platformSource = DEFAULT_PLATFORM_SOURCE): string {
-    const normalizedPlatformSource = normalizePlatformSource(platformSource);
-    const memorySessionId = `manual-${project}-${normalizedPlatformSource}`;
-    const contentSessionId = `manual-content-${project}-${normalizedPlatformSource}`;
+    // Order session selection/creation with DELETE, including other connections.
+    return this.db.transaction(() => {
+      const normalizedPlatformSource = normalizePlatformSource(platformSource);
+      const baseMemorySessionId = `manual-${project}-${normalizedPlatformSource}`;
+      const contentSessionId = `manual-content-${project}-${normalizedPlatformSource}`;
+      const existing = this.db.prepare(`
+        SELECT memory_session_id FROM sdk_sessions WHERE platform_source = ? AND content_session_id = ?
+      `).get(normalizedPlatformSource, contentSessionId) as { memory_session_id: string } | undefined;
+      if (existing) return existing.memory_session_id;
 
-    const existing = this.db.prepare(
-      'SELECT memory_session_id FROM sdk_sessions WHERE memory_session_id = ?'
-    ).get(memorySessionId) as { memory_session_id: string } | undefined;
+      // Manual sessions written before the content-session lookup above can
+      // carry another content_session_id shape (e.g. equal to the memory ID).
+      // The base memory ID is unique, so reuse that row rather than INSERT a
+      // duplicate, which failed every save in the project with a UNIQUE error.
+      const existingByMemoryId = this.db.prepare(
+        'SELECT memory_session_id, project, platform_source FROM sdk_sessions WHERE memory_session_id = ?'
+      ).get(baseMemorySessionId) as { memory_session_id: string; project: string; platform_source: string } | undefined;
+      if (existingByMemoryId?.project === project
+        && normalizePlatformSource(existingByMemoryId.platform_source) === normalizedPlatformSource) {
+        return existingByMemoryId.memory_session_id;
+      }
 
-    if (existing) {
+      // A deleted memory ID stays forbidden to delayed sync/backup rows. A new
+      // manual save gets a fresh identity, then reuses it through the stable
+      // content session lookup above, including after a worker restart.
+      const wasDeleted = this.db.prepare(
+        'SELECT 1 FROM deleted_memory_sessions WHERE memory_session_id = ?'
+      ).get(baseMemorySessionId);
+      // Hyphens in a project or custom source can give distinct pairs the
+      // same base ID. Never reuse another pair's session or its attribution.
+      const memorySessionId = wasDeleted || existingByMemoryId ? `${baseMemorySessionId}-${randomUUID()}` : baseMemorySessionId;
+      const deletedAt = this.getSessionDeletedAtEpochMs(normalizedPlatformSource, contentSessionId);
+      // This explicit save follows the deletion observed under the writer lock,
+      // even when both operations share one wall-clock millisecond.
+      const now = new Date(Math.max(Date.now(), (deletedAt ?? -1) + 1));
+      this.db.prepare(`
+        INSERT INTO sdk_sessions (memory_session_id, content_session_id, project, platform_source, started_at, started_at_epoch, status)
+        VALUES (?, ?, ?, ?, ?, ?, 'active')
+      `).run(memorySessionId, contentSessionId, project, normalizedPlatformSource, now.toISOString(), now.getTime());
+
+      logger.info('SESSION', 'Created manual session', { memorySessionId, project, platformSource: normalizedPlatformSource });
       return memorySessionId;
-    }
-
-    const now = new Date();
-    this.db.prepare(`
-      INSERT INTO sdk_sessions (memory_session_id, content_session_id, project, platform_source, started_at, started_at_epoch, status)
-      VALUES (?, ?, ?, ?, ?, ?, 'active')
-    `).run(memorySessionId, contentSessionId, project, normalizedPlatformSource, now.toISOString(), now.getTime());
-
-    logger.info('SESSION', 'Created manual session', { memorySessionId, project, platformSource: normalizedPlatformSource });
-
-    return memorySessionId;
+    }).immediate();
   }
 
   close(): void {
-    this.db.close();
+    // bun keeps a prepared statement — and with it the connection, its WAL index mapping and the
+    // database file — alive until the statement is finalized or collected, so a plain `db.close()`
+    // releases nothing while this store still holds its cache. Finalize the cached statements first,
+    // the way initializeOwnedDatabase does; then close strict, which Windows needs before the file
+    // or its directory can be renamed or removed.
+    for (const statement of this.statementCache.values()) statement.finalize();
+    this.statementCache.clear();
+    try {
+      this.db.close(true);
+    } catch (error) {
+      // Bun before 1.4 refuses a strict close ("database is locked") while any statement is still
+      // outstanding, and this store also prepares uncached statements (db.prepare / db.query).
+      // package.json allows those Bun versions, so fall back to the lazy close main always did
+      // and say so, instead of throwing out of every close().
+      logger.warn('DB', 'Strict close refused (statements outstanding on this Bun); falling back to lazy close', {}, error as Error);
+      this.db.close(false);
+    }
   }
 
   /**
@@ -5165,6 +5401,11 @@ export class SessionStore {
     agent_type?: string | null;
     agent_id?: string | null;
     merged_into_project?: string | null;
+    metadata?: string | null;
+    generated_by_model?: string | null;
+    occurrence_count?: number;
+    reinforcement_dates?: string | null;
+    last_reinforced?: string | null;
   }): { imported: boolean; id: number } {
     // A row from a legacy or hand-edited export can arrive without a session
     // id, and observations.memory_session_id is NOT NULL. /api/import validates
@@ -5199,13 +5440,27 @@ export class SessionStore {
       return { imported: false, id: existing.id };
     }
 
+    // These are recorded memory attributes, not this installation's sync
+    // identity. Keep them on a fresh import so note fingerprints still prevent
+    // re-ingestion and reinforced memories retain their selection history.
+    for (const field of ['metadata', 'generated_by_model', 'reinforcement_dates', 'last_reinforced'] as const) {
+      if (obs[field] != null && typeof obs[field] !== 'string') {
+        throw new TypeError(`Imported ${field} must be a string or null`);
+      }
+    }
+    const occurrenceCount = obs.occurrence_count ?? 1;
+    if (!Number.isSafeInteger(occurrenceCount) || occurrenceCount < 1) {
+      throw new TypeError('Imported occurrence_count must be a positive safe integer');
+    }
+
     const stmt = this.db.prepare(`
       INSERT INTO observations (
         memory_session_id, project, text, type, title, subtitle,
         facts, narrative, concepts, files_read, files_modified,
         prompt_number, discovery_tokens, agent_type, agent_id,
-        created_at, created_at_epoch, merged_into_project
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        created_at, created_at_epoch, merged_into_project,
+        metadata, generated_by_model, occurrence_count, reinforcement_dates, last_reinforced
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     // The row and its observation_files mappings commit together: an import
@@ -5231,10 +5486,29 @@ export class SessionStore {
         obs.agent_id ?? null,
         obs.created_at,
         obs.created_at_epoch,
-        typeof obs.merged_into_project === 'string' ? obs.merged_into_project : null
+        typeof obs.merged_into_project === 'string' ? obs.merged_into_project : null,
+        obs.metadata ?? null,
+        obs.generated_by_model ?? null,
+        occurrenceCount,
+        obs.reinforcement_dates ?? null,
+        obs.last_reinforced ?? null
       );
       const id = result.lastInsertRowid as number;
       replaceObservationFileIndex(this.db, id, obs.files_read, obs.files_modified);
+      // Restore derived lookup data too, without merging historical rows.
+      // Read SQLite's saved title (legacy imports can have numeric/boolean
+      // values) and the actual local parent, not an exported platform hint.
+      const saved = this.db.prepare(`SELECT o.title, o.agent_id, o.agent_type, s.platform_source
+        FROM observations o LEFT JOIN sdk_sessions s ON s.memory_session_id = o.memory_session_id
+        WHERE o.id = ?`).get(id) as {
+          title: string | null; agent_id: string | null; agent_type: string | null; platform_source: string | null;
+        };
+      this.db.prepare('UPDATE observations SET title_norm_key = ? WHERE id = ?').run(
+        computeTitleNormKey(obs.project, saved.platform_source, saved.title,
+          isSubagentEvent(saved.agent_id, saved.agent_type)), id,
+      );
+      const dedup = this.dedupConfig();
+      if (dedup.enabled) this.maintainDedupOnInsert(obs.project, id, saved.title, dedup);
       return id;
     })();
     emitContextInvalidation({ projects: importedRowProjects(obs) }, 'importObservation');
@@ -5295,10 +5569,25 @@ export class SessionStore {
       );
     }
 
-    const existing = this.db.prepare(`
+    // A prompt number is local to the writer's history. Synced devices can
+    // contribute distinct prompts with the same number to one session, so a
+    // restore matches the retained row, not just its turn number.
+    // A native receipt is the prompt's identity (UNIQUE per session), so an
+    // incoming receipt matches on it alone. Without one, or with no receipt hit,
+    // the row matches on its number, text and time; an export taken before
+    // receipts still matches a destination row that has gained one since.
+    const sessionClause = sessionDbId !== null ? 'session_db_id = ?' : 'content_session_id = ?';
+    const sessionKey = sessionDbId ?? prompt.content_session_id;
+    const nativePromptId = prompt.native_prompt_id ?? null;
+    const existingByReceipt = nativePromptId === null ? undefined : this.db.prepare(`
+      SELECT id FROM user_prompts WHERE ${sessionClause} AND native_prompt_id = ?
+    `).get(sessionKey, nativePromptId) as { id: number } | undefined;
+    const existing = existingByReceipt ?? this.db.prepare(`
       SELECT id FROM user_prompts
-      WHERE ${sessionDbId !== null ? 'session_db_id = ?' : 'content_session_id = ?'} AND prompt_number = ?
-    `).get(sessionDbId ?? prompt.content_session_id, prompt.prompt_number) as { id: number } | undefined;
+      WHERE ${sessionClause} AND prompt_number = ? AND prompt_text IS ? AND created_at_epoch = ?
+        ${nativePromptId === null ? '' : 'AND native_prompt_id IS NULL'}
+    `).get(sessionKey, prompt.prompt_number, coerceBindValue(prompt.prompt_text),
+      prompt.created_at_epoch) as { id: number } | undefined;
 
     if (existing) {
       return { imported: false, id: existing.id };

@@ -13,6 +13,10 @@ export type MediaVariantName = 'viewer' | 'llm';
 export const MEDIA_CLEANUP_MAX_ATTEMPTS = 8;
 const CLEANUP_RETRY_BASE_MS = 30_000;
 const CLEANUP_RETRY_MAX_DELAY_MS = 60 * 60 * 1000;
+// Bounds the synchronous rmSync work one cleanup job does per reconcile() pass,
+// which runs on the worker's thread at start and every 30 s; the rest waits for
+// the next pass. 128 is the per-pass value main used since #4341, not a measurement.
+const MAX_TEMP_CLEANUPS_PER_JOB = 128;
 /**
  * How long a 'converting' row is protected from reconcile(), which fails rows
  * whose lease has passed (a worker that died mid-conversion). It must outlast a
@@ -64,16 +68,21 @@ export function mediaEventKey(platform: MediaProvenance['platform'], identity: M
 
 /** Owns files and asset references, with no generator/retry responsibilities. */
 export class MediaStore {
-  readonly root: string;
+  private storageRoot: string;
+  get root(): string { return this.storageRoot; }
   constructor(readonly db: Database, dataDir: string, private readonly converter = convertMedia) {
-    this.root = resolve(dataDir, 'media-v1');
+    this.storageRoot = resolve(dataDir, 'media-v1');
+  }
+  private pinRoot(): void {
+    if (lstatSync(this.root).isSymbolicLink()) throw new MediaError('storage_unavailable');
+    // The configured data directory may itself live through a symlink (for
+    // example, on another drive). Pin that physical boundary while retaining
+    // the ban on media-v1 itself and every path beneath it being symlinks.
+    this.storageRoot = realpathSync(this.root);
   }
   private prepareRoot(): void {
     mkdirSync(this.root, { recursive: true, mode: 0o700 });
-    if (lstatSync(this.root).isSymbolicLink()) throw new MediaError('storage_unavailable');
-    // Pin the physical configured storage boundary, then reject all symlinks
-    // below it. No arbitrary route path is ever used for storage access.
-    if (realpathSync(this.root) !== this.root) throw new MediaError('storage_unavailable');
+    this.pinRoot();
     const temporary = join(this.root, '.tmp');
     mkdirSync(temporary, { recursive: true, mode: 0o700 });
     assertNoSymlinks(this.root, temporary);
@@ -108,6 +117,7 @@ export class MediaStore {
     const metadata = this.getMetadata(id)[variant];
     if (!metadata) throw new MediaError('media_not_ready');
     try {
+      this.pinRoot();
       const bytes = readContainedFile(this.root, join(this.root, id, variant + '.webp'), variant === 'viewer' ? MEDIA_LIMITS.maxCanonicalBytes : MEDIA_LIMITS.maxDerivativeBytes);
       if (bytes.length !== metadata.byteLength || createHash('sha256').update(bytes).digest('hex') !== metadata.sha256) throw new MediaError('checksum_mismatch');
       return bytes;
@@ -306,13 +316,16 @@ export class MediaStore {
         assertMediaId(job.directory);
         const target = join(this.root,job.directory);
         if (existsSync(target)) { assertNoSymlinks(this.root,target); rmSync(target,{recursive:true,force:true}); }
-        for (const name of readdirSync(join(this.root,'.tmp')).slice(0,128)) {
-          if (name.startsWith(job.attachment_id+'-')) {
-            const temp = join(this.root,'.tmp',name);
-            assertNoSymlinks(this.root,temp); rmSync(temp,{recursive:true,force:true});
-          }
+        // Limit this attachment's work, not the unrelated entries preceding
+        // it. Retain the durable job until every staged directory is removed.
+        const temporaryNames = readdirSync(join(this.root,'.tmp')).filter(name => name.startsWith(job.attachment_id+'-'));
+        for (const name of temporaryNames.slice(0,MAX_TEMP_CLEANUPS_PER_JOB)) {
+          const temp = join(this.root,'.tmp',name);
+          assertNoSymlinks(this.root,temp); rmSync(temp,{recursive:true,force:true});
         }
-        this.db.prepare('DELETE FROM media_cleanup_jobs WHERE attachment_id=?').run(job.attachment_id);
+        if (temporaryNames.length <= MAX_TEMP_CLEANUPS_PER_JOB) {
+          this.db.prepare('DELETE FROM media_cleanup_jobs WHERE attachment_id=?').run(job.attachment_id);
+        }
       } catch (error) {
         this.recordCleanupFailure(job, now, error instanceof MediaError ? error.code : 'storage_unavailable');
       }

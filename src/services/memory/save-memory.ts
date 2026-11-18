@@ -3,6 +3,9 @@ import { logger } from '../../utils/logger.js';
 import { logChromaWriteFailure } from '../worker/search/errors.js';
 import { notifyGrokBotIndex } from '../integrations/GrokBotIndexWriter.js';
 import { notifyNotion } from '../integrations/NotionExporter.js';
+import { DEFAULT_PLATFORM_SOURCE, normalizePlatformSource } from '../../shared/platform-source.js';
+import { retainTextHeadTail } from '../../shared/text-truncation.js';
+import { LOOKUP_ONLY_ALTERNATIVE_FINGERPRINT_KEY } from '../../shared/memory-save-replay.js';
 
 export interface SaveMemoryInput {
   text: string;
@@ -26,24 +29,40 @@ function persistMemory(dbManager: DatabaseManager, defaultProject: string, input
   const { title, metadata } = input;
   const metadataProject = typeof metadata?.project === 'string' && metadata.project.trim() ? metadata.project : '';
   const project = (input.project?.trim() ? input.project : '') || metadataProject || defaultProject;
-  const platformSource = typeof metadata?.platformSource === 'string' ? metadata.platformSource.trim() : undefined;
+  const platformSource = typeof metadata?.platformSource === 'string' ? metadata.platformSource : undefined;
   const sourceFingerprint = typeof metadata?.sourceFingerprint === 'string' ? metadata.sourceFingerprint : undefined;
   if (sourceFingerprint) {
-    // Exact replay dedupe includes the project. It survives process crashes
+    // Exact replay dedupe includes the project and source. It survives process crashes
     // between committing a note and saving the watcher's local checkpoint.
-    const existing = dbManager.getConnection().query(`SELECT id, title FROM observations
-      WHERE project = ? AND CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.sourceFingerprint') END = ?
-      ORDER BY id DESC LIMIT 1`).get(project, sourceFingerprint) as { id: number; title: string } | null;
+    const replayLookup = dbManager.getConnection().query(`SELECT o.id, o.title FROM observations o
+      LEFT JOIN sdk_sessions s ON s.memory_session_id = o.memory_session_id
+      WHERE o.project = ? AND COALESCE(NULLIF(s.platform_source, ''), '${DEFAULT_PLATFORM_SOURCE}') = ?
+        AND CASE WHEN json_valid(o.metadata) THEN json_extract(o.metadata, '$.sourceFingerprint') END = ?
+      ORDER BY o.id DESC LIMIT 1`);
+    const platform = normalizePlatformSource(platformSource);
+    // A client whose fingerprint for a source record changed between versions also names
+    // the one an earlier version saved (src/shared/memory-save-replay.ts), so a record that
+    // version saved is not saved again. Same query, so the same project and platform scoping.
+    const alternativeValue = metadata?.[LOOKUP_ONLY_ALTERNATIVE_FINGERPRINT_KEY];
+    const alternative = typeof alternativeValue === 'string' ? alternativeValue : undefined;
+    const existing = (replayLookup.get(project, platform, sourceFingerprint)
+      ?? (alternative ? replayLookup.get(project, platform, alternative) : null)) as { id: number; title: string } | null;
     if (existing) return { success: true, id: existing.id, title: existing.title, project, duplicate: true, message: `Memory already saved as observation #${existing.id}` };
   }
+  // The alternative fingerprint is for the lookup above only; it is not saved with the note.
+  const storedMetadata = metadata && Object.hasOwn(metadata, LOOKUP_ONLY_ALTERNATIVE_FINGERPRINT_KEY)
+    ? Object.fromEntries(Object.entries(metadata).filter(([key]) => key !== LOOKUP_ONLY_ALTERNATIVE_FINGERPRINT_KEY))
+    : metadata;
   const store = dbManager.getSessionStore();
   const sessionId = store.getOrCreateManualSession(project, platformSource);
   const observation = {
-    type: 'discovery', title: title?.trim() || text.substring(0, 60).trim() + (text.length > 60 ? '...' : ''),
+    type: 'discovery', title: title?.trim() || retainTextHeadTail(text, 60, 0).head.trim() + (text.length > 60 ? '...' : ''),
     subtitle: 'Manual memory', facts: [] as string[], narrative: text, concepts: [] as string[],
-    files_read: [] as string[], files_modified: [] as string[], metadata: metadata ? JSON.stringify(metadata) : null,
+    files_read: [] as string[], files_modified: [] as string[], metadata: storedMetadata ? JSON.stringify(storedMetadata) : null,
   };
-  const result = store.storeObservation(sessionId, project, observation, 0, 0);
+  // A person can reuse a note title while changing its facts. Keep exact
+  // content replay detection, but never discard an explicit save by title.
+  const result = store.storeObservation(sessionId, project, observation, 0, 0, undefined, undefined, { skipTitleDedup: true });
   logger.info('HTTP', 'Manual observation saved', { id: result.id, project, title: observation.title });
   dbManager.getCloudSync()?.notify();
   notifyGrokBotIndex();

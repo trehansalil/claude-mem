@@ -65,7 +65,7 @@ import {
 } from '../../stale-spawn-recovery.js';
 import type { TelegramWrapupFormatterInput } from '../../../integrations/TelegramWrapupNotifier.js';
 
-const MAX_USER_PROMPT_BYTES = 256 * 1024;
+export const MAX_USER_PROMPT_BYTES = 256 * 1024;
 
 // The session write endpoints are state-changing, so a browser page served
 // from a different local port may not call them. Origin-less callers (hooks,
@@ -339,7 +339,7 @@ export class SessionRoutes extends BaseRouteHandler {
           }
 
           try {
-            const resolvedPath = findClaudeExecutable('SDK');
+            const resolvedPath = await findClaudeExecutable('SDK');
             // A spawn failure recorded the executable it could not launch (a
             // .cmd/.bat shim passes discovery but not the SDK's spawn). While
             // discovery still resolves that same, unchanged file, a start would
@@ -707,6 +707,7 @@ export class SessionRoutes extends BaseRouteHandler {
   private static readonly observationsByClaudeIdSchema = z.object({
     contentSessionId: z.string().min(1),
     tool_name: z.string().min(1),
+    native_tool_name: z.string().min(1).optional(),
     tool_input: z.unknown().optional(),
     tool_response: z.unknown().optional(),
     cwd: z.string().optional(),
@@ -745,6 +746,7 @@ export class SessionRoutes extends BaseRouteHandler {
     const {
       contentSessionId,
       tool_name,
+      native_tool_name,
       tool_input,
       tool_response,
       cwd,
@@ -762,6 +764,7 @@ export class SessionRoutes extends BaseRouteHandler {
     const result = await ingestObservation({
       contentSessionId,
       toolName: tool_name,
+      nativeToolName: native_tool_name,
       toolInput: tool_input,
       toolResponse: tool_response,
       cwd,

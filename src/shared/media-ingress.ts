@@ -15,6 +15,7 @@ import {
   type UnknownRecord,
 } from './native-image-shapes.js';
 import { stripTags } from '../utils/tag-stripping.js';
+import { WORKER_JSON_BODY_LIMIT_BYTES } from './worker-http-limits.js';
 
 export interface MediaCandidate {
   pointer: string;
@@ -151,7 +152,7 @@ function withoutKey(record: UnknownRecord, removedKey: string | undefined): Unkn
 }
 
 function looksLikeJsonText(value: string): boolean {
-  return value.startsWith('{') || value.startsWith('[') || value.startsWith('"');
+  return /^[ \t\r\n]*[\[{\"]/.test(value);
 }
 
 /**
@@ -213,8 +214,8 @@ export function scanMediaFields(toolInput: unknown, toolResponse: unknown, stage
     const label = `event1_image${recognizedImageCount}`;
     const encodedLength = image.encodedBytes?.length ?? 0;
     const rejectionCode = rejectionCodeFor(image);
-    acceptedEncodedCharacters += encodedLength;
     if (!rejectionCode) {
+      acceptedEncodedCharacters += encodedLength;
       candidates.push({
         shape: image.shape,
         ...(image.encodedBytes !== undefined ? { encoded: image.encodedBytes } : {}),
@@ -326,6 +327,12 @@ export function scanMediaFields(toolInput: unknown, toolResponse: unknown, stage
     if (!isPlainRecord(value)) return value;
     const image = recognizeImageBlock(value);
     if (image) return handleImageBlock(value, image, pointer, depth);
+    // Dispatch already removed rejected bytes, but their native image blocks
+    // still occupy an ordinal. Reusing that label for a later image would
+    // replace the rejected block's status with the later attachment's ID.
+    const byteContainer = anthropicImageSourceOf(value) ?? claudeReadImageFileOf(value)
+      ?? openAiImageUrlOf(value) ?? (value.type === 'image' ? value : undefined);
+    if (byteContainer?.elided === ELIDED_IMAGE_NOTE && isPlainRecord(value.media_status)) recognizedImageCount += 1;
     return walkRecordEntries(value, pointer, depth);
   };
 
@@ -338,7 +345,8 @@ export function scanMediaFields(toolInput: unknown, toolResponse: unknown, stage
   };
 }
 
-export const LOCAL_EVENT_MAX_BYTES = 5 * 1024 * 1024;
+/** The worker's JSON body limit, the largest request it parses; boundObservationDispatch keeps an event under it. */
+export const LOCAL_EVENT_MAX_BYTES = WORKER_JSON_BODY_LIMIT_BYTES;
 const OVERSIZE_STRING_BYTES = 64 * 1024;
 const OVERSIZE_STRING_KEPT_CHARS = 16 * 1024;
 const OVERSIZE_FIELD_KEPT_CHARS = 32 * 1024;
@@ -385,8 +393,8 @@ function stripMemoryTagsBeforeClip(value: unknown): unknown {
 
 /**
  * Pre-dispatch bound: keep useful text when image bodies would push the event
- * past the unchanged 5mb JSON cap. Image-free events under the cap are
- * returned with identical content.
+ * past the worker's JSON body limit (LOCAL_EVENT_MAX_BYTES). Image-free events
+ * under the cap are returned with identical content.
  */
 export function boundObservationDispatch<T extends { tool_input?: unknown; tool_response?: unknown }>(body: T): T {
   const dispatchScan = scanMediaFields(body.tool_input, body.tool_response, 'dispatch');

@@ -20,15 +20,23 @@ import { buildWorkerUrl, getWorkerPort, getWorkerHost, fetchWithTimeout, resolve
 import { InvalidWorkerUrlError, normalizeWorkerBaseUrl } from '../shared/worker-url.js';
 import { getCurrentWorkerPid, verifyRestartedWorker } from './restart-verify.js';
 import { runShutdownSequence, WORKER_GRACEFUL_SHUTDOWN_DEADLINE_BASE_MS, type WorkerShutdownReason } from './worker-shutdown.js';
-import { DATA_DIR, DB_PATH, USER_SETTINGS_PATH, ensureDir, paths } from '../shared/paths.js';
+import { DATA_DIR, DB_PATH, USER_SETTINGS_PATH, ensurePrivateDir, paths } from '../shared/paths.js';
 import { HookSpool, migrateLegacySessionEndReplay } from '../shared/hook-spool.js';
 import { HookSpoolDrainer, hookSpoolConsumedMarkers } from './worker/hook-spool-drain.js';
 import { pruneOldLogs } from './worker/log-retention.js';
+import { initializeDatabaseWithBusyRetry } from './worker/db-init-retry.js';
+import {
+  PLUGIN_CACHE_PRUNE_FIRST_DELAY_MS,
+  PLUGIN_CACHE_PRUNE_INTERVAL_MS,
+  pruneSupersededPluginCache,
+} from '../npx-cli/utils/prune-cache.js';
 import { parseRetentionDays } from '../shared/retention-days.js';
 import { HookSpoolRoutes } from './worker/http/routes/HookSpoolRoutes.js';
 import { HOOK_TIMEOUTS } from '../shared/hook-constants.js';
 import { getUptimeSeconds } from '../shared/uptime.js';
 import { SettingsDefaultsManager } from '../shared/SettingsDefaultsManager.js';
+import { readLocalApiToken } from '../shared/hook-settings.js';
+import { readLegacyTvToken, resolveWorkerBindHost } from './worker/worker-bind-host.js';
 import { describeObserverAuthMethod } from './worker/observer-auth-method.js';
 import { logger } from '../utils/logger.js';
 import { isHookStdoutClosed } from '../shared/hook-io.js';
@@ -41,7 +49,7 @@ import { isPidAlive, setRegistryDegradedReporter } from '../supervisor/process-r
 
 import { ensureWorkerStarted as ensureWorkerStartedShared, getLastWorkerBootFailure, type WorkerStartResult } from './worker-spawner.js';
 import { acquireSpawnLock, releaseSpawnLock } from '../shared/worker-spawn-gate.js';
-import { snapshotDependencyHealth, type DependencyHealthSnapshot } from '../shared/dependency-health.js';
+import { dependencyStatusLabels, snapshotDependencyHealth, type DependencyHealthSnapshot } from '../shared/dependency-health.js';
 import { captureEvent, captureException, shutdownTelemetry, enableExceptionAutocaptureForWorker } from './telemetry/telemetry.js';
 import { telemetryBuffer } from './telemetry/buffer.js';
 import { collectInstallStats } from './telemetry/install-stats.js';
@@ -77,6 +85,7 @@ export { isPluginDisabledInClaudeSettings } from '../shared/plugin-state.js';
 import { isPluginDisabledInClaudeSettings } from '../shared/plugin-state.js';
 import { resolveRuntimeContext } from './hooks/runtime-selector.js';
 import { MediaError } from '../shared/media-contract.js';
+import { BUN_NO_AUTO_INSTALL_FLAG } from '../shared/bun-auto-install.js';
 
 declare const __DEFAULT_PACKAGE_VERSION__: string;
 declare const __CMEM_MEDIA_STANDALONE__: boolean;
@@ -89,7 +98,7 @@ const packageVersion = typeof __DEFAULT_PACKAGE_VERSION__ !== 'undefined' ? __DE
 export const WORKER_BOOT_FAILED_EXIT_CODE = 78;
 
 /** Subcommands that read or write the caller's project, so they run in its directory (#4628). */
-export const COMMANDS_THAT_ACT_ON_CALLER_PROJECT: ReadonlySet<string> = new Set(['generate', 'clean', 'adopt', 'memory', 'cursor']);
+export const COMMANDS_THAT_ACT_ON_CALLER_PROJECT: ReadonlySet<string> = new Set(['generate', 'clean', 'adopt', 'memory', 'cursor', 'grok', 'aider']);
 
 import {
   writePidFile,
@@ -122,7 +131,7 @@ import { runProjectMergeCommand } from './infrastructure/ProjectMerge.js';
 
 import { Server } from './server/Server.js';
 import { InitPhaseTracker } from './server/init-phase.js';
-import { buildWorkerOriginPolicy } from './worker/http/middleware.js';
+import { buildWorkerOriginPolicy, uiStaticPaths } from './worker/http/middleware.js';
 import { BetterAuthRoutes } from '../server/auth/BetterAuthRoutes.js';
 import {
   createServerApiKey,
@@ -136,16 +145,22 @@ import { ServerV1Routes } from '../server/routes/v1/ServerV1Routes.js';
 import {
   handleCursorCommand
 } from './integrations/CursorHooksInstaller.js';
+import { handleGrokCommand } from './integrations/GrokBuildInstaller.js';
 import {
   handleKimiCommand
 } from './integrations/KimiHooksInstaller.js';
 import {
+  handleAiderCommand
+} from './integrations/AiderInstaller.js';
+import {
   handleDevinCommand
 } from './integrations/DevinHooksInstaller.js';
 import {
-  handleAntigravityCliCommand
+  handleAntigravityCliCommand,
+  healStaleAntigravityHooksConfig
 } from './integrations/AntigravityCliHooksInstaller.js';
-import { notifyGrokBotIndex, watchGrokBotIndexSettings } from './integrations/GrokBotIndexWriter.js';
+import { handleGeminiCommand } from './integrations/GeminiHooksInstaller.js';
+import { notifyGrokBotIndex, watchGrokBotIndexChanges, stopGrokBotIndexChanges } from './integrations/GrokBotIndexWriter.js';
 
 import { DatabaseManager } from './worker/DatabaseManager.js';
 import { SessionManager } from './worker/SessionManager.js';
@@ -167,13 +182,14 @@ import { FormattingService } from './worker/FormattingService.js';
 import { TimelineService } from './worker/TimelineService.js';
 import { SessionEventBroadcaster } from './worker/events/SessionEventBroadcaster.js';
 import { SessionCompletionHandler } from './worker/session/SessionCompletionHandler.js';
-import { setIngestContext, attachIngestGeneratorStarter, transcriptCheckpointGate } from './worker/http/shared.js';
+import { setIngestContext, attachIngestGeneratorStarter } from './worker/http/shared.js';
 import { DEFAULT_CONFIG_PATH, DEFAULT_STATE_PATH, expandHomePath, scopeNativeHookBackedCodexWatches, loadTranscriptWatchConfig } from './transcripts/config.js';
 import { TranscriptWatcher } from './transcripts/watcher.js';
 import { runMemoryCommand } from './memory/cli.js';
 import { SyncApply } from './sync/SyncApply.js';
 import { ContextCacheService } from './worker/ContextCacheService.js';
 import { getContextReadWorker, closeContextReadWorker } from './context/ContextReadWorkerClient.js';
+import { DeepSearchClient } from './deep-search/DeepSearchClient.js';
 import { emitContextInvalidation } from '../shared/context-invalidation.js';
 import { SyncClient, keepPullingOptions } from './sync/SyncClient.js';
 
@@ -185,6 +201,8 @@ import { HistoryImport } from './setup/history-import.js';
 import { cmemProOrigin } from '../shared/cmem-gateway.js';
 import { Database as BunDatabase } from 'bun:sqlite';
 import { WorkViewRoutes } from './worker/http/routes/WorkViewRoutes.js';
+import { ConversationContinuationRunner } from './work-view/conversation-continuation-runner.js';
+import { detectUsableAgent } from './agent-runner/detect.js';
 import { SessionRoutes } from './worker/http/routes/SessionRoutes.js';
 import { DataRoutes } from './worker/http/routes/DataRoutes.js';
 import { MediaRoutes } from './worker/http/routes/MediaRoutes.js';
@@ -210,7 +228,7 @@ import { applyPendingRestore } from './backup/restore-swap.js';
 
 import { CorpusStore } from './worker/knowledge/CorpusStore.js';
 import { CorpusBuilder } from './worker/knowledge/CorpusBuilder.js';
-import { KnowledgeAgent } from './worker/knowledge/KnowledgeAgent.js';
+import { createCorpusAgent } from './worker/knowledge/CorpusAgent.js';
 import { cliFlagValue } from '../shared/cli-flag-value.js';
 
 export interface StatusOutput {
@@ -269,7 +287,7 @@ const CLEAN_SHUTDOWN_SENTINEL_PATH = path.join(DATA_DIR, '.worker-clean-shutdown
 
 function writeCleanShutdownSentinel(): void {
   try {
-    ensureDir(DATA_DIR);
+    ensurePrivateDir(DATA_DIR);
     writeFileSync(CLEAN_SHUTDOWN_SENTINEL_PATH, new Date().toISOString());
   } catch (error: unknown) {
     // [ANTI-PATTERN IGNORED]: sentinel is best-effort crash-detection metadata; a failed write must not abort graceful shutdown. Logged at warn with path; worst case the next boot reports 'crash' instead of 'clean'.
@@ -311,14 +329,15 @@ function readAndClearCleanShutdownSentinel(): string | null {
 }
 
 export class WorkerService implements WorkerRef {
+  private readonly deepSearchClient = new DeepSearchClient(DB_PATH);
   private server: Server;
   private startTime: number = Date.now();
   // Crash detection (worker_started telemetry): derived once at startup from
   // the previous run's stale PID file + the clean-shutdown sentinel.
   private previousShutdown: 'clean' | 'crash' | 'unknown' = 'unknown';
   private previousUptimeSeconds: number | null = null;
-  // Observation TV shared secret, resolved once in the constructor. Empty = off.
-  private tvToken: string = '';
+  // Whether the local API token guard is mounted, resolved once in the constructor.
+  private localApiTokenEnabled: boolean = false;
   private mcpClient: Client;
 
   private mcpReady: boolean = false;
@@ -329,6 +348,8 @@ export class WorkerService implements WorkerRef {
   private bootWatchdog: ReturnType<typeof setTimeout> | null = null;
   private pendingSessionResumeTimer: ReturnType<typeof setInterval> | null = null;
   private logRetentionTimer: ReturnType<typeof setTimeout> | null = null;
+  private pluginCachePruneTimer: ReturnType<typeof setTimeout> | null = null;
+  private pluginCachePruneInFlight = false;
   private autoUpdateTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly hookSpool = new HookSpool();
   private readonly hookSpoolDrainer = new HookSpoolDrainer(this.hookSpool);
@@ -351,6 +372,11 @@ export class WorkerService implements WorkerRef {
   private searchRoutes: SearchRoutes | null = null;
   private corpusRoutes: CorpusRoutes | null = null;
   private workViewRoutes: WorkViewRoutes | null = null;
+  /**
+   * My Work's turns and opens, once the database is ready. Kept apart from workViewRoutes, which shutdown drops at its
+   * first step: the shutdown waits for these commands after that, and force-stops any still running before it exits.
+   */
+  private conversationContinuationRunner: ConversationContinuationRunner | null = null;
   private sharedWorkSync: SharedWorkSync | null = null;
 
   private chromaMcpManager: ChromaMcpManager | null = null;
@@ -420,17 +446,11 @@ export class WorkerService implements WorkerRef {
       version: packageVersion
     }, { capabilities: {} });
 
-    // Observation TV remote broadcast secret. Must be read from settings.json —
-    // SettingsDefaultsManager.get() only consults process.env and DEFAULTS, so a
-    // token written to ~/.claude-mem/settings.json would be invisible to it.
-    // Whitespace-only is OFF, not a secret equal to a space.
-    // RESOLUTION POINT: the token is the single switch. It is passed to the
-    // Server below as `remoteReadOnly`, and only when it is non-empty — so a
-    // token-less install constructs an options object identical to today's and
-    // the read-only guard is never mounted.
     const workerSettings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
-    const tvToken = (workerSettings.CLAUDE_MEM_TV_TOKEN ?? '').trim();
-    this.tvToken = tvToken;
+    // Local API token (#5141): file-only, so the environment cannot switch the mode.
+    // Read once at boot; restart to change.
+    const localApiToken = readLocalApiToken();
+    this.localApiTokenEnabled = localApiToken !== '';
 
     this.server = new Server({
       getInitializationComplete: () => this.initializationCompleteFlag,
@@ -460,7 +480,7 @@ export class WorkerService implements WorkerRef {
       preBodyParserRoutes: [
         new BetterAuthRoutes(() => this.dbManager.getConnection()),
       ],
-      ...(tvToken ? { remoteReadOnly: { getToken: () => tvToken } } : {}),
+      ...(localApiToken ? { localApiToken: { getToken: () => localApiToken, openStaticPaths: uiStaticPaths() } } : {}),
       // Browser access: same-host and CLAUDE_MEM_ALLOWED_ORIGINS for CORS, plus
       // the DNS-rebinding Host check. Read once at boot; restart to change it.
       originPolicy: buildWorkerOriginPolicy(workerSettings),
@@ -633,6 +653,54 @@ export class WorkerService implements WorkerRef {
       clearTimeout(this.logRetentionTimer);
       clearInterval(this.logRetentionTimer);
       this.logRetentionTimer = null;
+    }
+  }
+
+  /**
+   * Claude Code's marketplace update drops each release into its own folder
+   * under the plugin cache and leaves the old ones there (#5681). The
+   * installer only prunes when it copies a version itself (#4105), and a
+   * worker that stays up never goes through that copy. Sweep once boot has
+   * settled, then hourly. The folder this process is running from is kept,
+   * and so is any folder an open Claude Code session is still loaded from
+   * (#5970).
+   */
+  private startPluginCachePrune(): void {
+    if (this.pluginCachePruneTimer != null || this.isShuttingDown) return;
+    const sweep = (): void => {
+      if (this.pluginCachePruneInFlight || this.isShuttingDown) return;
+      this.pluginCachePruneInFlight = true;
+      void pruneSupersededPluginCache({
+        runningScriptPath: __dirname,
+        additionalProtectedVersions: [packageVersion],
+      }).then(result => {
+        if (result.removed.length > 0) {
+          logger.info('SYSTEM', `Pruned ${result.removed.length} stale plugin cache version(s)`, { removed: result.removed });
+        }
+        for (const failure of result.failed) {
+          logger.warn('SYSTEM', `Could not prune plugin cache version ${failure.version}`, { reason: failure.reason });
+        }
+      }).catch(error => {
+        logger.warn('SYSTEM', 'Plugin cache prune failed; old version folders are kept until the next sweep', {},
+          error instanceof Error ? error : new Error(String(error)));
+      }).finally(() => {
+        this.pluginCachePruneInFlight = false;
+      });
+    };
+    this.pluginCachePruneTimer = setTimeout(() => {
+      sweep();
+      if (this.isShuttingDown) return;
+      this.pluginCachePruneTimer = setInterval(sweep, PLUGIN_CACHE_PRUNE_INTERVAL_MS);
+      this.pluginCachePruneTimer.unref?.();
+    }, PLUGIN_CACHE_PRUNE_FIRST_DELAY_MS);
+    this.pluginCachePruneTimer.unref?.();
+  }
+
+  private stopPluginCachePrune(): void {
+    if (this.pluginCachePruneTimer != null) {
+      clearTimeout(this.pluginCachePruneTimer);
+      clearInterval(this.pluginCachePruneTimer);
+      this.pluginCachePruneTimer = null;
     }
   }
 
@@ -925,7 +993,13 @@ export class WorkerService implements WorkerRef {
 
   async start(): Promise<void> {
     const port = getWorkerPort();
-    const host = getWorkerHost();
+    // A leftover CLAUDE_MEM_TV_TOKEN with a non-loopback host and no local API
+    // token binds to loopback: see resolveWorkerBindHost.
+    const host = resolveWorkerBindHost({
+      configuredHost: getWorkerHost(),
+      legacyTvToken: readLegacyTvToken(USER_SETTINGS_PATH),
+      localApiTokenSet: this.localApiTokenEnabled,
+    });
 
     // Phase 3 telemetry: bridge logged errors into PostHog Error Tracking
     // WITHOUT the logger importing telemetry (no import cycle). captureException
@@ -978,23 +1052,6 @@ export class WorkerService implements WorkerRef {
     // that has not finished or failed (buildAutoUpdateCheckDeps).
     this.startAutoUpdateTimer();
 
-    if (this.tvToken) {
-      // Operators need to see, in the log, that a remote surface is open.
-      // Never log the token itself.
-      logger.info('SYSTEM', 'Observation TV remote broadcast enabled', {
-        host,
-        allowedPaths: ['/tv', '/tv.html', '/stream', 'GET /api/observations'],
-      });
-    } else if (host !== '127.0.0.1' && host !== '::1' && host !== '::ffff:127.0.0.1' && host !== 'localhost') {
-      // Warn, do not refuse to bind: docs/docker.md tells people to set
-      // CLAUDE_MEM_WORKER_HOST=0.0.0.0, and refusing would break that install.
-      logger.warn(
-        'SECURITY',
-        'Worker bound to a non-loopback host with no CLAUDE_MEM_TV_TOKEN — the full worker API, including provider API keys via GET /api/settings, is reachable from the network',
-        { host }
-      );
-    }
-
     writePidFile({
       pid: process.pid,
       port,
@@ -1036,7 +1093,7 @@ export class WorkerService implements WorkerRef {
       ModeManager.getInstance().loadMode(modeId);
       logger.info('SYSTEM', `Mode loaded: ${modeId}`);
 
-      const dependencyHealth = runWorkerDependencyPreflight({
+      const dependencyHealth = await runWorkerDependencyPreflight({
         settings,
         classifyClaudeError,
       });
@@ -1082,7 +1139,10 @@ export class WorkerService implements WorkerRef {
       }
 
       logger.info('WORKER', 'Initializing database manager...');
-      await this.dbManager.initialize();
+      // A replacement worker can boot while another connection is writing
+      // (#3603). SQLITE_BUSY* here is transient, so retry it for a bounded
+      // time (db-init-retry.ts states the budget) before settling on `failed`.
+      await initializeDatabaseWithBusyRetry(this.dbManager, { shouldStop: () => this.isShuttingDown });
       // Shutdown may have begun while initialization was pending.
       if (this.isShuttingDown) return;
 
@@ -1095,6 +1155,21 @@ export class WorkerService implements WorkerRef {
         enabled: settings.CLAUDE_MEM_WORK_VIEW_SHARED_STATE === 'true',
       });
       this.sharedWorkSync.start();
+      // My Work's "continue this conversation": one turn per Send, run by the owner's own CLI. Memory only; it starts
+      // nothing by itself. Every open My Work window is told when an exchange ends, by its id and state only.
+      this.conversationContinuationRunner = new ConversationContinuationRunner({
+        recordedFolderForConversation: (platform, conversationSessionId) =>
+          this.dbManager.getSessionStore().getRecordedFolderForConversation(platform, conversationSessionId),
+        // Checks only the conversation's own CLI: checking Gemini too could start the Gemini CLI on every Send and Open.
+        detectAgent: agentId => detectUsableAgent(agentId),
+        spawnImpl: spawn,
+        onChange: exchange => this.workViewRoutes?.publishConversationContinuation(exchange),
+        // Its turns and opens stay in the supervisor's registry while they run, like every process the worker starts.
+        // shutdown() sends them their stop first (workViewRoutes.close), waits for them alongside the graceful shutdown's
+        // other steps and before its cascade, and force-stops what is left of any still running before the worker exits
+        // or starts its successor.
+        processRegistry: getSupervisor().getRegistry(),
+      });
       this.workViewRoutes = new WorkViewRoutes({
         ...(settings.CLAUDE_MEM_WORK_VIEW_SHARED_STATE === 'true' ? {
           persistSharedCopy: (requestId: string, entry: { fingerprint: string; copy: unknown; generatedAt: number }) => this.sharedWorkSync!.persistCopy(requestId, entry),
@@ -1125,6 +1200,7 @@ export class WorkerService implements WorkerRef {
           origin: () => cmemProOrigin(),
           token: () => SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH).CLAUDE_MEM_CLOUD_SYNC_TOKEN?.trim() || null,
         }),
+        conversationContinuationRunner: this.conversationContinuationRunner,
       });
       this.server.registerRoutes(this.workViewRoutes);
       this.initPhaseTracker.setInitPhase('db_ready');
@@ -1216,6 +1292,9 @@ export class WorkerService implements WorkerRef {
       }
       const searchRecencyWindowMs = parsedRecencyWindowMs ?? SEARCH_CONSTANTS.RECENCY_WINDOW_MS;
       const contextReader = getContextReadWorker();
+      contextReader.setTimeoutListener(({ method, queuedMs, runningMs }) => {
+        captureEvent('context_read_timed_out', { read_method: method, queue_wait_ms: queuedMs, duration_ms: runningMs });
+      });
       const searchManager = new SearchManager(
         this.dbManager.getSessionSearch(),
         this.dbManager.getSessionStore(),
@@ -1223,7 +1302,8 @@ export class WorkerService implements WorkerRef {
         formattingService,
         timelineService,
         searchRecencyWindowMs,
-        contextReader
+        contextReader,
+        this.deepSearchClient
       );
       // Precomputed SessionStart context (liveness plan, Phase 6): the route
       // records each live render, the service re-renders on writes.
@@ -1247,8 +1327,11 @@ export class WorkerService implements WorkerRef {
         searchManager.getOrchestrator(),
         this.corpusStore
       );
-      const knowledgeAgent = new KnowledgeAgent(this.corpusStore);
-      this.corpusRoutes = new CorpusRoutes(this.corpusStore, corpusBuilder, knowledgeAgent);
+      // The corpus agent is the Claude Agent SDK unless CLAUDE_MEM_CORPUS_AGENT
+      // is "api". The setting is read on every call, so this one instance
+      // serves a change without a restart (see knowledge/CorpusAgent.ts).
+      const corpusAgent = await createCorpusAgent(this.corpusStore);
+      this.corpusRoutes = new CorpusRoutes(this.corpusStore, corpusBuilder, corpusAgent);
       this.server.registerRoutes(this.corpusRoutes);
       logger.info('WORKER', 'CorpusRoutes registered');
 
@@ -1277,6 +1360,9 @@ export class WorkerService implements WorkerRef {
       this.resolveInitialization();
       this.initPhaseTracker.setInitPhase('ready');
       logger.info('SYSTEM', 'Core initialization complete (DB + search ready)');
+      // Optional raw-tool indexing yields between committed batches. Start only
+      // after core routes are usable; shutdown preserves the committed cursor.
+      void this.dbManager.initializeToolUseSearch();
       this.resolveAutoUpdateFailuresNowThatThisWorkerIsReady();
 
       // Lifecycle telemetry. Profile-less: a person on this id would make every
@@ -1351,8 +1437,8 @@ export class WorkerService implements WorkerRef {
       // Seed Grok Bot Memory INDEX files from current observations so seats
       // do not wait for the next store before the mid-attach file exists.
       notifyGrokBotIndex();
-      // Standing line / project-map edits must reach idle seats too.
-      watchGrokBotIndexSettings();
+      // Imports, sync, deletions and settings edits must reach idle seats too.
+      watchGrokBotIndexChanges();
 
       if (this.chromaMcpManager) {
         ChromaSync.registerBackfillStore(this.dbManager.getSessionStore());
@@ -1381,6 +1467,7 @@ export class WorkerService implements WorkerRef {
       // lands ~5 minutes after start, then every backup interval.
       this.dbManager.getBackupManager()?.start();
       this.startLogRetention();
+      this.startPluginCachePrune();
 
       const mcpServerPath = path.join(__dirname, 'mcp-server.cjs');
       this.mcpReady = existsSync(mcpServerPath);
@@ -1508,7 +1595,7 @@ export class WorkerService implements WorkerRef {
     }
 
     try {
-      this.transcriptWatcher = new TranscriptWatcher(transcriptConfig, statePath, 'in-process', transcriptCheckpointGate);
+      this.transcriptWatcher = new TranscriptWatcher(transcriptConfig, statePath, 'in-process');
       await this.transcriptWatcher.start();
     } catch (error) {
       this.transcriptWatcher?.stop();
@@ -1551,12 +1638,15 @@ export class WorkerService implements WorkerRef {
       markShuttingDown: () => { this.isShuttingDown = true; },
       beforeGracefulShutdown: async () => {
         this.memoryFeedInvalidation.close();
+        stopGrokBotIndexChanges();
+        void this.deepSearchClient.close();
         this.workViewRoutes?.close();
         this.workViewRoutes = null;
         this.sharedWorkSync?.close();
         this.sharedWorkSync = null;
         this.stopPendingSessionResume();
         this.stopLogRetention();
+        this.stopPluginCachePrune();
         this.stopAutoUpdateTimer();
         this.hookSpoolDrainer.stop();
         // Stop the idle monitor before the drain: its own trigger has
@@ -1600,13 +1690,20 @@ export class WorkerService implements WorkerRef {
       },
       performGracefulShutdown: () => performGracefulShutdown({
         server: this.server.getHttpServer(),
+        // workViewRoutes.close above sent them their stop: they end on it while the session drain and the other steps run,
+        // and before the supervisor's cascade.
+        commandsStoppedAsShutdownBegan: this.conversationContinuationRunner ?? undefined,
         sessionManager: this.sessionManager,
         mcpClient: this.mcpClient,
-        contextReader: { close: closeContextReadWorker },
+        contextReader: { close: async () => { await Promise.all([closeContextReadWorker(), this.deepSearchClient.close()]); } },
         dbManager: this.dbManager,
         chromaMcpManager: this.chromaMcpManager || undefined
       }),
       gracefulDeadlineMs: getPlatformTimeout(WORKER_GRACEFUL_SHUTDOWN_DEADLINE_BASE_MS),
+      // No turn or open My Work started may outlive this worker, however the graceful shutdown ended.
+      forceStopCommandsStillRunning: async () => { await this.conversationContinuationRunner?.forceStopCommandsStillRunning(); },
+      // Nor any other child in the supervisor's registry, when the graceful shutdown did not get to finish its cascade.
+      stopEveryRegisteredChildProcess: () => getSupervisor().stop(),
       restartHandoff: {
         port: getWorkerPort(),
         portFreeTimeoutMs: getPlatformTimeout(5000),
@@ -1671,7 +1768,7 @@ export class WorkerService implements WorkerRef {
 }
 
 export async function ensureWorkerStarted(port: number): Promise<WorkerStartResult> {
-  return ensureWorkerStartedShared(port, __filename);
+  return ensureWorkerStartedShared(port, resolveWorkerScriptPath() ?? __filename);
 }
 
 export type ParsedWorkerCommand = {
@@ -1722,7 +1819,7 @@ function printWorkerAliasHelp(): never {
 function printWorkerServiceUsage(): void {
   console.error('Usage: worker-service <command>');
   console.error('Commands: start, stop, restart, status, hook <platform> <event>, worker <command>, server <command>,');
-  console.error('  adopt, project, transcript, generate, clean, cleanup, cursor, memory, kimi, devin, antigravity-cli,');
+  console.error('  adopt, project, transcript, generate, clean, cleanup, cursor, grok, memory, kimi, aider, devin, antigravity-cli,');
   console.error('  --daemon, --version, --help');
 }
 
@@ -1743,7 +1840,8 @@ function runServerServiceCli(command: string, extraArgs: string[] = []): void {
     }
   }
 
-  const child = spawn(process.execPath, [serverScript, command, ...extraArgs], {
+  // `server start` runs the server in this child; its embedder loads sharp (#5601).
+  const child = spawn(process.execPath, [BUN_NO_AUTO_INSTALL_FLAG, serverScript, command, ...extraArgs], {
     stdio: 'inherit',
     windowsHide: true,
     // Strip host CLI bleed-through (CLAUDE_CODE_*, including EFFORT_LEVEL) and
@@ -1786,7 +1884,7 @@ function parseServerApiKeyOptions(args: string[]): Record<string, string> {
 }
 
 function openServerCommandDatabase(): Database {
-  ensureDir(DATA_DIR);
+  ensurePrivateDir(DATA_DIR);
   return openConfiguredSqliteDatabase(DB_PATH, { create: true, readwrite: true });
 }
 
@@ -1881,7 +1979,7 @@ function runServerApiKeyCli(args: string[]): never {
   }
 }
 
-async function main() {
+export async function main() {
   const { command, args: commandArgs } = parseWorkerServiceCommand(process.argv.slice(2));
   // Load the bundle without binding a port or depending on a running worker.
   if (command === '--version') {
@@ -2215,6 +2313,11 @@ async function main() {
       break;
     }
 
+    case 'grok': {
+      process.exit(await handleGrokCommand(process.argv[3], process.argv.slice(4)));
+      break;
+    }
+
     case 'memory': {
       // Auto-memory ingest (sibling to transcript). Dry-run runs client-side;
       // the real store reaches the worker over HTTP from inside runMemoryCommand.
@@ -2224,10 +2327,22 @@ async function main() {
       break;
     }
 
+    case 'gemini': {
+      process.exit(await handleGeminiCommand(process.argv[3]));
+      break;
+    }
+
     case 'kimi': {
       const kimiSubcommand = process.argv[3];
       const kimiResult = await handleKimiCommand(kimiSubcommand, process.argv.slice(4));
       process.exit(kimiResult);
+      break;
+    }
+
+    case 'aider': {
+      const aiderSubcommand = process.argv[3];
+      const aiderResult = await handleAiderCommand(aiderSubcommand, process.argv.slice(4));
+      process.exit(aiderResult);
       break;
     }
 
@@ -2246,6 +2361,14 @@ async function main() {
     }
 
     case 'hook': {
+      // A pre-#5085 Antigravity install left a PreToolUse entry in
+      // ~/.gemini/config/hooks.json pointing at this binary; the current
+      // adapter answers it with no `decision`, so agy denies every tool call
+      // until the file is migrated (#5665). Heal it on the way in — a no-op
+      // when the file is current, missing, or corrupt.
+      if (process.argv[3] === 'antigravity-cli') {
+        healStaleAntigravityHooksConfig();
+      }
       // Shared with the hook-only bundle (src/cli/hook-entry.ts), which the
       // launcher and bun-runner.js run for `hook` when the plugin ships it.
       const { runHookSubcommand } = await import('../cli/run-hook-subcommand.js');
@@ -2366,6 +2489,10 @@ async function main() {
     // never a foreground worker (#5490).
     case undefined:
     case '--daemon': {
+      // Worker startup also migrates stale Antigravity hooks.json entries
+      // left by an in-place upgrade (#5665); see the `hook` case.
+      healStaleAntigravityHooksConfig();
+
       // Before anything below spawns a child (the reclaim probes, the
       // supervisor, chroma-mcp), stand in claude-mem's data dir rather than
       // whatever cwd this daemon was launched with (#3706; EPERM on
@@ -2502,23 +2629,12 @@ export function formatDependencyHealthHint(health: WorkerHealthSnapshot): string
     return null;
   }
 
-  const labels = dependencies.statuses.map(status => {
-    if (status.dependency === 'claude_cli' && status.kind === 'setup_required') {
-      return 'Claude CLI setup required';
-    }
-    if (status.dependency === 'codex_cli' && status.kind === 'setup_required') {
-      return 'Codex CLI setup required';
-    }
-    if (status.dependency === 'uvx' && status.kind === 'vector_search_unavailable') {
-      return 'uvx unavailable for vector search';
-    }
-    if (status.dependency === 'chroma' && status.kind === 'vector_search_unavailable') {
-      return 'Chroma unavailable for vector search';
-    }
-    return `${status.dependency}: ${status.kind}`;
-  });
+  // The fallback names a pair only a worker newer than this CLI can report.
+  const labels = dependencies.statuses.map(status =>
+    dependencyStatusLabels(status.dependency, status.kind)?.statusCommandHint ?? `${status.dependency}: ${status.kind}`);
 
-  return `  Dependencies: degraded (${labels.join(', ')}). Run npx claude-mem doctor or open Settings for remediation.`;
+  // doctor prints each status with its remediation; no Settings screen shows them.
+  return `  Dependencies: degraded (${labels.join(', ')}). Run npx claude-mem doctor for remediation.`;
 }
 
 /**

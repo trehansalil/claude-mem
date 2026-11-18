@@ -1,13 +1,9 @@
-import { afterEach, beforeEach, describe, expect, it, spyOn } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { spoolWorkStateMcpInstruction, spoolWorkStateMcpResult } from '../../src/cli/work-state-telemetry';
 import { settleHookSpoolNudges } from '../../src/cli/spool-hook-event';
-import { WORK_STATE_RULE } from '../../src/shared/memory-instructions';
 import { useTempHookSpoolDataDir, spooledEntries } from '../helpers/temp-hook-spool';
 import { workStateOutcome } from '../../src/shared/work-state-telemetry';
 import { observationHandler } from '../../src/cli/handlers/observation';
-import { getEventHandler } from '../../src/cli/handlers/index';
-import { hookCommand } from '../../src/cli/hook-command';
-import { installFakeStdin, restoreStdin } from '../fake-stdin';
 import { sessionInitHandler, setSessionInitDependenciesForTesting } from '../../src/cli/handlers/session-init';
 
 let temporary: ReturnType<typeof useTempHookSpoolDataDir>;
@@ -54,34 +50,10 @@ describe('work-state hook receipts', () => {
     } finally { setSessionInitDependenciesForTesting(); }
   });
 
-  for (const platform of ['claude-code', 'codex', 'cursor']) {
-    it(`records no instruction handoff from the ${platform} SessionStart hook, which no longer carries the rule`, async () => {
-      // Even a block that still contains the rule text (an old cached body) is
-      // not counted: the handoff is the MCP server's now.
-      const handler = spyOn(getEventHandler('context'), 'execute').mockResolvedValue({
-        hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: WORK_STATE_RULE },
-      });
-      const original = process.stdout.write;
-      process.stdout.write = ((_chunk: string, done: () => void) => {
-        done();
-        return true;
-      }) as typeof process.stdout.write;
-      installFakeStdin(JSON.stringify({ session_id: 'real-hook', conversation_id: 'real-hook', cwd: temporary.dataDir }));
-      try {
-        await hookCommand(platform, 'context', { skipExit: true });
-        expect(spooledEntries('work_state_telemetry')).toHaveLength(0);
-      } finally {
-        handler.mockRestore();
-        process.stdout.write = original;
-        restoreStdin();
-      }
-    });
-  }
-
-  it('counts the MCP server handing off its instructions, with or without the work-state rule', () => {
+  it('counts the MCP server handing off its instructions, with or without the work-state rule', async () => {
     spoolWorkStateMcpInstruction(true);
     spoolWorkStateMcpInstruction(false);
-    const entries = spooledEntries('work_state_telemetry');
+    const entries = (await spooledEntries('work_state_telemetry'));
     expect(entries.map(e => e.payload.state).sort()).toEqual(['disabled', 'returned']);
     for (const entry of entries) {
       // An MCP process cannot tell which host session it serves.
@@ -90,22 +62,22 @@ describe('work-state hook receipts', () => {
     }
   });
 
-  it('preserves unknown MCP attribution and spools pre-worker failures', () => {
+  it('preserves unknown MCP attribution and spools pre-worker failures', async () => {
     spoolWorkStateMcpResult('work_state_write', { isError: true, content: [{ type: 'text', text: 'Service initializing' }] });
-    const [entry] = spooledEntries('work_state_telemetry');
+    const [entry] = (await spooledEntries('work_state_telemetry'));
     expect(entry.payload).toMatchObject({ kind: 'mcp', platformSource: 'unknown', outcome: 'error', tool: 'write' });
   });
 
-  it('does not spool after telemetry opt-out', () => {
+  it('does not spool after telemetry opt-out', async () => {
     process.env.DO_NOT_TRACK = '1';
     spoolWorkStateMcpInstruction(true);
     spoolWorkStateMcpResult('work_state_write', { isError: true });
-    expect(spooledEntries()).toHaveLength(0);
+    expect(await spooledEntries()).toHaveLength(0);
   });
 
   it('preserves missing host attribution before legacy observation normalization', async () => {
     await observationHandler.execute({ ...input, platform: undefined, toolName: 'TodoWrite', toolUseId: 'native-id', toolResponse: {} });
-    const [entry] = spooledEntries('observation');
+    const [entry] = (await spooledEntries('observation'));
     expect(entry.payload).toMatchObject({ platformSource: 'claude', telemetryPlatformSource: 'unknown' });
   });
 

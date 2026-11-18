@@ -1,5 +1,7 @@
 // Human requests own the top level. Agent work and observations are evidence
 // beneath a proven native conversation, never substitutes for a human ask.
+import { createHash } from 'node:crypto';
+import { canonicalJson } from '../sync/CanonicalContent.js';
 import { bucketFileAvailable, copyCoversSource, fileUrl, mergeProducts, productsFromDeliverable, productsFromObservation, productsFromToolUse, servableFile } from './work-product.mjs';
 import { NO_PROJECT, projectRoot } from './session-project.mjs';
 
@@ -112,9 +114,14 @@ export function originalFor(session, prompts) {
 // producer recorded it directly. A group with a recorded project root keeps
 // every conversation the ledger assigned to it; a group whose root is unknown
 // stays inside the one its members show.
-export function buildHumanRequests(view, records = {}, { titleCache = {}, ledger = null } = {}) {
+export function buildHumanRequests(view, records = {}, { titleCache = {}, ledger = null, onProductFile = null } = {}) {
   const sessions = new Map((records.sessions ?? []).map((session) => [session.id, session]));
   const prompts = records.prompts ?? [];
+  const promptsBySession = new Map();
+  for (const prompt of prompts) {
+    if (!promptsBySession.has(prompt.session_db_id)) promptsBySession.set(prompt.session_db_id, []);
+    promptsBySession.get(prompt.session_db_id).push(prompt);
+  }
   const flattened = (view.agents ?? []).flatMap((agent) => (agent.work ?? []).map((item) => ({ ...item, agentId: agent.id, agentLabel: agent.label, agentSessionId: agent.sessionId })));
   const subagentIds = new Set((view.agents ?? []).filter((agent) => agent.isSubagent).map((agent) => agent.id));
   const activityPool = new Map();
@@ -204,10 +211,12 @@ export function buildHumanRequests(view, records = {}, { titleCache = {}, ledger
 
   // 1. Requests from prompts: every ungrouped conversation with a substantive
   // human ask, and every group, whether or not any work was recorded yet.
-  for (const [key, session] of sessionsByKey) {
+  // Equal-time asks must choose the same original on every replica, whose
+  // local session IDs and read order can differ after canonical sync.
+  for (const [key, session] of [...sessionsByKey].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)) {
     // Its work is filed under the request ids the producer recorded.
     if (explicitIds.has(key) || ledger?.groups?.ignored?.[key]) continue;
-    const original = originalFor(session, prompts);
+    const original = originalFor(session, promptsBySession.get(session.id) ?? []);
     if (!original) continue;
     const groupId = groupFor(key, session);
     addProject(requestFor(groupId ? JSON.stringify(['overall-request', groupId]) : key, { key, original, groupId }), session.project);
@@ -232,7 +241,7 @@ export function buildHumanRequests(view, records = {}, { titleCache = {}, ledger
       unlinkedWork.push({ ...item, reason: 'multiple-explicit-requests-without-item-link' });
       continue;
     }
-    let original = session ? originalFor(session, prompts) : null;
+    let original = session ? originalFor(session, promptsBySession.get(session.id) ?? []) : null;
     const explicitText = isHumanActionRequest(item.requestText) ? requestText(item.requestText) : null;
     if (!original && explicit && explicitText) original = { text: explicitText, source: 'explicit-work-state-request', sourceId: item.id, url: item.url, promptNumber: null, atEpoch: item.lastUpdateEpoch ?? null };
     if (!original || (!key && !explicit)) {
@@ -281,30 +290,48 @@ export function buildHumanRequests(view, records = {}, { titleCache = {}, ledger
     if (session) attach(session, record.products ?? []);
   }
 
-  const sessionIdsByKey = new Map(), promptsBySession = new Map();
+  const sessionIdsByKey = new Map();
   for (const session of sessions.values()) {
     const key = conversationKey(session);
     if (key) sessionIdsByKey.set(key, [...(sessionIdsByKey.get(key) ?? []), session.id]);
   }
-  for (const prompt of prompts) {
-    if (!promptsBySession.has(prompt.session_db_id)) promptsBySession.set(prompt.session_db_id, []);
-    promptsBySession.get(prompt.session_db_id).push(prompt);
-  }
   for (const request of requests.values()) {
     const merged = mergeProducts([...(recordedProducts.get(request) ?? []), ...request.items.flatMap((item) => item.workProduct ?? [])]);
+    // Reviews cover recorded outputs too, including publications and saved
+    // copies that arrive without another work-state update. Hash before disk
+    // availability and copy coverage change which links the card displays.
+    // Local Git products have no remote URL. Match the JSON representation
+    // sent to the viewer, which omits those undefined optional properties.
+    // Version the empty set too: a check made before the first product arrives
+    // must not look like a pre-upgrade fingerprint eligible for adoption.
+    request.sourceProductHash = createHash('sha256').update(canonicalJson(JSON.parse(JSON.stringify(merged)))).digest('hex');
+    // Legacy checks did not record this hash. Carry one forward only when all
+    // current products have known source times that predate the check.
+    request.sourceProductRecordedAtEpoch = merged.every((product) => Number.isFinite(product.atEpoch) && product.atEpoch > 0)
+      ? merged.reduce((latest, product) => Math.max(latest, product.atEpoch), 0) : null;
     // A bucket copy that is on disk replaces the record that points at where the file was made (that place is often
     // deleted later), unless the file has been written since the copy: then the record is a newer version and stays.
     const copies = merged.filter((product) => product.deliverable && product.sourcePath);
-    const covered = (product) => Boolean(product.path) && copies.some((copy) => copy.sourcePath === product.path && copyCoversSource(copy, product.path));
+    const coverage = new Map(copies.map(copy => [copy, copyCoversSource(copy, copy.sourcePath)]));
+    const covered = (product) => Boolean(product.path) && copies.some((copy) => copy.sourcePath === product.path && coverage.get(copy));
     request.workProduct = merged.filter((product) => !covered(product))
-      .map((product) => ({ ...product, fileUrl: fileUrl(product), available: product.path ? Boolean(servableFile(product)) : product.deliverable ? bucketFileAvailable(product) : true }));
+      .map((product) => {
+        const available = product.path ? Boolean(servableFile(product)) : product.deliverable ? bucketFileAvailable(product) : true;
+        if (product.path || product.bucketPath) onProductFile?.(product, available, coverage.get(product) ?? null);
+        return { ...product, fileUrl: fileUrl(product), available };
+      });
     const relatedIds = new Set(request.conversationKeys.flatMap((key) => sessionIdsByKey.get(key) ?? []));
     const related = [...relatedIds].flatMap((id) => promptsBySession.get(id) ?? []);
     // A new ask is activity on its request, even before any agent records work.
     request.updatedAtEpoch = Math.max(request.updatedAtEpoch, request.original.atEpoch ?? 0, ...related.map((prompt) => prompt.created_at_epoch ?? 0));
     if (!request.agentIds.length) for (const agent of view.agents ?? []) if (relatedIds.has(agent.sessionId) && !request.agentIds.includes(agent.id)) request.agentIds.push(agent.id);
     request.scopeUpdates = related.filter((prompt) => !(request.original.source === 'user-prompt' && prompt.id === request.original.sourceId) && requestText(prompt.prompt_text) && (request.original.promptNumber == null || prompt.prompt_number >= request.original.promptNumber))
-      .sort((a, b) => (b.created_at_epoch ?? 0) - (a.created_at_epoch ?? 0) || b.prompt_number - a.prompt_number || b.id - a.id)
+      .sort((a, b) => {
+        const first = conversationKey(sessions.get(a.session_db_id)) ?? '';
+        const second = conversationKey(sessions.get(b.session_db_id)) ?? '';
+        return (b.created_at_epoch ?? 0) - (a.created_at_epoch ?? 0) || b.prompt_number - a.prompt_number
+          || (first < second ? 1 : first > second ? -1 : 0) || b.id - a.id;
+      })
       .slice(0, 6).reverse().map((prompt) => ({ text: requestText(prompt.prompt_text, 500), sourceId: prompt.id, url: `/api/work-view/evidence/prompt/${prompt.id}`, promptNumber: prompt.prompt_number, atEpoch: prompt.created_at_epoch ?? null }));
     const streams = new Map();
     for (const item of request.items) {

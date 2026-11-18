@@ -9,6 +9,7 @@ import { fileURLToPath } from 'url';
 import { parseArgs } from 'util';
 import { Server, type RouteHandler } from '../../services/server/Server.js';
 import { paths } from '../../shared/paths.js';
+import { BUN_NO_AUTO_INSTALL_FLAG } from '../../shared/bun-auto-install.js';
 import { logger } from '../../utils/logger.js';
 import {
   captureProcessStartToken,
@@ -70,23 +71,39 @@ class ServerRuntimeInfoRoutes implements RouteHandler {
     // can read waiting/active/completed/failed/delayed/stalled without
     // hitting `/api/health`. Sampling is best-effort: a Redis blip surfaces
     // the lane with `unavailable: true` rather than crashing the route.
+    //
+    // It is unauthenticated on purpose (a probe cannot present credentials) and
+    // the server runtime is reachable over the container network
+    // (docker-compose sets CLAUDE_MEM_SERVER_HOST=0.0.0.0). So it reports the
+    // state the route documents and nothing else: the auth mode, the Postgres
+    // schema version, the queue backend's connection coordinates (host, port,
+    // key prefix) and the raw driver error text were reconnaissance for anyone
+    // who could reach the port, and a probe reads the lanes without them.
+    // `vectorSearch` keeps its documented shape (available, model, missing
+    // count, last embedding error).
     app.get('/v1/info', async (_req, res) => {
       const queueLanes = await collectQueueLaneMetrics(this.graph);
-      const vectorSearch = await getVectorSearchStatus(this.graph.postgres.pool).catch((error: unknown) => ({
-        unavailable: true,
-        error: error instanceof Error ? error.message : String(error),
-      }));
+      const vectorSearch = await getVectorSearchStatus(this.graph.postgres.pool).catch((error: unknown) => {
+        // The response stays free of the driver error text (see above); the
+        // cause goes to the server log, where the operator can read it.
+        const err = error instanceof Error ? error : new Error(String(error));
+        logger.warn('SYSTEM', 'Vector search status could not be read for /v1/info', {}, err);
+        return {
+          available: false,
+          model: '',
+          observationsWithoutVectors: null,
+          lastEmbedError: null,
+        };
+      });
       res.json({
         name: 'claude-mem-server',
         runtime: SERVER_RUNTIME,
-        authMode: this.graph.authMode,
         postgres: {
           initialized: this.graph.postgres.bootstrap.initialized,
-          schemaVersion: this.graph.postgres.bootstrap.schemaVersion,
         },
         boundaries: {
-          queueManager: this.graph.queueManager.getHealth(),
-          generationWorkerManager: this.graph.generationWorkerManager.getHealth(),
+          queueManager: { status: this.graph.queueManager.getHealth().status },
+          generationWorkerManager: { status: this.graph.generationWorkerManager.getHealth().status },
         },
         queueLanes,
         vectorSearch,
@@ -251,12 +268,19 @@ export class ServerService {
         }
         this.server = null;
       }
-      await Promise.all([
-        this.graph.queueManager.close(),
-        this.graph.generationWorkerManager.close(),
-        this.graph.stopBackgroundWork?.(),
+      // Each owner must finish releasing its database work before the pool
+      // closes, even if a sibling close fails. Keep the original failure for
+      // the caller, but do not let it skip remaining resource cleanup.
+      const boundaries = await Promise.allSettled([
+        () => this.graph.queueManager.close(),
+        () => this.graph.generationWorkerManager.close(),
+        () => this.graph.stopBackgroundWork?.(),
+      ].map(close => Promise.resolve().then(close)));
+      const pool = await Promise.allSettled([
+        Promise.resolve().then(() => this.graph.postgres.pool.end()),
       ]);
-      await this.graph.postgres.pool.end();
+      const failure = [...boundaries, ...pool].find(result => result.status === 'rejected');
+      if (failure?.status === 'rejected') throw failure.reason;
     } finally {
       if (this.persistRuntimeState) {
         removeServerState();
@@ -872,7 +896,8 @@ function spawnServerDaemon(port: number): number | undefined {
   // DATA_DIR without creating it — so create it rather than depend on some earlier
   // caller having done so. Idempotent.
   mkdirSync(paths.dataDir(), { recursive: true });
-  const child = spawn(process.execPath, [scriptPath, '--daemon'], {
+  // The server's embedder loads sharp; never let Bun auto-install it (#5601).
+  const child = spawn(process.execPath, [BUN_NO_AUTO_INSTALL_FLAG, scriptPath, '--daemon'], {
     detached: true,
     stdio: 'ignore',
     windowsHide: true,

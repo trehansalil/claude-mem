@@ -84,6 +84,17 @@ export const OPENAI_COMPAT_PRESETS: readonly OpenAICompatPreset[] = [
     hint: 'API Route key; select a chat-completions model from your account catalog. Model ids are passed verbatim.',
   },
   {
+    id: 'modelgo',
+    label: 'ModelGo (modelgo.ai)',
+    baseUrl: 'https://api.modelgo.ai/v1',
+    // ModelGo keys expose the logical models enabled for that account. Do not
+    // guess one here: users should choose a chat-completions model returned by
+    // their authenticated GET /v1/models request.
+    defaultModel: '',
+    requiresApiKey: true,
+    hint: 'mgk_ key from console.modelgo.ai; choose a logical chat-completions model returned by api.modelgo.ai/v1/models.',
+  },
+  {
     id: 'opper',
     label: 'Opper (opper.ai)',
     baseUrl: 'https://api.opper.ai/v3/compat',
@@ -152,6 +163,48 @@ export const OPENAI_COMPAT_PRESETS: readonly OpenAICompatPreset[] = [
     defaultModel: 'deepseek/deepseek-v4-flash',
     requiresApiKey: true,
     hint: 'Key from standardcompute.com/dashboard/api-keys; vendor-prefixed model ids such as deepseek/deepseek-v4-flash or z-ai/glm-5.3. US endpoint: https://us.stdcmpt.com/v1.',
+  },
+  {
+    id: 'uberllm',
+    label: 'UberLLM (uberllm.dev)',
+    baseUrl: 'https://api.uberllm.dev/v1',
+    // A cheap, fast model for the same reason as NVIDIA's default: extraction
+    // is high volume. Ids are vendor-prefixed and passed verbatim.
+    defaultModel: 'deepseek/deepseek-v4.1-flash',
+    requiresApiKey: true,
+    hint: 'Key from uberllm.dev/dashboard/keys; vendor-prefixed model ids such as deepseek/deepseek-v4.1-flash or z-ai/glm-5.2, listed at api.uberllm.dev/v1/models.',
+  },
+  {
+    id: 'hopbase',
+    label: 'HopBase (hop-base.com)',
+    baseUrl: 'https://api.hop-base.com/v1',
+    // A cheap, fast model for the same reason as NVIDIA's default: extraction
+    // is high volume. Ids are passed verbatim.
+    defaultModel: 'deepseek-v4.1-flash',
+    requiresApiKey: true,
+    hint: 'Key from the HopBase console; model ids such as deepseek-v4.1-flash or claude-haiku-5-5, as listed by GET api.hop-base.com/v1/models for your key.',
+  },
+  {
+    id: 'trustedrouter',
+    label: 'TrustedRouter (trustedrouter.com)',
+    baseUrl: 'https://api.trustedrouter.com/v1',
+    // A cheap, fast fixed model for the same reason as NVIDIA's default:
+    // extraction is high volume. trustedrouter/auto stays opt-in, since it
+    // routes each request to a model priced up to frontier rates. Ids are
+    // vendor-prefixed and passed verbatim.
+    defaultModel: 'deepseek/deepseek-v4-flash',
+    requiresApiKey: true,
+    hint: 'Key from trustedrouter.com; vendor-prefixed model ids such as deepseek/deepseek-v4-flash, or trustedrouter/auto to route per request (priced per routed model), listed at api.trustedrouter.com/v1/models.',
+  },
+  {
+    id: 'atmorouter',
+    label: 'AtmoRouter (atmorouter.dev)',
+    baseUrl: 'https://atmorouter.dev/v1',
+    // A cheap, fast model for the same reason as NVIDIA's default: extraction
+    // is high volume. Ids carry a route prefix and are passed verbatim.
+    defaultModel: 'zai/glm-5.3-flash',
+    requiresApiKey: true,
+    hint: 'Key (ar-...) from Dashboard > API Keys at atmorouter.dev; route-prefixed model ids such as zai/glm-5.3-flash or zai/glm-5.3, listed at atmorouter.dev/v1/models.',
   },
   {
     id: 'deepseek',

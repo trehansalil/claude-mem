@@ -39,17 +39,18 @@ function fixture(response: typeof fetch = (async () => Response.json(answer())) 
   const dir = mkdtempSync(join(scratch, 'hosted-intent-'));
   cleanup.push(() => rmSync(dir, { recursive: true, force: true }));
   const databasePath = join(dir, 'memory.db');
-  const store = new SessionStore(databasePath);
-  cleanup.push(() => store.close());
+  let store: SessionStore | undefined;
+  const getStore = () => store ??= new SessionStore(databasePath);
+  cleanup.push(() => store?.close());
   const configPath = join(dir, 'intent-install.json');
   const createRun = () => new HostedIntent({
     origin: () => 'https://cloud.example/', credentials: () => credentials, intentConfigPath: configPath, ledgerDir: join(dir, 'work-view'),
-    openDatabase: () => new Database(databasePath, { readonly: true }),
-    appendWorkStateEntry: entry => { store.appendWorkStateEntry(entry); }, homeProject: () => 'home',
+    openDatabase: () => { getStore(); return new Database(databasePath, { readonly: true }); },
+    appendWorkStateEntry: entry => { getStore().appendWorkStateEntry(entry); }, homeProject: () => 'home',
     fetch: ((url, init) => init?.method === 'GET' ? preflight(url, init) : response(url, init)) as typeof fetch,
     now: () => at, timezoneOffsetMinutes: () => 420,
   });
-  return { run: createRun(), createRun, configPath, dir, store, databasePath };
+  return { run: createRun(), createRun, configPath, dir, get store() { return getStore(); }, databasePath };
 }
 
 describe('hosted setup extraction', () => {
@@ -310,7 +311,7 @@ describe('hosted setup extraction', () => {
   it('fails loudly on the uncompressed cap even when the gzip would fit, with no paid request', async () => {
     let calls = 0;
     const { run } = fixture((async () => { calls++; return Response.json(answer()); }) as typeof fetch);
-    await expect(run.run([{ ...prompts[0], text: 'a'.repeat(INTENT_MAX_UPLOAD_BYTES) }], true)).rejects.toThrow('2 MiB upload cap');
+    await expect(run.run([{ ...prompts[0], text: 'a'.repeat(INTENT_MAX_UPLOAD_BYTES) }], true)).rejects.toMatchObject({ code: 'hosted-too-large', sent: false, message: expect.stringContaining('2 MiB upload cap') });
     expect(calls).toBe(0);
   });
 
@@ -490,6 +491,30 @@ describe('hosted setup extraction', () => {
     await expect(test.run.run(prompts, true)).rejects.toThrow('Installation credentials are temporarily unavailable.');
     expect(test.run.state()).toMatchObject({ state: 'failed', error: expect.stringContaining('Installation credentials are temporarily unavailable.') });
     expect(requests).toEqual(['https://cloud.example/api/installer/intent']);
+  });
+
+  it('refuses an over-cap history as hosted-too-large before any Cloud call, with nothing sent', async () => {
+    let calls = 0;
+    const counting = (async () => { calls++; return Response.json(answer()); }) as typeof fetch;
+    const preflight = (async () => { calls++; return Response.json({ available: true }); }) as typeof fetch;
+    const { run } = fixture(counting, { token: 'setup-token', userId: 'owner' }, preflight);
+    const big = prompts.map((prompt, index) => index === 0 ? { ...prompt, text: 'a'.repeat(INTENT_MAX_UPLOAD_BYTES) } : prompt);
+    await expect(run.run(big, true)).rejects.toMatchObject({ code: 'hosted-too-large', sent: false,
+      message: 'Hosted setup exceeds the 2 MiB upload cap. No prompts were truncated or uploaded.' });
+    expect(calls).toBe(0);
+    expect(run.state()).toMatchObject({ state: 'failed', error: expect.stringContaining('2 MiB upload cap') });
+  });
+
+  it('uploads a history whose body is exactly at the cap', async () => {
+    let uploads = 0;
+    const { run } = fixture((async () => { uploads++; return Response.json(answer()); }) as typeof fetch);
+    const sized = prompts.map(prompt => ({ ...prompt }));
+    const bodyBytes = () => Buffer.byteLength(JSON.stringify({ ownerPrompts: sized, improveProduct: true, timezoneOffsetMinutes: 420 }));
+    sized[0].text += 'a'.repeat(INTENT_MAX_UPLOAD_BYTES - bodyBytes());
+    expect(bodyBytes()).toBe(INTENT_MAX_UPLOAD_BYTES);
+    await run.run(sized, true);
+    expect(uploads).toBe(1);
+    expect(run.state()).toMatchObject({ state: 'ok', error: null });
   });
 
   it('rejects an invalid explicit install credential even when account credentials exist', async () => {

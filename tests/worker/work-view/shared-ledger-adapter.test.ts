@@ -1,5 +1,6 @@
 import { afterEach, expect, test } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from 'node:fs';
+import { removeTempDir } from '../../helpers/temp-dir.js';
 import { join, posix, win32 } from 'node:path';
 import { Database } from 'bun:sqlite';
 import { tmpdir } from 'node:os';
@@ -15,12 +16,13 @@ import { createHumanCopyInput, humanCopyFingerprint } from '../../../src/service
 import { buildContentOperation } from '../../../src/services/sync/CanonicalContent.js';
 import { decodeChanges } from '../../../src/services/sync/SyncClient.js';
 import { SyncApply } from '../../../src/services/sync/SyncApply.js';
+import { upsertToolUse } from '../../../src/services/sqlite/tool-uses.js';
 
 const disposals: Array<() => void> = [];
-afterEach(() => { for (const dispose of disposals.splice(0).reverse()) dispose(); });
+afterEach(async () => { for (const dispose of disposals.splice(0).reverse()) await dispose(); });
 function fixture(deviceId = 'device-a') {
   const dir = mkdtempSync(join(tmpdir(), 'shared-ledger-'));
-  disposals.push(() => rmSync(dir, { recursive: true, force: true }));
+  disposals.push(() => removeTempDir(dir));
   const databasePath = join(dir, 'memory.db');
   const store = new SessionStore(databasePath);
   store.setLocalSyncDeviceId(deviceId);
@@ -37,15 +39,19 @@ function groups(...ids: string[]) {
 }
 const state = (f: ReturnType<typeof fixture>) => readSharedRecords(f.store.db, { deviceId: f.deviceId, validateValue: isSharedProjectionValue });
 const count = (f: ReturnType<typeof fixture>) => (f.store.db.query('SELECT COUNT(*) AS count FROM work_state_entries').get() as { count: number }).count;
+function replicate(from: ReturnType<typeof fixture>, to: ReturnType<typeof fixture>) {
+  const rows = from.store.db.query('SELECT * FROM work_state_entries WHERE origin_device_id IS NULL ORDER BY id').all() as any[];
+  const apply = new SyncApply(to.store.db, { deviceId: to.deviceId });
+  const cursor = Number(apply.getCursor());
+  const wires = rows.map((row, i) => ({ seq: String(cursor + i + 1), ...buildContentOperation({ kind: 'work_state', originDeviceId: from.deviceId,
+    originLocalId: String(row.id), entityRev: row.sync_rev, payload: { project: row.project, list_name: row.list_name,
+      fields: JSON.parse(row.fields), created_at: row.created_at, created_at_epoch: String(row.created_at_epoch) } }) }));
+  return apply.applyOps(decodeChanges(wires));
+}
 function applyRemote(target: ReturnType<typeof fixture>, updates: any[]) {
   const remote = fixture('device-z');
   publishSharedRecords(remote.store.db, { deviceId: remote.deviceId, project: 'shared', updates, validateValue: isSharedProjectionValue });
-  const rows = remote.store.db.query('SELECT * FROM work_state_entries ORDER BY id').all() as any[];
-  const cursor = Number(new SyncApply(target.store.db, { deviceId: target.deviceId }).getCursor());
-  const wires = rows.map((row, i) => ({ seq: String(cursor + i + 1), ...buildContentOperation({ kind: 'work_state', originDeviceId: remote.deviceId,
-    originLocalId: String(row.id), entityRev: row.sync_rev, payload: { project: row.project, list_name: row.list_name,
-      fields: JSON.parse(row.fields), created_at: row.created_at, created_at_epoch: String(row.created_at_epoch) } }) }));
-  return new SyncApply(target.store.db, { deviceId: target.deviceId }).applyOps(decodeChanges(wires));
+  return replicate(remote, target);
 }
 
 test('the registered real JSON writer commits canonical facts before its file and does not echo on restart', () => {
@@ -87,6 +93,132 @@ test('unchanged reconciliation creates no canonical rows or metadata writes', ()
   expect(count(f)).toBe(rows);
   expect(f.store.db.query('SELECT total_changes() AS count').get()).toEqual(before);
   expect(f.store.db.query('SELECT * FROM my_work_file_state ORDER BY name').all()).toEqual(metadata);
+});
+
+test('a concurrent native write after activity capture remains visible to the next pass', () => {
+  const f = fixture();
+  const writer = new SessionStore(f.databasePath);
+  disposals.push(() => writer.close());
+  // The first pass decides on an empty database; the write lands right after that decision.
+  const ownsActivity = f.adapter.ownsActivity.bind(f.adapter);
+  let inserted = false;
+  f.adapter.ownsActivity = () => {
+    const owns = ownsActivity();
+    if (!inserted) {
+      inserted = true;
+      const id = writer.createSDKSession('after-capture', 'repo', 'Keep concurrent work');
+      writer.saveUserPrompt('after-capture', 1, 'Keep concurrent work', id);
+    }
+    return owns;
+  };
+  f.adapter.reconcile();
+  expect([...state(f).records.values()].filter(record => record.kind === 'provenance')).toHaveLength(0);
+  f.adapter.reconcile();
+  const provenance = [...state(f).records.values()].find(record => record.kind === 'provenance');
+  expect(provenance?.value).toMatchObject({ session: { content_session_id: 'after-capture', project: 'repo' } });
+});
+
+test('a concurrent native write after a full activity capture remains visible to the next pass', () => {
+  // This device already owns a session, so the pass builds the view and publishes; the write lands right after that publish.
+  const f = fixture();
+  const writer = new SessionStore(f.databasePath);
+  disposals.push(() => writer.close());
+  const owned = writer.createSDKSession('owned', 'repo', 'Work this device did');
+  writer.saveUserPrompt('owned', 1, 'Work this device did', owned);
+  const publish = f.adapter.publish.bind(f.adapter);
+  let inserted = false;
+  f.adapter.publish = updates => {
+    const changed = publish(updates);
+    if (!inserted) {
+      inserted = true;
+      const id = writer.createSDKSession('after-capture', 'repo', 'Keep concurrent work');
+      writer.saveUserPrompt('after-capture', 1, 'Keep concurrent work', id);
+    }
+    return changed;
+  };
+  const sessions = () => [...state(f).records.values()].filter(record => record.kind === 'provenance')
+    .map(record => (record.value as { session: { content_session_id: string } }).session.content_session_id).sort();
+  f.adapter.reconcile();
+  expect(inserted).toBe(true);
+  expect(sessions()).toEqual(['owned']);
+  f.adapter.reconcile();
+  expect(sessions()).toEqual(['after-capture', 'owned']);
+  const provenance = [...state(f).records.values()].find(record => record.kind === 'provenance'
+    && (record.value as { session: { content_session_id: string } }).session.content_session_id === 'after-capture');
+  expect(provenance?.value).toMatchObject({ session: { content_session_id: 'after-capture', project: 'repo' } });
+});
+
+test('a failed activity publication is retried after an unchanged SQLite writer releases its lock', () => {
+  const f = fixture(), receiver = fixture('device-b');
+  const session = f.store.createSDKSession('locked-capture', 'repo', 'Keep shared work visible');
+  f.store.updateMemorySessionId(session, 'locked-capture-memory');
+  f.store.saveUserPrompt('locked-capture', 1, 'Keep shared work visible', session);
+  const at = Date.now(), fields = { task: 'Publish shared result', status: 'doing' };
+  f.store.appendWorkStateEntry({ project: 'repo', listName: 'release', fields, createdAtEpoch: at });
+  upsertToolUse(f.store.db, { toolUseId: 'locked-call', contentSessionId: 'locked-capture',
+    sessionDbId: session, memorySessionId: 'locked-capture-memory', project: 'repo', platformSource: 'claude',
+    toolName: 'work_state_write', toolInput: JSON.stringify({ list: 'release', fields }), createdAtEpoch: at });
+  f.adapter.saveFile('request-groups.json', groups('locked-capture'));
+  const lock = new Database(f.databasePath);
+  disposals.push(() => lock.close());
+  f.store.db.exec('PRAGMA busy_timeout = 1');
+  const version = f.store.db.query('PRAGMA data_version').get();
+  lock.exec('BEGIN IMMEDIATE');
+  try {
+    expect(f.adapter.reconcile().files).toEqual([expect.objectContaining({ file: 'activity' })]);
+    expect([...state(f).records.values()].filter(record => record.kind === 'provenance')).toHaveLength(0);
+  } finally {
+    // A writer can roll back without changing data_version. No new source
+    // row or file edit should be needed to publish the already captured work.
+    lock.exec('ROLLBACK');
+  }
+  expect(f.store.db.query('PRAGMA data_version').get()).toEqual(version);
+  expect(f.adapter.reconcile().files).toEqual([]);
+  const provenance = [...state(f).records.values()].find(record => record.kind === 'provenance');
+  expect(provenance?.value).toMatchObject({ session: { content_session_id: 'locked-capture' },
+    attributions: [expect.objectContaining({ work: expect.objectContaining({ device: f.deviceId }) })] });
+  replicate(f, receiver);
+  const source = new WorkStateSource({ databasePath: receiver.databasePath, localDeviceId: receiver.deviceId });
+  disposals.push(() => source.close());
+  const request = source.read().agentView.humanRequests.find((item: any) => item.groupId === groupIdFor(key('locked-capture')));
+  expect(request?.items.map((item: any) => item.title)).toEqual(['Publish shared result']);
+  const saved = count(f);
+  f.adapter.reconcile();
+  expect(count(f)).toBe(saved);
+});
+
+// bun:sqlite reports a held writer lock as SQLITE_BUSY; WAL snapshot and recovery conflicts carry extended busy codes.
+test.each(['SQLITE_BUSY', 'SQLITE_BUSY_SNAPSHOT', 'SQLITE_BUSY_RECOVERY'])('an activity publish that hits a busy database (%s) is retried by the next pass, not dropped', code => {
+  const f = fixture();
+  const owned = f.store.createSDKSession('owned', 'repo', 'Work this device did');
+  f.store.saveUserPrompt('owned', 1, 'Work this device did', owned);
+  const publish = f.adapter.publish.bind(f.adapter);
+  let failures = 0;
+  f.adapter.publish = updates => {
+    if (failures++ === 0) throw Object.assign(new Error('database is locked'), { code });
+    return publish(updates);
+  };
+  const provenance = () => [...state(f).records.values()].filter(record => record.kind === 'provenance');
+  const diagnostic = f.adapter.reconcile();
+  expect(diagnostic.files).toEqual([{ file: 'activity', message: 'database is locked' }]);
+  expect(provenance()).toHaveLength(0);
+  // Nothing changed in the database since the failed pass; the retry must still happen.
+  f.adapter.reconcile();
+  expect(provenance()).toHaveLength(1);
+  expect(provenance()[0].value).toMatchObject({ session: { content_session_id: 'owned', project: 'repo' } });
+});
+
+test('an activity publish that fails for a lasting reason is not rebuilt on every pass', () => {
+  // A conflict or an invalid value repeats until the data changes, and each capture rebuilds the whole view.
+  const f = fixture();
+  const owned = f.store.createSDKSession('owned', 'repo', 'Work this device did');
+  f.store.saveUserPrompt('owned', 1, 'Work this device did', owned);
+  let attempts = 0;
+  f.adapter.publish = () => { attempts++; throw new Error('Shared My Work has a conflicting decision; retained the previous complete state'); };
+  f.adapter.reconcile();
+  f.adapter.reconcile();
+  f.adapter.reconcile();
+  expect(attempts).toBe(1);
 });
 
 test('formatting and object-key order do not become a new imported generation', () => {
@@ -131,23 +263,14 @@ test('external Python-style JSON changes import once, and deleting a known local
 test('deleted identities revive from their durable tombstone base after restart and peer updates', () => {
   const a = fixture(), b = fixture('device-b');
   const id = groupIdFor(key('a')), identity = sharedRecordKey('group', id);
-  const transfer = (from: ReturnType<typeof fixture>, to: ReturnType<typeof fixture>) => {
-    const rows = from.store.db.query('SELECT * FROM work_state_entries WHERE origin_device_id IS NULL ORDER BY id').all() as any[];
-    const apply = new SyncApply(to.store.db, { deviceId: to.deviceId });
-    const cursor = Number(apply.getCursor());
-    apply.applyOps(decodeChanges(rows.map((row, index) => ({ seq: String(cursor + index + 1), ...buildContentOperation({
-      kind: 'work_state', originDeviceId: from.deviceId, originLocalId: String(row.id), entityRev: row.sync_rev,
-      payload: { project: row.project, list_name: row.list_name, fields: JSON.parse(row.fields), created_at: row.created_at, created_at_epoch: String(row.created_at_epoch) },
-    }) }))));
-  };
   a.adapter.saveFile('request-groups.json', groups('a'));
   a.adapter.saveFile('request-groups.json', groups());
   expect(state(a).records.get(identity)).toMatchObject({ deleted: true, revision: '2' });
-  transfer(a, b);
+  replicate(a, b);
   b.adapter.reconcile({ captureActivity: false });
   b.adapter.saveFile('request-groups.json', groups('a'));
   expect(state(b).records.get(identity)).toMatchObject({ deleted: false, revision: '3' });
-  transfer(b, a);
+  replicate(b, a);
   a.adapter.reconcile({ captureActivity: false });
   a.adapter.saveFile('request-groups.json', groups());
   expect(state(a).records.get(identity)).toMatchObject({ deleted: true, revision: '4' });
@@ -315,14 +438,9 @@ test('remote tombstones materialize into story and progress compatibility files'
   f.adapter.saveFile(`progress/${groupId}.json`, { groupId, state: 'in-progress', percent: 20, summary: 'Old progress' });
   const remote = fixture('device-z');
   // First copy current state to the remote, so deletion is authored after the existing revision.
-  const sourceRows = f.store.db.query('SELECT * FROM work_state_entries ORDER BY id').all() as any[];
-  const sourceWires = sourceRows.map((row, i) => ({ seq: String(i + 1), ...buildContentOperation({ kind: 'work_state', originDeviceId: f.deviceId, originLocalId: String(row.id), entityRev: row.sync_rev,
-    payload: { project: row.project, list_name: row.list_name, fields: JSON.parse(row.fields), created_at: row.created_at, created_at_epoch: String(row.created_at_epoch) } }) }));
-  new SyncApply(remote.store.db, { deviceId: remote.deviceId }).applyOps(decodeChanges(sourceWires));
+  replicate(f, remote);
   publishSharedRecords(remote.store.db, { deviceId: remote.deviceId, project: 'shared', updates: [{ kind: 'story', key: 'current', deleted: true }, { kind: 'progress', key: groupId, deleted: true }], validateValue: isSharedProjectionValue });
-  const rows = remote.store.db.query('SELECT * FROM work_state_entries WHERE origin_device_id IS NULL ORDER BY id').all() as any[];
-  new SyncApply(f.store.db, { deviceId: f.deviceId }).applyOps(decodeChanges(rows.map((row, i) => ({ seq: String(i + 1), ...buildContentOperation({ kind: 'work_state', originDeviceId: remote.deviceId, originLocalId: String(row.id), entityRev: row.sync_rev,
-    payload: { project: row.project, list_name: row.list_name, fields: JSON.parse(row.fields), created_at: row.created_at, created_at_epoch: String(row.created_at_epoch) } }) }))));
+  replicate(remote, f);
   f.adapter.reconcile({ captureActivity: false });
   expect(readLedger(f.directory).story).toBeNull();
   expect(readLedger(f.directory).progress[groupId]).toBeUndefined();
@@ -337,4 +455,32 @@ test('remote refresh display never becomes local PID or lock ownership', () => {
   f.adapter.reconcile({ captureActivity: false });
   expect(JSON.parse(readFileSync(join(f.directory, 'refresh.json'), 'utf8'))).toEqual(localStatus);
   expect(state(f).records.get(sharedRecordKey('refresh', f.deviceId))?.value).not.toHaveProperty('pid');
+});
+
+test('a replica that owns no activity does not rebuild the agent view on every pulled commit', () => {
+  // The cloud viewer pulls every row it has: on its account 0 of 163,082 observations and 0 of 5,598 prompts are
+  // its own, and its pull loop commits every 30 s. Each commit moved the activity signature, so the shared-work-sync
+  // thread built the whole agent view (about a second and tens of MB on that account) to publish nothing.
+  const f = fixture();
+  const writer = new SessionStore(f.databasePath);
+  disposals.push(() => writer.close());
+  const sessionId = writer.createSDKSession('pulled-session', 'repo', 'A request from another computer');
+  writer.saveUserPrompt('pulled-session', 1, 'A request from another computer', sessionId);
+  writer.db.prepare("UPDATE user_prompts SET origin_device_id = 'device-z', origin_local_id = '1'").run();
+  let viewBuilds = 0;
+  const prepare = f.store.db.prepare.bind(f.store.db);
+  (f.store.db as any).prepare = (sql: string) => { if (sql.includes("LIKE '%work_state_write%'")) viewBuilds++; return prepare(sql); };
+  f.adapter.reconcile();
+  for (let commit = 1; commit <= 3; commit++) {
+    // A commit from another connection, as each pulled page is.
+    writer.db.prepare("INSERT OR REPLACE INTO sync_state (k, v) VALUES ('pull-cursor', ?)").run(String(commit));
+    f.adapter.reconcile();
+  }
+  expect(viewBuilds).toBe(0);
+  expect([...state(f).records.values()].filter(record => record.kind === 'provenance')).toHaveLength(0);
+  // The same prompt as this device's own row: the capture runs again and publishes it.
+  writer.db.prepare("UPDATE user_prompts SET origin_device_id = ?").run(f.deviceId);
+  f.adapter.reconcile();
+  expect(viewBuilds).toBe(1);
+  expect([...state(f).records.values()].find(record => record.kind === 'provenance')?.value).toMatchObject({ session: { content_session_id: 'pulled-session' } });
 });

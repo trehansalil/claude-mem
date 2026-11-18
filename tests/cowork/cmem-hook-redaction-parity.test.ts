@@ -24,6 +24,10 @@ const rep = (char: string, count: number) => char.repeat(count);
 interface Sample { text: string; secret?: string }
 
 const SAMPLES: Record<string, Sample[]> = {
+  cookie_header: [
+    { text: 'Cookie: sessionid=abc123def456ghi789', secret: 'abc123def456ghi789' },
+    { text: 'set-cookie: sid=Zx9Yw8Vu7Ts6Rq5Po4Nn3Mm2', secret: 'Zx9Yw8Vu7Ts6Rq5Po4Nn3Mm2' },
+  ],
   url_credentials: [{ text: 'postgres://app:hunter2parity@db.internal/prod', secret: 'hunter2parity' }],
   aws_access_key: [{ text: 'AKIA' + rep('Q', 16) }],
   aws_secret_key: [{ text: 'AWS_SECRET_ACCESS_KEY=' + rep('w', 40), secret: rep('w', 40) }],
@@ -59,6 +63,12 @@ const SAMPLES: Record<string, Sample[]> = {
   perplexity_key: [{ text: 'pplx-' + rep('P', 48) }],
   supabase_token: [{ text: 'sbp_' + rep('e', 40) }],
   sentry_token: [{ text: 'sntryu_' + rep('c', 64) }],
+  grafana_token: [{ text: 'glsa_' + rep('G', 32) + '_' + rep('a', 8) }, { text: 'glc_' + rep('Q', 40) + '==' }],
+  postman_key: [{ text: 'PMAK-' + rep('b', 24) + '-' + rep('c', 34) }],
+  pulumi_token: [{ text: 'pul-' + rep('d', 40) }],
+  doppler_token: [{ text: 'dp.pt.' + rep('D', 43) }],
+  heroku_key: [{ text: 'HRKU-AA' + rep('h', 58) }],
+  atlassian_token: [{ text: 'ATATT3' + rep('A', 186) }],
   slack_webhook: [{ text: 'https://hooks.slack.com/services/T0000000/B0000000/' + rep('K', 24), secret: rep('K', 24) }],
   discord_webhook: [{ text: 'https://discord.com/api/webhooks/12345678901234567/' + rep('C', 60), secret: rep('C', 60) }],
   claude_mem_key: [{ text: 'cmem_' + rep('M', 32) }, { text: 'cm_pro_' + rep('m', 16) }],
@@ -137,12 +147,14 @@ describe('Cowork shim redacts every key shape the worker redacts', () => {
         expect(result.counts[name] ?? 0).toBeGreaterThan(0);
         expect(result.redacted).not.toContain(secret);
       });
-
-      it(`${name} sample ${index + 1}: the Cowork shim redacts it`, async () => {
-        const body = await runShim(sample.text);
-        expect(body).not.toContain(secret);
-        expect(body).toContain('[cmem-redacted]');
-      });
     });
   }
+
+  it('the Cowork shim redacts every sample in one response', async () => {
+    const samples = Object.entries(SAMPLES).flatMap(([name, values]) =>
+      values.map((sample, index) => ({ name: `${name} sample ${index + 1}`, ...sample })));
+    const body = await runShim(samples.map(sample => sample.text).join('\n'));
+    expect(samples.filter(sample => body.includes(sample.secret ?? sample.text)).map(sample => sample.name)).toEqual([]);
+    expect(body).toContain('[cmem-redacted]');
+  });
 });

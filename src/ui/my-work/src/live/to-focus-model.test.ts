@@ -3,9 +3,13 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
-import { focusAreaLabel, resolveFocusAreaId, suggestionEditDecision } from './to-focus-model.ts'
+import { NOT_SORTED_YET_LABEL, createFocusAreaResolver, focusAreaLabel, resolveFocusAreaId, suggestionEditDecision } from './to-focus-model.ts'
 import { toWorkModel } from './to-work-model.ts'
 import type { WorkViewFocusArea, WorkViewGoalItem, WorkViewGoalList, WorkViewHumanRequest, WorkViewSnapshot } from './work-view-api-types.ts'
+import { myworkFr } from '../../../i18n/mywork-fr.ts'
+import { myworkKo } from '../../../i18n/mywork-ko.ts'
+import { myworkTr } from '../../../i18n/mywork-tr.ts'
+import { myworkZh } from '../../../i18n/mywork-zh.ts'
 
 const appRoot = new URL('../../', import.meta.url)
 const baseSnapshot = JSON.parse(readFileSync(new URL('test-fixtures/work-view-snapshot.trimmed.json', appRoot), 'utf8')) as WorkViewSnapshot
@@ -31,11 +35,17 @@ const goals = (areas: WorkViewGoalItem[], asks: WorkViewGoalItem[]): WorkViewGoa
 const mapFocus = (focusAreas: WorkViewFocusArea[], humanRequests: WorkViewHumanRequest[], extra: Partial<WorkViewSnapshot> = {}) =>
   toWorkModel({ ...baseSnapshot, focusAreas, humanRequests, ...extra }, now)
 
-test('a request\'s placement maps to its area; no placement reads "Sorting…", never a guessed area', () => {
+test('a request\'s placement maps to its area; no placement reads "Not sorted yet", never a guessed area', () => {
   const model = mapFocus([area('fa_viewer', { name: 'Viewer' })], [placed('r1', 'fa_viewer'), placed('r2')])
   assert.deepEqual(model.requestReadErrors, [])
   assert.deepEqual(model.requests.map((request) => request.focusAreaId), ['fa_viewer', undefined])
-  assert.deepEqual(model.requests.map((request) => focusAreaLabel(request.focusAreaId, model.focusAreas)), ['Viewer', 'Sorting…'])
+  assert.deepEqual(model.requests.map((request) => focusAreaLabel(request.focusAreaId, model.focusAreas)), ['Viewer', NOT_SORTED_YET_LABEL])
+  // The area chip says the same words for the same case (components/bits.tsx FocusAreaChip).
+  assert.equal(NOT_SORTED_YET_LABEL, 'Not sorted yet')
+})
+
+test('every My Work catalog words the unplaced case (the chip says it through the constant, which the catalog test cannot see)', () => {
+  for (const catalog of [myworkZh, myworkKo, myworkTr, myworkFr]) assert.ok(catalog[NOT_SORTED_YET_LABEL]?.trim())
 })
 
 test('Other is its own bucket, never an area', () => {
@@ -56,6 +66,12 @@ test('the owner\'s order wins over the suggested priority; unordered areas follo
   assert.deepEqual(model.focusAreas.map((entry) => entry.name), ['Owner first', 'Owner second', 'A', 'B', 'No rank'])
 })
 
+test('recorded area scope reaches the work view; older workers have no scope text', () => {
+  const model = mapFocus([area('fa_scoped', { about: 'Viewer cards and onboarding.' }), area('fa_old')], [])
+  assert.equal(model.focusAreas.find((entry) => entry.id === 'fa_scoped')!.about, 'Viewer cards and onboarding.')
+  assert.equal(model.focusAreas.find((entry) => entry.id === 'fa_old')!.about, null)
+})
+
 test('a placement in a merged area resolves to the area it was merged into, through a chain', () => {
   const areas = [area('fa_old', { mergedInto: 'fa_mid' }), area('fa_mid', { mergedInto: 'fa_new' }), area('fa_new', { name: 'New' })]
   const model = mapFocus(areas, [placed('r1', 'fa_old')])
@@ -63,11 +79,11 @@ test('a placement in a merged area resolves to the area it was merged into, thro
   assert.equal(focusAreaLabel('fa_old', model.focusAreas), 'New')
 })
 
-test('a merge loop, a dismissed area or an unknown area reads "Sorting…" until a refresh places the request', () => {
+test('a merge loop, a dismissed area or an unknown area reads "Not sorted yet" until a refresh places the request', () => {
   const model = mapFocus([area('fa_x', { mergedInto: 'fa_y' }), area('fa_y', { mergedInto: 'fa_x' }), area('fa_gone', { status: 'dismissed' })], [])
   for (const id of ['fa_x', 'fa_gone', 'fa_unknown']) {
     assert.equal(resolveFocusAreaId(id, model.focusAreas), null, id)
-    assert.equal(focusAreaLabel(id, model.focusAreas), 'Sorting…', id)
+    assert.equal(focusAreaLabel(id, model.focusAreas), NOT_SORTED_YET_LABEL, id)
   }
   assert.equal(mapFocus([area('fa_gone', { status: 'dismissed' })], [placed('r1', 'fa_gone')]).requests[0].focusAreaId, undefined)
 })
@@ -75,6 +91,35 @@ test('a merge loop, a dismissed area or an unknown area reads "Sorting…" until
 test('a done area keeps its requests', () => {
   const model = mapFocus([area('fa_done', { status: 'done', name: 'Done one' })], [placed('r1', 'fa_done')])
   assert.equal(model.requests[0].focusAreaId, 'fa_done')
+})
+
+test('a model resolver reuses area indexing and resolved merge chains across many requests', () => {
+  const model = mapFocus([area('old', { mergedInto: 'middle' }), area('middle', { mergedInto: 'live' }), area('live')], [])
+  let indexReads = 0
+  let mergeReads = 0
+  for (const entry of model.focusAreas) {
+    const { id, mergedInto } = entry
+    Object.defineProperty(entry, 'id', { get: () => { indexReads++; return id } })
+    Object.defineProperty(entry, 'mergedInto', { get: () => { mergeReads++; return mergedInto } })
+  }
+  const resolve = createFocusAreaResolver(model.focusAreas)
+  assert.equal(resolve('old'), 'live')
+  const firstIndexReads = indexReads
+  const firstMergeReads = mergeReads
+  for (let index = 0; index < 10_000; index++) {
+    assert.equal(resolve(index % 2 ? 'old' : 'middle'), 'live')
+  }
+  assert.equal(indexReads, firstIndexReads, 'request count must not cause more area indexing')
+  assert.equal(mergeReads, firstMergeReads, 'request count must not retraverse a resolved merge chain')
+})
+
+test('separate model resolvers see changed placement and cannot keep an old merge decision', () => {
+  const old = mapFocus([area('old', { mergedInto: 'first' }), area('first'), area('second')], []).focusAreas
+  const resolveOld = createFocusAreaResolver(old)
+  assert.equal(resolveOld('old'), 'first')
+  const next = old.map((entry) => entry.id === 'old' ? { ...entry, mergedInto: 'second' } : entry)
+  assert.equal(createFocusAreaResolver(next)('old'), 'second')
+  assert.equal(resolveOld('old'), 'first')
 })
 
 test('an area carries its own owner-goals quotes; asks go under their area (following merges), the rest under Other', () => {
@@ -105,7 +150,7 @@ test('owner-goals area items follow merges like asks, and items on one area comb
   assert.deepEqual(model.focusAreas.find((entry) => entry.id === 'fa_old')!.quotes, [], 'a merged-away area keeps no words of its own')
 })
 
-test('an older worker with no focusAreas: no areas, and every request reads "Sorting…"', () => {
+test('an older worker with no focusAreas: no areas, and every request reads "Not sorted yet"', () => {
   const model = toWorkModel({ ...baseSnapshot, humanRequests: [placed('r1', 'fa_viewer')] }, now)
   assert.deepEqual(model.focusAreas, [])
   assert.equal(model.requests[0].focusAreaId, undefined)
@@ -115,4 +160,12 @@ test('a Suggested card owns the Undo for a merge only; a rename or a new goal go
   assert.equal(suggestionEditDecision({ action: 'merge', focusAreaId: 'fa_old', intoFocusAreaId: 'fa_ship' }), 'merged')
   assert.equal(suggestionEditDecision({ action: 'rename', focusAreaId: 'fa_old', name: 'Shipping' }), null)
   assert.equal(suggestionEditDecision({ action: 'edit-goal', focusAreaId: 'fa_old', goal: 'Ship weekly.' }), null)
+})
+
+test('a done area carries when it was marked done (doneAt), never its last save: Past focus prints that day', () => {
+  // Renamed on Oct 20 after it was marked done on Oct 17: the worker's last save is the rename, the done day stays.
+  const model = mapFocus([area('fa_done', { status: 'done', doneAt: '2026-10-17T16:05:00Z', savedAt: '2026-10-20T09:00:00Z' }), area('fa_old_worker')], [])
+  assert.equal(model.focusAreas.find((entry) => entry.id === 'fa_done')!.doneAt, '2026-10-17T16:05:00Z')
+  // A worker before 16.0.0 sends no done time, so Past focus prints no date (G19), never a made-up one or the last save.
+  assert.equal(model.focusAreas.find((entry) => entry.id === 'fa_old_worker')!.doneAt, null)
 })

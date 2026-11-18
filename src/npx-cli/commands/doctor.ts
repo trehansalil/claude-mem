@@ -7,9 +7,13 @@
 
 import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from 'fs';
 import { isAbsolute, join, posix as posixPath, win32 as windowsPath } from 'path';
+import { homedir } from 'os';
+import { readTomlBooleanInTable } from '../../shared/codex-toml.js';
+import { CODEX_PLUGIN_CONFIG_TABLE } from '../../shared/plugin-state.js';
+import { registerCodexUserHooks } from '../../services/integrations/codex-user-hooks.js';
 import { styleText } from 'node:util';
 import { IS_WINDOWS, installedPluginsPath, marketplaceDirectory, readPluginVersion } from '../utils/paths.js';
-import { getWorkerBaseUrl, resolvePluginRoot, type PluginRootResolution } from '../../shared/worker-utils.js';
+import { getWorkerBaseUrl, resolvePluginRoot, withWorkerAuth, type PluginRootResolution } from '../../shared/worker-utils.js';
 import {
   AUTO_UPDATE_OFF_DECISIONS,
   AutoUpdateCheckError,
@@ -37,6 +41,7 @@ import {
 } from '../../services/auto-update/auto-update-state.js';
 import { productionAutoUpdateSwitchReaders } from '../../services/auto-update/auto-update-switch-readers.js';
 import { InvalidWorkerUrlError } from '../../shared/worker-url.js';
+import { DEPENDENCY_STATUS_LABELS, dependencyStatusLabels } from '../../shared/dependency-health.js';
 import { getBunVersion, getUvVersion, isInstallCurrent } from '../install/setup-runtime.js';
 import { findCodexExecutablePath, isCodexOnPath } from '../install/tool-path.js';
 import { getCredential } from '../../shared/EnvManager.js';
@@ -60,10 +65,17 @@ import {
 import {
   currentLauncherHostEnvironment,
   findExecutableOnPath,
+  launcherFileEmbedsBundle,
   probeLauncherVersion,
   resolveLauncherBinaryPath,
+  verifyLauncherSignature,
+  type LauncherCodesignRunner,
   type LauncherHostEnvironment,
 } from '../../launcher/install-launcher.js';
+import {
+  bunVersionHonoursMacosSignatureFix,
+  MINIMUM_BUN_VERSION_FOR_SIGNED_LAUNCHER_ON_DARWIN,
+} from '../../launcher/bun-be-bun-support.js';
 import { LAUNCHER_PROTOCOL } from '../../launcher/launcher-protocol.js';
 
 type CheckStatus = 'ok' | 'warn' | 'fail';
@@ -117,6 +129,23 @@ function probeVersion(bin: 'bun' | 'uv'): string | null {
   }
 }
 
+export function bunRuntimeCheck(bunVersion: string | null, platform: NodeJS.Platform = process.platform): CheckResult {
+  const name = 'Bun runtime';
+  if (!bunVersion) {
+    return { name, status: 'fail', detail: 'not found on PATH — install: https://bun.sh', required: true };
+  }
+  const version = bunVersion.replace(/^v/, '');
+  if (platform === 'darwin' && !bunVersionHonoursMacosSignatureFix(version)) {
+    return {
+      name,
+      status: 'warn',
+      detail: `v${version}. Rebuilding the launcher for macOS 27 requires Bun ${MINIMUM_BUN_VERSION_FOR_SIGNED_LAUNCHER_ON_DARWIN} or newer. Run \`bun upgrade\`.`,
+      required: true,
+    };
+  }
+  return { name, status: 'ok', detail: `v${version}`, required: true };
+}
+
 async function probeWorkerHealth(workerUrl: string): Promise<{
   status: CheckStatus;
   detail: string;
@@ -166,9 +195,9 @@ function describeChromaExit(lastExit: NonNullable<ChromaCrashState['lastExit']>)
  */
 export async function probeChromaDiagnostics(workerUrl: string): Promise<CheckResult[]> {
   try {
-    const response = await fetch(`${workerUrl}/api/admin/doctor`, {
+    const response = await fetch(`${workerUrl}/api/admin/doctor`, withWorkerAuth({
       signal: AbortSignal.timeout(3000),
-    });
+    }, { readOnly: true }));
     if (!response.ok) {
       return [];
     }
@@ -240,9 +269,9 @@ export async function probeWorkerDependencies(
   codexPath?: string | null,
 ): Promise<CheckResult[]> {
   try {
-    const response = await fetch(`${workerUrl}/api/admin/doctor`, {
+    const response = await fetch(`${workerUrl}/api/admin/doctor`, withWorkerAuth({
       signal: AbortSignal.timeout(3000),
-    });
+    }, { readOnly: true }));
     if (!response.ok) {
       return [];
     }
@@ -266,67 +295,24 @@ export function workerDependencyChecks(
   codexOnPath: boolean = false,
   codexPath?: string | null,
 ): CheckResult[] {
-  const checks: CheckResult[] = [];
-  for (const status of statuses) {
-    if (status.dependency === 'claude_cli' && status.kind === 'setup_required') {
-      let codexHint = '';
-      if (codexDetected) {
-        codexHint = codexOnPath || !codexPath
-          ? ' (Codex CLI is installed; you can switch by setting CLAUDE_MEM_PROVIDER to codex in ~/.claude-mem/settings.json)'
-          : ` (Codex CLI is installed at ${codexPath}; you can switch by setting CLAUDE_MEM_PROVIDER to codex and CLAUDE_MEM_CODEX_PATH to "${codexPath}" in ~/.claude-mem/settings.json)`;
-      }
-      const detail = status.remediation
-        ? `${status.message}${codexHint} — ${status.remediation}`
-        : `${status.message}${codexHint}`;
-      checks.push({
-        name: 'Claude CLI setup',
-        status: 'warn',
-        detail,
-        required: false,
-      });
-    } else if (status.dependency === 'codex_cli' && status.kind === 'setup_required') {
-      const detail = status.remediation
-        ? `${status.message} — ${status.remediation}`
-        : status.message;
-      checks.push({
-        name: 'Codex CLI setup',
-        status: 'warn',
-        detail,
-        required: false,
-      });
-    } else if (status.dependency === 'uvx' && status.kind === 'vector_search_unavailable') {
-      const detail = status.remediation
-        ? `${status.message} — ${status.remediation}`
-        : status.message;
-      checks.push({
-        name: 'uvx (vector search)',
-        status: 'warn',
-        detail,
-        required: false,
-      });
-    } else if (status.dependency === 'chroma' && status.kind === 'vector_search_unavailable') {
-      const detail = status.remediation
-        ? `${status.message} — ${status.remediation}`
-        : status.message;
-      checks.push({
-        name: 'Chroma vector search',
-        status: 'warn',
-        detail,
-        required: false,
-      });
-    } else if (status.dependency === 'observer_dir' && status.kind === 'setup_required') {
-      const detail = status.remediation
-        ? `${status.message} — ${status.remediation}`
-        : status.message;
-      checks.push({
-        name: 'Observer data directory',
-        status: 'warn',
-        detail,
-        required: false,
-      });
+  return statuses.map((status): CheckResult => {
+    const labels = dependencyStatusLabels(status.dependency, status.kind);
+    let codexHint = '';
+    if (labels === DEPENDENCY_STATUS_LABELS.claude_cli && codexDetected) {
+      codexHint = codexOnPath || !codexPath
+        ? ' (Codex CLI is installed; you can switch by setting CLAUDE_MEM_PROVIDER to codex in ~/.claude-mem/settings.json)'
+        : ` (Codex CLI is installed at ${codexPath}; you can switch by setting CLAUDE_MEM_PROVIDER to codex and CLAUDE_MEM_CODEX_PATH to "${codexPath}" in ~/.claude-mem/settings.json)`;
     }
-  }
-  return checks;
+    const message = `${status.message}${codexHint}`;
+    return {
+      // A pair this CLI does not list comes from a newer worker: it is shown
+      // under the worker's own names, never dropped.
+      name: labels?.doctorCheckName ?? `${status.dependency} (${status.kind})`,
+      status: 'warn',
+      detail: status.remediation ? `${message} — ${status.remediation}` : message,
+      required: false,
+    };
+  });
 }
 
 async function probeChromaCensus(): Promise<CheckResult> {
@@ -508,9 +494,18 @@ function realPathOrNull(path: string): string | null {
  * prints, and one timed `--version` round trip. Hooks call `claude-mem` in exec
  * form, so a missing launcher surfaces in Claude Code as
  * `Executable not found in $PATH: "claude-mem"` on every hook. Required: a
- * missing launcher, or a `claude-mem` on PATH that is not the launcher, fails
- * doctor. An older protocol only warns, because the SessionStart self-heal
- * (ensure-launcher.cjs) replaces it on the next startup. Exported for tests.
+ * missing launcher, a launcher macOS killed for its signature, or a
+ * `claude-mem` on PATH that is not the launcher fails doctor. An older protocol
+ * only warns, because the SessionStart self-heal (ensure-launcher.cjs) replaces
+ * it on the next startup.
+ *
+ * On macOS the launcher also gets `codesign --verify --strict` (#5247). A
+ * launcher that still answers but fails it only warns: it works on this OS, and
+ * macOS 27 is the one that kills it. When `codesign` cannot run, nothing is
+ * proven either way, so that warns too. With a Bun older than
+ * MINIMUM_BUN_VERSION_FOR_SIGNED_LAUNCHER_ON_DARWIN (`bunVersion`), a rebuild
+ * gets the same rejected signature, so the hint names `bun upgrade` first.
+ * Exported for tests.
  *
  * `npx claude-mem doctor` runs with npx's own `node_modules/.bin` first on PATH, where `claude-mem` is this CLI.
  * Hooks run outside npx, so when this CLI (`runningCliPath`) is npx's copy, PATH directories that resolve to it
@@ -519,6 +514,8 @@ function realPathOrNull(path: string): string | null {
 export function hookLauncherCheck(
   host: LauncherHostEnvironment = currentLauncherHostEnvironment(),
   runningCliPath: string | undefined = process.argv[1],
+  verifySignature: LauncherCodesignRunner = verifyLauncherSignature,
+  bunVersion: string | null = null,
 ): CheckResult {
   const name = 'Hook launcher';
   const reinstallHint = 'run `npx claude-mem install`';
@@ -536,8 +533,45 @@ export function hookLauncherCheck(
     };
   }
   const probeStartedAt = performance.now();
-  const { protocol: printedProtocol, failure: probeFailure } = probeLauncherVersion(launcherOnPath);
+  const { protocol: printedProtocol, failure: probeFailure, signal } = probeLauncherVersion(launcherOnPath);
   const roundTripMilliseconds = Math.round(performance.now() - probeStartedAt);
+  // Only a file that is our launcher is verified: one that answered, or one a
+  // signal killed that embeds the launcher bundle (install-launcher.ts
+  // inspectExistingLauncherBinary uses the same rule to rebuild it).
+  const killedLauncher = printedProtocol === null && signal !== null && launcherFileEmbedsBundle(launcherOnPath);
+  const signature = host.platform === 'darwin' && (printedProtocol !== null || killedLauncher)
+    ? verifySignature(launcherOnPath)
+    : null;
+  const signatureReason = signature && signature.status !== 0
+    ? signature.stderr.trim().split('\n').pop() || (signature.status === null ? 'codesign did not run' : `exit ${signature.status}`)
+    : null;
+  const signatureRejected = signature !== null && signature.status !== null && signature.status !== 0;
+  const plainBunVersion = bunVersion?.replace(/^v/, '') ?? null;
+  const bunUpgradeFirst = plainBunVersion !== null && !bunVersionHonoursMacosSignatureFix(plainBunVersion)
+    ? `run \`bun upgrade\` first (Bun ${plainBunVersion} builds a launcher macOS 27 rejects; ${MINIMUM_BUN_VERSION_FOR_SIGNED_LAUNCHER_ON_DARWIN} or newer does not), then `
+    : '';
+  if (killedLauncher && signatureRejected) {
+    // `npx claude-mem install` rebuilds a killed launcher in place (#5253), so
+    // nothing needs moving.
+    return {
+      name,
+      status: 'fail',
+      detail: `${launcherOnPath} was killed by ${signal} before it answered --version and fails codesign --verify --strict (${signatureReason}); macOS 27 kills a launcher whose signature it rejects. ${bunUpgradeFirst}${reinstallHint}, which rebuilds it`,
+      required: true,
+    };
+  }
+  if (printedProtocol !== null && signatureRejected) {
+    // The installer keeps a launcher that answers the current protocol or a
+    // newer one, so that one has to be moved aside before it is rebuilt; an
+    // older protocol is rebuilt on its own.
+    const rebuildHint = printedProtocol >= LAUNCHER_PROTOCOL ? `move it aside, then ${reinstallHint}` : reinstallHint;
+    return {
+      name,
+      status: 'warn',
+      detail: `${launcherOnPath} runs (protocol ${printedProtocol}) but fails codesign --verify --strict (${signatureReason}); macOS 27 will kill it. ${bunUpgradeFirst}${rebuildHint}`,
+      required: true,
+    };
+  }
   if (printedProtocol === null) {
     return {
       name,
@@ -554,15 +588,66 @@ export function hookLauncherCheck(
       required: true,
     };
   }
-  return {
-    name,
-    status: 'ok',
-    detail: `${launcherOnPath} (protocol ${printedProtocol}, --version ${roundTripMilliseconds} ms)`,
-    required: true,
-  };
+  const detail = `${launcherOnPath} (protocol ${printedProtocol}, --version ${roundTripMilliseconds} ms)`;
+  if (signatureReason !== null) {
+    return { name, status: 'warn', detail: `${detail}; could not check its code signature (${signatureReason})`, required: true };
+  }
+  return { name, status: 'ok', detail, required: true };
 }
 
 /** Where the "Auto-update" row reads from: autoUpdateDoctorSources in production, fixtures in tests. */
+/**
+ * Codex runs claude-mem's hooks from the user's own hooks.json. A Codex home
+ * that has the plugin switched on but lacks those hooks captures nothing, and
+ * nothing else reports it. Null when this home does not use the Codex plugin.
+ */
+export function codexHooksCheck(options: {
+  codexHome: string;
+  hookDefinitionsPath: string;
+  launcherPath: string;
+  platform?: NodeJS.Platform;
+}): CheckResult | null {
+  const name = 'Codex hooks';
+  const configPath = join(options.codexHome, 'config.toml');
+  let pluginEnabled: boolean | undefined;
+  try {
+    pluginEnabled = readTomlBooleanInTable(readFileSync(configPath, 'utf-8'), CODEX_PLUGIN_CONFIG_TABLE, 'enabled');
+  } catch {
+    return null;
+  }
+  if (pluginEnabled !== true) return null;
+  try {
+    const hooks = registerCodexUserHooks({ ...options, dryRun: true });
+    if (hooks.changed) {
+      return {
+        name,
+        status: 'warn',
+        detail: `claude-mem's hooks are missing or out of date in ${hooks.hooksPath}, so Codex chats are not being captured — run \`npx claude-mem install\``,
+        required: false,
+      };
+    }
+    // The registered hooks match, so they name exactly this launcher. Codex has
+    // no SessionStart self-heal (ensure-launcher.cjs is Claude Code's), so a
+    // missing launcher fails every Codex hook until it is reinstalled.
+    if (!existsSync(options.launcherPath)) {
+      return {
+        name,
+        status: 'warn',
+        detail: `the hooks in ${hooks.hooksPath} run ${options.launcherPath}, which is missing, so Codex chats are not being captured — run \`npx claude-mem install\``,
+        required: false,
+      };
+    }
+    return {
+      name,
+      status: 'ok',
+      detail: `${hooks.hookCount} registered in ${hooks.hooksPath}; Codex runs them once you approve them (check with /hooks in Codex)`,
+      required: false,
+    };
+  } catch (error: unknown) {
+    return { name, status: 'warn', detail: error instanceof Error ? error.message : String(error), required: false };
+  }
+}
+
 export interface AutoUpdateDoctorSources {
   now: number;
   /**
@@ -1010,12 +1095,7 @@ export async function runDoctorCommand(): Promise<void> {
 
   // 1. Bun (required — hooks run on Bun).
   const bunVersion = probeVersion('bun');
-  checks.push({
-    name: 'Bun runtime',
-    status: bunVersion ? 'ok' : 'fail',
-    detail: bunVersion ? `v${bunVersion.replace(/^v/, '')}` : 'not found on PATH — install: https://bun.sh',
-    required: true,
-  });
+  checks.push(bunRuntimeCheck(bunVersion));
 
   // 2. uv (warn-only — only needed for vector search).
   const uvVersion = probeVersion('uv');
@@ -1038,7 +1118,17 @@ export async function runDoctorCommand(): Promise<void> {
   if (pluginRoot) checks.push(await treeSitterCliCheck(pluginRoot.root));
 
   // 3c. The on-PATH `claude-mem` hook launcher (plan-17 #3605).
-  checks.push(hookLauncherCheck());
+  checks.push(hookLauncherCheck(currentLauncherHostEnvironment(), process.argv[1], verifyLauncherSignature, bunVersion));
+
+  // 3c-2. Codex runs the same launcher from the user's own hooks.json.
+  if (pluginRoot) {
+    const codexHooks = codexHooksCheck({
+      codexHome: process.env.CODEX_HOME || join(homedir(), '.codex'),
+      hookDefinitionsPath: join(pluginRoot.root, 'hooks', 'codex-hooks.json'),
+      launcherPath: resolveLauncherBinaryPath(currentLauncherHostEnvironment()),
+    });
+    if (codexHooks) checks.push(codexHooks);
+  }
 
   // 3d. claude-mem's own updater: on or off, what it last did, and the fix
   // when an automatic update may have left the install not working.

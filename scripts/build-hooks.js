@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { deepSearchBuildPlugin } from './deep-search-build.js';
 import { build } from 'esbuild';
 import fs from 'fs';
 import path from 'path';
@@ -7,6 +8,7 @@ import vm from 'node:vm';
 import { isDeepStrictEqual } from 'node:util';
 import { fileURLToPath } from 'url';
 import { allowScriptsMap } from './postinstall-allowlist.js';
+import { refusedEventsHooked } from './code-mode-refused-events.js';
 import { OPENCODE_PLUGIN_BUILD_OPTIONS } from './opencode-plugin-build-options.js';
 import { preparePiExtensionBuild, preflightDshAttribution, DSH_PLUGIN_BUILD_OPTIONS } from './harness-plugin-build-options.js';
 
@@ -133,12 +135,14 @@ const ENSURE_LAUNCHER = {
   source: 'src/launcher/ensure-launcher.ts'
 };
 
-// Claude Code mod (a hooks module named by `modules` in plugin/hooks/hooks.json):
-// at the configured share of the context window, Claude saves its work state,
-// then /clear runs and "continue" is sent.
-const AUTO_CLEAR_MOD = {
-  source: 'src/mods/auto-clear/register.ts',
-  outfile: 'plugin/hooks/auto-clear.js'
+// claude-mem's Claude Code hooks module, named by `modules` in
+// plugin/hooks/hooks.json. Claude Code allows a plugin one such module, so it
+// registers every claude-mem mod (src/mods/): auto-clear and the session-start card.
+const HOOKS_MODULE = {
+  source: 'src/mods/hooks-module.ts',
+  outfile: 'plugin/hooks/hooks-module.js',
+  // The same file as hooks.json names it: a path relative to hooks.json.
+  hooksJsonModules: ['./hooks-module.js']
 };
 
 // A hooks module runs with no Node: no require, no node: imports, and it must
@@ -151,6 +155,13 @@ function assertModBundle(filePath) {
   const nodeImport = content.match(/\brequire\(|from\s+["']node:|from\s+["'](fs|os|path|child_process)["']/);
   if (nodeImport) {
     throw new Error(`${filePath} reaches for Node (${nodeImport[0]}). A hooks module has no Node APIs: keep src/mods/ free of Node imports.`);
+  }
+  const refused = refusedEventsHooked(content);
+  if (refused.length > 0) {
+    throw new Error(
+      `${filePath} hooks ${refused.join(', ')}. Claude Code's Code Mode refuses to start when an enabled plugin's hooks module hooks any event listed in scripts/code-mode-refused-events.js, `
+      + 'so this bundle would turn Code Mode off for all of claude-mem. Hook an event outside that list (session.append for tool results).'
+    );
   }
 }
 
@@ -522,7 +533,7 @@ async function buildHooks() {
         // Native decoder must remain external and be installed for each host.
         // https://sharp.pixelplumbing.com/install/#bundlers
         'sharp': packageJson.dependencies.sharp,
-        'zod': '^4.4.3',
+        'zod': '^4.6.6',
         // better-auth stays external in the bundles below (~3.7MB), so the
         // worker's /api/auth/* routes (Pro sign-in) resolve it from
         // plugin/node_modules at request time — the same pattern as sharp.
@@ -566,7 +577,7 @@ async function buildHooks() {
         // Its C sources are compiled and loaded whenever a Pascal file is parsed,
         // so a new version must arrive as a reviewed bump, never through a range.
         'tree-sitter-delphi': '0.1.0',
-        'shell-quote': '1.9.0',
+        'shell-quote': '1.11.0',
       },
       // The server's embedder, about 300 MB, which only server mode runs. The
       // plugin install omits optional dependencies (installPluginDependencies),
@@ -606,7 +617,10 @@ async function buildHooks() {
         // onnxruntime-common, which onnxruntime-node already installs, so it
         // downloads nothing. Remove it once transformers.js stops requiring
         // onnxruntime-web under Node.
-        'onnxruntime-web': `npm:onnxruntime-common@${onnxruntimeNode}`
+        'onnxruntime-web': `npm:onnxruntime-common@${onnxruntimeNode}`,
+        // onnxruntime-node 1.23.2 asks for adm-zip ^0.5.16, which stays on the
+        // 0.5 line and its High advisories (#6211); 0.6.1 fixes them all.
+        'adm-zip': '^0.6.1'
       },
       trustedDependencies: [
         'tree-sitter-cli'
@@ -640,6 +654,7 @@ async function buildHooks() {
     console.log(`\n🔧 Building worker service...`);
     await build({
       entryPoints: [WORKER_SERVICE.source],
+      plugins: [deepSearchBuildPlugin()],
       bundle: true,
       platform: 'node',
       target: 'node18',
@@ -779,11 +794,17 @@ async function buildHooks() {
       define: {
         '__DEFAULT_PACKAGE_VERSION__': JSON.stringify(version),
         ...DIRNAME_DEFINE,
+        // Bun 1.3.13 inlines process.env.KEY when transpiling Worker entries,
+        // then reuses those values from its content-keyed disk cache in another
+        // process. Keep the environment object dynamic so a relocated bundle
+        // never opens a previous run's database/config directory.
+        'process.env': '__CM_RUNTIME_ENV__',
         'import.meta.url': '__IMPORT_META_URL__'
       },
       banner: {
         js: [
           ...DIRNAME_BANNER,
+          'var __CM_RUNTIME_ENV__ = process.env;',
           'var __IMPORT_META_URL__ = require("node:url").pathToFileURL(__CM_FILENAME__).href;'
         ].join('\n')
       }
@@ -1132,9 +1153,9 @@ async function buildHooks() {
     const ensureLauncherStats = fs.statSync(`${hooksDir}/${ENSURE_LAUNCHER.name}.cjs`);
     console.log(`✓ ensure-launcher built (${(ensureLauncherStats.size / 1024).toFixed(2)} KB)`);
 
-    console.log(`\n🔧 Building auto-clear mod...`);
+    console.log(`\n🔧 Building the Claude Code hooks module...`);
     await build({
-      entryPoints: [AUTO_CLEAR_MOD.source],
+      entryPoints: [HOOKS_MODULE.source],
       bundle: true,
       // A Claude Code hooks module is an ES module with no Node APIs, read as
       // source (Claude Code lists its hooks and $ calls off the text), so it is
@@ -1142,17 +1163,24 @@ async function buildHooks() {
       platform: 'neutral',
       target: 'es2022',
       format: 'esm',
-      outfile: AUTO_CLEAR_MOD.outfile,
+      outfile: HOOKS_MODULE.outfile,
       minify: false,
       legalComments: 'none',
       logLevel: 'error',
       banner: {
-        js: '// Built from src/mods/auto-clear/ by scripts/build-hooks.js. Edit the source, not this file.'
+        js: '// Built from src/mods/ by scripts/build-hooks.js. Edit the source, not this file.'
       }
     });
-    assertModBundle(AUTO_CLEAR_MOD.outfile);
-    const autoClearStats = fs.statSync(AUTO_CLEAR_MOD.outfile);
-    console.log(`✓ auto-clear mod built (${(autoClearStats.size / 1024).toFixed(2)} KB)`);
+    assertModBundle(HOOKS_MODULE.outfile);
+    const claudeCodeHooksJson = JSON.parse(fs.readFileSync('plugin/hooks/hooks.json', 'utf-8'));
+    if (!isDeepStrictEqual(claudeCodeHooksJson.modules, HOOKS_MODULE.hooksJsonModules)) {
+      throw new Error(
+        `plugin/hooks/hooks.json \`modules\` must be ${JSON.stringify(HOOKS_MODULE.hooksJsonModules)} (found ${JSON.stringify(claudeCodeHooksJson.modules)}). ` +
+        'Claude Code loads one hooks module per plugin and refuses a second entry.'
+      );
+    }
+    const hooksModuleStats = fs.statSync(HOOKS_MODULE.outfile);
+    console.log(`✓ hooks module built (${(hooksModuleStats.size / 1024).toFixed(2)} KB)`);
 
     console.log(`\n🔧 Building NPX CLI...`);
     const npxCliOutDir = 'dist/npx-cli';
@@ -1235,6 +1263,24 @@ async function buildHooks() {
       console.log(`✓ openclaw plugin built (${(openclawStats.size / 1024).toFixed(2)} KB)`);
     }
 
+    // claude-mem/eve: memory provider for eve agents. eve and zod come from the
+    // consuming agent (optional peer dependencies), so they stay external.
+    console.log(`\n🔧 Building eve memory provider...`);
+    const eveOutDir = 'dist/eve';
+    fs.mkdirSync(eveOutDir, { recursive: true });
+    await build({
+      entryPoints: ['integrations/eve/provider/src/index.ts'],
+      bundle: true,
+      platform: 'node',
+      target: 'node24',
+      format: 'esm',
+      outfile: `${eveOutDir}/index.js`,
+      logLevel: 'error',
+      external: ['eve', 'eve/*', 'zod', 'node:*'],
+    });
+    fs.copyFileSync('integrations/eve/provider/types/index.d.ts', `${eveOutDir}/index.d.ts`);
+    console.log(`✓ eve memory provider built (${(fs.statSync(`${eveOutDir}/index.js`).size / 1024).toFixed(2)} KB)`);
+
     if (fs.existsSync('src/integrations/opencode-plugin/index.ts')) {
       console.log(`\n🔧 Building OpenCode plugin...`);
       const opencodeOutDir = 'dist/opencode-plugin';
@@ -1291,7 +1337,7 @@ async function buildHooks() {
       'plugin/skills/how-it-works/SKILL.md',
       'plugin/skills/how-it-works/onboarding-explainer.md',
       'plugin/hooks/hooks.json',
-      'plugin/hooks/auto-clear.js',
+      HOOKS_MODULE.outfile,
       'plugin/hooks/codex-hooks.json',
       'plugin/hooks/qoder-hooks.json',
       'plugin/hooks/qoder-repo-hooks.json',

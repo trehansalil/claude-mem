@@ -32,6 +32,7 @@ const PUBLISHING_TOOLS = [
   { match: /chatgpt_space__create_page$/, kind: 'page' },
   { match: /sites__save_version_and_deploy/, kind: 'deployment' },
 ];
+const GITHUB_PULL_REQUEST_TOOL = /(?:^|__)create_pull_request$/;
 // Work-state fields that name work product directly. `work_product` is the
 // field agents use to attach anything; *_url fields are read as links.
 const WORK_PRODUCT_FIELDS = new Set(['work_product', 'work_products', 'deliverable', 'deliverables']);
@@ -75,9 +76,23 @@ function parse(value) {
 }
 
 function urlsIn(value, found = []) {
-  if (typeof value === 'string') { const url = safeWebUrl(value); if (url) found.push(url); }
-  else if (Array.isArray(value)) for (const item of value) urlsIn(item, found);
-  else if (value && typeof value === 'object') for (const [key, item] of Object.entries(value)) if (/url$/i.test(key) || typeof item === 'object') urlsIn(item, found);
+  // Captured JSON can be much deeper than the JavaScript call stack.
+  const pending = [value];
+  const visited = new WeakSet();
+  while (pending.length) {
+    const item = pending.pop();
+    if (typeof item === 'string') {
+      const url = safeWebUrl(item);
+      if (url) found.push(url);
+    } else if (item && typeof item === 'object' && !visited.has(item)) {
+      visited.add(item);
+      const children = Array.isArray(item) ? item : Object.entries(item)
+        .filter(([key, child]) => /url$/i.test(key) || typeof child === 'object')
+        .map(([, child]) => child);
+      // Reverse insertion preserves the previous depth-first source order.
+      for (let index = children.length - 1; index >= 0; index--) pending.push(children[index]);
+    }
+  }
   return found;
 }
 
@@ -86,9 +101,26 @@ function urlsIn(value, found = []) {
 // command that only mentions it (a search, a quoted string) made nothing.
 const GIT_PREFIX = String.raw`(?:^|[;&|(\n])\s*(?:rtk\s+)?(?:\/usr\/bin\/)?git(?:\s+-[Cc]\s+(?:"[^"]*"|'[^']*'|\S+))*\s+`;
 const gitPattern = (subcommand, flags = '') => new RegExp(GIT_PREFIX + subcommand, flags);
-const GITHUB_REMOTE = /^(?:https:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)([\w.-]+)\/([\w.-]+?)(?:\.git)?\/?$/;
+// Git's successful push output removes SSH usernames (for example, `To github.com:owner/repo.git`).
+// Accept those recorded spellings as well as configured remotes and GitHub's documented SSH-over-443 endpoint.
+const GITHUB_REMOTE = /^(?:https:\/\/github\.com\/|(?:git@)?github\.com:|ssh:\/\/(?:git@)?(?:github\.com(?::22)?|ssh\.github\.com:443)\/)([\w.-]+)\/([\w.-]+?)(?:\.git)?\/?$/;
 const SHA = '[0-9a-f]{7,40}';
 const unquote = (token) => token.replace(/^(["'])(.*)\1$/, '$2');
+
+// Git abbreviations are identities only when the recorded longer hashes agree.
+// Keep ambiguous prefixes separate rather than choosing whichever commit was
+// encountered last. Building the prefix index costs at most 40 steps per hash.
+function commitShaResolver(shas) {
+  const prefixes = new Map();
+  for (const sha of shas) for (let length = 7; length <= sha.length; length++) {
+    const prefix = sha.slice(0, length), known = prefixes.get(prefix);
+    if (known === undefined || (known !== null && sha.startsWith(known))) prefixes.set(prefix, sha);
+    else if (known !== null && !known.startsWith(sha)) prefixes.set(prefix, null);
+  }
+  return sha => prefixes.has(sha) ? prefixes.get(sha) : sha;
+}
+
+const matchingCommitSha = (left, right) => left.startsWith(right) || right.startsWith(left);
 
 /** The GitHub `owner/repo` a remote URL names, or null for any other host. */
 export function githubRepo(remote) {
@@ -98,7 +130,7 @@ export function githubRepo(remote) {
 
 function gitUrl(product) {
   if (!product.repo) return undefined;
-  return product.kind === 'commit' ? `https://github.com/${product.repo}/commit/${product.sha}` : `https://github.com/${product.repo}/tree/${product.branch}`;
+  return product.kind === 'commit' ? `https://github.com/${product.repo}/commit/${product.sha}` : `https://github.com/${product.repo}/tree/${product.branch.split('/').map(encodeURIComponent).join('/')}`;
 }
 
 function outputText(call, response) {
@@ -114,17 +146,26 @@ const BASH_DOUBLE_QUOTE_ESCAPE = /\\([$`"\\])/g;
 // The subject line of the message each `git commit` in a command passes with
 // -m or a heredoc, in order; null where the message comes from elsewhere.
 function commitSubjects(command) {
-  const starts = [...command.matchAll(gitPattern(String.raw`commit\b`, 'g'))].map((match) => match.index);
+  const starts = [...command.matchAll(gitPattern(String.raw`commit\b`, 'g'))].map((match) => match.index + match[0].length);
   return starts.map((start, index) => {
     const invocation = command.slice(start, starts[index + 1]);
+    // Only options before this command's unquoted separator belong to it.
+    // Keep the remainder available for a heredoc body, but never borrow a
+    // later tag (or another command)'s message as the commit's subject.
+    // Consume redirection operators first: their & or | does not end a command.
+    const argumentEnd = invocation.match(/^(?:>[&|]|<&|&>>?|[^"'\\;&|\n]|\\[\s\S]|"(?:[^"\\]|\\[\s\S])*"|'[^']*')*/)[0].length;
+    const matchArgument = pattern => {
+      const match = invocation.match(pattern);
+      return match && match.index < argumentEnd ? match : null;
+    };
     // -m "$(cat <<'EOF'\n<subject>\n...EOF\n)": the subject is the heredoc's first
     // line, read raw — quotes inside the substitution are literal, so the outer
     // "..." match below would stop at the first one.
-    const substituted = invocation.match(/\s-[a-zA-Z]*m\s+"\$\(\s*cat\s+<<-?\s*['"]?\w+['"]?[^\n]*\n([^\n]*)/);
+    const substituted = matchArgument(/\s(?:-[a-zA-Z]*m\s+|--message(?:=|\s+))"\$\(\s*cat\s+<<-?\s*['"]?\w+['"]?[^\n]*\n([^\n]*)/);
     if (substituted) return short(substituted[1]);
-    const inline = invocation.match(/\s-[a-zA-Z]*m\s+(?:"((?:[^"\\]|\\.)*)"|'([^']*)')/);
-    const heredoc = invocation.match(/\s-F\s+-\s*<<-?\s*['"]?\w+['"]?\n([^\n]*)/);
-    const text = inline ? (inline[1] ?? inline[2]).replace(BASH_DOUBLE_QUOTE_ESCAPE, '$1') : heredoc?.[1];
+    const inline = matchArgument(/\s(?:-[a-zA-Z]*m\s+|--message(?:=|\s+))(?:"((?:[^"\\]|\\.)*)"|'([^']*)')/);
+    const heredoc = matchArgument(/\s-F\s+-\s*<<-?\s*['"]?\w+['"]?\n([^\n]*)/);
+    const text = inline ? inline[1]?.replace(BASH_DOUBLE_QUOTE_ESCAPE, '$1') ?? inline[2] : heredoc?.[1];
     return short(text?.split('\n')[0]);
   });
 }
@@ -135,9 +176,8 @@ function commitSubjects(command) {
 function commitsFrom(command, response, out) {
   const commits = new Map();
   const add = (sha, branch, subject) => {
-    const key = sha.slice(0, 7);
-    const known = commits.get(key);
-    commits.set(key, { sha: known?.sha.length > sha.length ? known.sha : sha, branch: branch ?? known?.branch ?? null, subject: subject ?? known?.subject ?? null });
+    const known = commits.get(sha);
+    commits.set(sha, { sha, branch: branch ?? known?.branch ?? null, subject: subject ?? known?.subject ?? null });
   };
   const recorded = response?.gitOperation?.commit;
   const subjects = commitSubjects(command);
@@ -158,48 +198,142 @@ function commitsFrom(command, response, out) {
       }
     }
   }
-  return [...commits.values()];
-}
-
-// The remote and branch a `git push` command names (`git push -u origin <branch>`,
-// `git push <url> HEAD:<branch>`); null for a push that deletes or sends tags.
-function pushTarget(command) {
-  const args = command.match(gitPattern(String.raw`push((?:[ \t]+(?:"[^"]*"|'[^']*'|[^\s;&|)]+))*)`))?.[1];
-  const tokens = (args ?? '').trim().split(/\s+/).filter(Boolean).map(unquote);
-  if (tokens.some((token) => ['-d', '--delete', '--tags', '--mirror', '--all'].includes(token))) return null;
-  const [remote, refspec] = tokens.filter((token) => !token.startsWith('-'));
-  const branch = refspec && !refspec.startsWith(':') ? refspec.replace(/^\+/, '').split(':').at(-1).replace(/^refs\/heads\//, '') : null;
-  return { repo: githubRepo(remote), branch: branch && branch !== 'HEAD' ? branch : null };
-}
-
-/** Branches a recorded `git push` updated, each with the GitHub repo it went to
- * (from git's `To <remote>` line or the remote URL in the command) and the
- * commit the push left it at. */
-function pushesFrom(command, response, out) {
-  const runs = gitPattern(String.raw`push\b`).test(command);
-  const recorded = typeof response?.gitOperation?.push?.branch === 'string' ? response.gitOperation.push.branch : null;
-  if (!runs && !recorded) return [];
-  const target = runs ? pushTarget(command) : null;
-  const pushes = new Map();
-  let repo = null;
-  for (const line of out.split('\n')) {
-    const remote = line.match(/^To (\S+)$/);
-    if (remote) { repo = githubRepo(remote[1]); continue; }
-    const ref = line.match(new RegExp(String.raw`^\s*[ +*=]?\s*(?:${SHA}\.\.\.?(${SHA})|\[new branch\])\s+(\S+)\s+->\s+(\S+)`));
-    if (!ref) continue;
-    const branch = ref[3].replace(/^refs\/heads\//, '');
-    pushes.set(branch, { branch, repo: repo ?? target?.repo ?? null, heads: ref[1] ? [ref[1]] : [] });
+  const resolveSha = commitShaResolver([...commits.keys()]);
+  const unique = new Map();
+  for (const commit of commits.values()) {
+    const sha = resolveSha(commit.sha) ?? commit.sha, known = unique.get(sha);
+    unique.set(sha, { ...commit, sha, branch: commit.branch ?? known?.branch ?? null, subject: commit.subject ?? known?.subject ?? null });
   }
-  // A quiet push prints no ref line: use the branch gitOperation or the command names.
-  const branch = recorded ?? target?.branch;
-  if (!pushes.size && branch && !/\[rejected\]|failed to push|^fatal:/m.test(out)) pushes.set(branch, { branch, repo: target?.repo ?? null, heads: [] });
+  return [...unique.values()];
+}
+
+// The remote and destination branches named in each `git push` command.
+function pushTargets(command) {
+  const word = String.raw`(?:[^\s"'<>;&|()]+|"[^"]*"|'[^']*')+`;
+  const redirection = String.raw`(?:\d*(?:>>?|<{1,3})&?|&>>?)`;
+  // Consume a comment to end of line, including separators or command text.
+  const pattern = gitPattern(String.raw`push\b((?:[ \t]+(?:#[^\n]*)?|${redirection}|${word})*)`, 'g');
+  const redirect = new RegExp(`^${redirection}$`);
+  return [...command.matchAll(pattern)].map(([, args]) => {
+    const shellTokens = args.match(new RegExp(`${redirection}|${word}`, 'g')) ?? [];
+    const tokens = [];
+    for (let index = 0; index < shellTokens.length; index++) {
+      // Only an unquoted # at the start of a shell word opens a comment.
+      if (shellTokens[index].startsWith('#')) break;
+      // Redirects may sit between Git arguments. Consume their file/fd target,
+      // then keep scanning so a later --dry-run or --delete is still respected.
+      if (redirect.test(shellTokens[index])) { index++; continue; }
+      tokens.push(unquote(shellTokens[index]));
+    }
+    const positional = [];
+    let dryRun = false, deleting = false, tags = false, repoOption;
+    for (let index = 0; index < tokens.length; index++) {
+      const token = tokens[index];
+      if (token === '--') { positional.push(...tokens.slice(index + 1)); break; }
+      if (token === '--repo') { repoOption = tokens[++index]; continue; }
+      if (token.startsWith('--repo=')) { repoOption = token.slice('--repo='.length); continue; }
+      // These options consume the next word; that value is neither a remote,
+      // a refspec nor a flag, even when it is literally "--dry-run".
+      if (/^--(?:push-option|receive-pack|exec|recurse-submodules)$/.test(token)) { index++; continue; }
+      if (token.startsWith('--')) {
+        if (token === '--dry-run' || token === '--no-dry-run') dryRun = token === '--dry-run';
+        if (token === '--delete' || token === '--no-delete') deleting = token === '--delete';
+        if (token === '--tags' || token === '--no-tags') tags = token === '--tags';
+        continue; // --option=value carries its value in this same word.
+      }
+      if (token.startsWith('-')) {
+        let flags = token.slice(1);
+        const valueAt = flags.indexOf('o');
+        if (valueAt !== -1) {
+          if (valueAt === flags.length - 1) index++;
+          flags = flags.slice(0, valueAt); // -qoVALUE: only q is a flag.
+        }
+        if (flags.includes('n')) dryRun = true;
+        if (flags.includes('d')) deleting = true;
+        continue;
+      }
+      positional.push(token);
+    }
+    const [remote, ...refspecs] = positional;
+    const destinations = [];
+    for (let index = 0; index < refspecs.length; index++) {
+      const spec = refspecs[index];
+      // Git's `tag <name>` shorthand expands to refs/tags/<name> on both ends.
+      if (spec === 'tag') { tags = true; index++; continue; }
+      destinations.push(spec.startsWith(':') ? '' : spec.replace(/^\+/, '').split(':').at(-1));
+    }
+    const branches = deleting ? [] : destinations.map(ref =>
+      ref && ref !== 'HEAD' && (!ref.startsWith('refs/') || ref.startsWith('refs/heads/')) ? ref.replace(/^refs\/heads\//, '') : null);
+    const deletesOrTags = deleting || tags || destinations.some(ref => ref.startsWith('refs/tags/'));
+    // Git lets a positional repository override --repo, otherwise --repo wins.
+    return { repo: githubRepo(remote ?? repoOption), branches, dryRun, deletesOrTags };
+  });
+}
+
+/** Changed remote branches, as reported by regular or --porcelain Git output. */
+function pushesFrom(command, response, out) {
+  const targets = pushTargets(command);
+  const recorded = response?.gitOperation?.push?.branch;
+  if (!targets.length && typeof recorded !== 'string') return [];
+  let target = targets.length === 1 ? targets[0] : null;
+  let index = 0;
+  let repo = target?.repo ?? null;
+  const pushes = new Map();
+  const add = (branch, head) => {
+    const key = JSON.stringify([repo, branch]);
+    pushes.set(key, { branch, repo, heads: head ? [head] : [] });
+  };
+  const lines = out.split('\n');
+  const mixedSimulation = targets.some(t => t.dryRun) && targets.some(t => !t.dryRun);
+  if (mixedSimulation) {
+    const reportsPush = text => typeof text === 'string' && /^(?:To |Everything up-to-date$)/m.test(text);
+    // Missing reports or reports split across streams cannot be paired with commands in order.
+    if (lines.filter(reportsPush).length !== targets.length || (reportsPush(response?.stdout) && reportsPush(response?.stderr))) return [];
+  }
+  for (const line of lines) {
+    if (line === 'Everything up-to-date') { index++; continue; }
+    const remote = line.match(/^To (\S+)$/);
+    if (remote) {
+      target = targets[index++] ?? (targets.length === 1 ? targets[0] : null);
+      repo = githubRepo(remote[1]) ?? target?.repo ?? null;
+      continue;
+    }
+    if (target?.dryRun) continue;
+    const porcelain = line.match(/^[ +*]\t[^:\t]*:refs\/heads\/([^\t]+)\t(.+)$/);
+    if (porcelain) {
+      add(porcelain[1], porcelain[2].match(new RegExp(String.raw`^${SHA}\.\.\.?(${SHA})`))?.[1]);
+      continue;
+    }
+    const ref = line.match(new RegExp(String.raw`^\s*[ +*]?\s*(?:${SHA}\.\.\.?(${SHA})|\[new branch\])\s+(\S+)\s+->\s+(\S+)`));
+    if (ref && !ref[3].startsWith('refs/tags/')) {
+      const branch = ref[3].replace(/^refs\/heads\//, '');
+      if (!target?.deletesOrTags || target.branches.includes(branch) || line.includes('[new branch]')) add(branch, ref[1]);
+    }
+  }
+  const branch = recorded ?? target?.branches.find(Boolean);
+  if (!pushes.size && targets.length <= 1 && !target?.dryRun && branch
+    && (!target?.deletesOrTags || target.branches.includes(branch))
+    && !/Everything up-to-date|\[up to date\]|\[new tag\]|\[deleted\]|\[rejected\]|failed to push|^fatal:/m.test(out)) add(branch);
   return [...pushes.values()];
 }
 
 /** Branches a recorded `git checkout -b` / `git switch -c` created. */
 function createdBranchesFrom(command, out) {
-  if (/^fatal:/m.test(out)) return [];
-  return [...command.matchAll(gitPattern(String.raw`(?:checkout\s+-[bB]|switch\s+-[cC])\s+("[^"]+"|'[^']+'|[^\s;&|)]+)`, 'g'))].map((match) => ({ branch: unquote(match[1]), repo: null, heads: [] }));
+  // A command can be skipped by a shell condition, refused with `error:` (dirty
+  // worktree), or succeed before a later command fails. Credit each branch only
+  // when Git confirms that particular creation/reset, regardless of later errors.
+  const requested = [...new Set([...command.matchAll(gitPattern(String.raw`(?:checkout\s+-[bB]|switch\s+-[cC])\s+("[^"]+"|'[^']+'|[^\s;&|)]+)`, 'g'))].map((match) => unquote(match[1])))];
+  const confirmed = new Set([...out.matchAll(/^(?:Switched to a new branch|Switched to and reset branch|Reset branch) '(.+)'\r?$/gm)].map((match) => match[1]));
+  if (confirmed.size > 0 || /^(?:fatal:|error:|Already on ')/m.test(out)) {
+    return requested.filter(branch => confirmed.has(branch)).map(branch => ({ branch, repo: null, heads: [] }));
+  }
+  // No English Git message at all: Git may be printing in another language (its
+  // checkout/switch messages are translated), so the confirmation above can't be
+  // read. Localized output can't be fully verified; credit a requested branch only
+  // when the output names it quoted, as Git's localized success line does. An
+  // untaken `&&` branch or an unrelated failure doesn't, and empty output credits
+  // nothing, so this is no looser than the old rule (which credited every request).
+  return requested.filter(branch => out.includes(`'${branch}'`)).map(branch => ({ branch, repo: null, heads: [] }));
 }
 
 function pullRequestFrom(command, response, out, { atEpoch, sourceRef }) {
@@ -215,18 +349,44 @@ function pullRequestFrom(command, response, out, { atEpoch, sourceRef }) {
   return [{ kind: 'pull-request', title: short(titleText) ?? `PR #${url.split('/').at(-1)}`, url, atEpoch, sourceRef }];
 }
 
+/** GitHub's create tool returns a numeric ID and browser URL only after creation;
+ * an interactive form awaiting submission is not a completed publication. */
+function pullRequestFromGitHubTool(input, response, { atEpoch, sourceRef }) {
+  const repoPart = value => typeof value === 'string' && /^[\w.-]+$/.test(value);
+  const numericId = value => (typeof value === 'string' && /^[1-9]\d*$/.test(value)) || (Number.isSafeInteger(value) && value > 0);
+  if (!repoPart(input.owner) || !repoPart(input.repo)) return [];
+  const refused = value => value?.isError === true || value?.is_error === true
+    || value?.error != null || value?.status === 'awaiting_user_submission';
+  if (refused(response) || refused(response?.structuredContent)) return [];
+  const blocks = Array.isArray(response) ? response : response?.content;
+  const candidates = [response?.structuredContent, response,
+    ...(Array.isArray(blocks) ? blocks.filter(block => block?.type === 'text' && typeof block.text === 'string').map(block => parse(block.text)) : [])];
+  for (const result of candidates) {
+    if (!result || typeof result !== 'object' || refused(result) || !numericId(result.id)) continue;
+    const url = safeWebUrl(result.html_url ?? result.url);
+    if (!url) continue;
+    const parsed = new URL(url), path = /^\/([\w.-]+)\/([\w.-]+)\/pull\/([1-9]\d*)$/.exec(parsed.pathname);
+    if (parsed.protocol !== 'https:' || parsed.hostname !== 'github.com' || parsed.port || parsed.search || parsed.hash || !path
+      || path[1].toLowerCase() !== input.owner.toLowerCase() || path[2].toLowerCase() !== input.repo.toLowerCase()
+      || (result.number !== undefined && (!numericId(result.number) || String(result.number) !== path[3]))) continue;
+    return [{ kind: 'pull-request', title: short(result.title ?? input.title) ?? `PR #${path[3]}`, url, atEpoch, sourceRef }];
+  }
+  return [];
+}
+
 /** Commits and branches one recorded Bash command made. */
 export function gitProductsFromCommand(command, response, out, { atEpoch = null, sourceRef = null } = {}) {
   const pushes = pushesFrom(command, response, out);
-  const branches = new Map([...createdBranchesFrom(command, out), ...pushes].map((branch) => [branch.branch, branch]));
+  const branches = [...createdBranchesFrom(command, out).filter(created => !pushes.some(pushed => pushed.branch === created.branch)), ...pushes];
   const products = [];
   for (const commit of commitsFrom(command, response, out)) {
-    const pushed = (commit.branch && pushes.find((push) => push.branch === commit.branch)) || pushes.find((push) => push.heads.some((head) => head.startsWith(commit.sha.slice(0, 7))))
+    const matchingPushes = pushes.filter((push) => push.heads.some((head) => matchingCommitSha(head, commit.sha)));
+    const pushed = (commit.branch && pushes.find((push) => push.branch === commit.branch)) || (matchingPushes.length === 1 ? matchingPushes[0] : null)
       // A quiet commit pushed by the same command went to the one branch it pushed.
       || (!commit.branch && pushes.length === 1 ? pushes[0] : null);
     products.push({ kind: 'commit', title: commit.subject ? `${commit.sha.slice(0, 7)} ${commit.subject}` : commit.sha.slice(0, 7), sha: commit.sha, branch: commit.branch ?? pushed?.branch ?? null, repo: pushed?.repo ?? null, atEpoch, sourceRef });
   }
-  for (const branch of branches.values()) products.push({ kind: 'branch', title: branch.branch, branch: branch.branch, repo: branch.repo, heads: branch.heads, atEpoch, sourceRef });
+  for (const branch of branches) products.push({ kind: 'branch', title: branch.branch, branch: branch.branch, repo: branch.repo, heads: branch.heads, atEpoch, sourceRef });
   return products.map((product) => ({ ...product, url: gitUrl(product) }));
 }
 
@@ -235,6 +395,7 @@ export function productsFromToolUse(call) {
   const input = parse(call.tool_input) ?? {}, response = parse(call.tool_response);
   const sourceRef = { kind: 'tool-use', id: call.id };
   const atEpoch = call.created_at_epoch ?? null;
+  if (GITHUB_PULL_REQUEST_TOOL.test(call.tool_name)) return pullRequestFromGitHubTool(input, response, { atEpoch, sourceRef });
   if (call.tool_name === 'Bash' && typeof input.command === 'string') {
     const out = outputText(call, response);
     return [...pullRequestFrom(input.command, response, out, { atEpoch, sourceRef }), ...gitProductsFromCommand(input.command, response, out, { atEpoch, sourceRef })];
@@ -255,9 +416,10 @@ export function productsFromObservation(observation) {
   if (!Array.isArray(files)) return [];
   return files.flatMap((path, index) => {
     const kind = fileKind(path);
+    if (!kind) return [];
     // A generic entry file is named by its folder (…/launch-review/index.html).
     const title = /^index\.\w+$/i.test(basename(path)) ? basename(path.slice(0, -basename(path).length - 1)) || basename(path) : basename(path);
-    return kind ? [{ kind, title, path, atEpoch: observation.created_at_epoch ?? null, sourceRef: { kind: 'observation', id: observation.id, index } }] : [];
+    return [{ kind, title, path, atEpoch: observation.created_at_epoch ?? null, sourceRef: { kind: 'observation', id: observation.id, index } }];
   });
 }
 
@@ -289,8 +451,8 @@ export function productsFromFields(fields, { atEpoch = null, sourceRef = null } 
 }
 
 // A commit is one entry per sha, a branch one per name, anything else one per link or file.
-const productKey = (product) => product.kind === 'commit' && product.sha ? `commit:${product.sha.slice(0, 7)}`
-  : product.kind === 'branch' && product.branch ? `branch:${product.branch}` : product.productId ?? product.url ?? product.path;
+const productKey = (product) => product.kind === 'commit' && product.sha ? `commit:${product.sha}`
+  : product.kind === 'branch' && product.branch ? `branch:${product.repo ?? ''}:${product.branch}` : product.productId ?? product.url ?? product.path;
 
 /** Opaque identity for a recorded local file. The path never enters the shared identity. */
 export function localProductId(ref) {
@@ -305,24 +467,44 @@ export function localProductId(ref) {
  * branch was pushed at or after it was made, the push left the branch at that
  * commit, or another commit made by the same command was. */
 export function mergeProducts(lists, limit = 60) {
-  const products = lists.flat();
+  const recorded = lists.flat();
+  const resolveSha = commitShaResolver(recorded.flatMap(product => product.kind === 'commit' && product.sha ? [product.sha] : product.heads ?? []));
+  const products = recorded.map(product => product.kind === 'commit' && product.sha ? { ...product, sha: resolveSha(product.sha) ?? product.sha } : product);
   const pushesByBranch = new Map(), repoByHead = new Map(), repoBySource = new Map();
   for (const product of products) if (product.kind === 'branch' && product.repo) {
     if (!pushesByBranch.has(product.branch)) pushesByBranch.set(product.branch, []);
     pushesByBranch.get(product.branch).push(product);
-    for (const head of product.heads ?? []) repoByHead.set(head.slice(0, 7), product.repo);
+    for (const head of product.heads ?? []) {
+      const sha = resolveSha(head);
+      if (sha === null) continue;
+      if (!repoByHead.has(sha)) repoByHead.set(sha, new Set());
+      repoByHead.get(sha).add(product.repo);
+    }
   }
   const sourceKey = (product) => product.sourceRef ? `${product.sourceRef.kind}:${product.sourceRef.id}` : null;
-  const pushedAfter = (product) => pushesByBranch.get(product.branch)?.find((push) => product.kind === 'branch' || (push.atEpoch ?? 0) >= (product.atEpoch ?? 0))?.repo;
-  const repoOf = (product) => product.repo ?? pushedAfter(product) ?? (product.sha ? repoByHead.get(product.sha.slice(0, 7)) : undefined) ?? null;
-  for (const product of products) if (product.kind === 'commit' && repoOf(product) && sourceKey(product)) repoBySource.set(sourceKey(product), repoOf(product));
+  const pushedAfter = (product) => {
+    const repos = new Set((pushesByBranch.get(product.branch) ?? [])
+      .filter(push => product.kind === 'branch' || (push.atEpoch ?? 0) >= (product.atEpoch ?? 0)).map(push => push.repo));
+    return repos.size === 1 ? [...repos][0] : null;
+  };
+  const repoOf = (product) => {
+    const repos = product.sha ? repoByHead.get(product.sha) : null;
+    return product.repo ?? pushedAfter(product) ?? (repos?.size === 1 ? [...repos][0] : null);
+  };
+  for (const product of products) if (product.kind === 'commit') {
+    const source = sourceKey(product), repo = repoOf(product);
+    if (!source || !repo) continue;
+    if (!repoBySource.has(source)) repoBySource.set(source, new Set());
+    repoBySource.get(source).add(repo);
+  }
   const unique = new Map();
   for (const product of products.sort((a, b) => (b.atEpoch ?? 0) - (a.atEpoch ?? 0))) {
-    const key = productKey(product);
-    if (unique.has(key)) continue;
     const isGit = product.kind === 'commit' || product.kind === 'branch';
-    const repo = isGit && !product.repo ? repoOf(product) ?? (product.kind === 'commit' ? repoBySource.get(sourceKey(product)) : null) : null;
-    unique.set(key, repo ? { ...product, repo, url: gitUrl({ ...product, repo }) } : product);
+    const sourceRepos = repoBySource.get(sourceKey(product));
+    const repo = isGit && !product.repo ? repoOf(product) ?? (product.kind === 'commit' && sourceRepos?.size === 1 ? [...sourceRepos][0] : null) : null;
+    const resolved = repo || (isGit && product.repo) ? { ...product, ...(repo ? { repo } : {}), url: gitUrl({ ...product, repo: repo ?? product.repo }) } : product;
+    const key = productKey(resolved);
+    if (!unique.has(key)) unique.set(key, resolved);
   }
   return [...unique.values()].slice(0, limit);
 }
@@ -383,6 +565,7 @@ export function fileUrl(product) {
 const FILE_EXTENSION_PATTERN = Object.keys(FILE_KINDS).map((extension) => `files_modified LIKE '%${extension}"%'`).join(' OR ');
 const PUBLISHING_PRODUCT_PREDICATE = `(tool_name IN ('Artifact', 'mcp__claude_ai_Notion__notion-create-pages', 'mcp__claude_ai_Claude_Docs__batch', 'mcp__claude_ai_Claude_Docs__create')
   OR tool_name LIKE '%chatgpt_space__create_page' OR tool_name LIKE '%sites__save_version_and_deploy%'
+  OR tool_name = 'create_pull_request' OR tool_name GLOB '*__create_pull_request'
   OR (tool_name = 'Bash' AND tool_input LIKE '%gh pr create%'))`;
 const GIT_PRODUCT_PREDICATE = `tool_name = 'Bash' AND tool_input LIKE '%git%' AND tool_input NOT LIKE '%gh pr create%'
   AND (tool_input LIKE '%commit%' OR tool_input LIKE '%push%' OR tool_input LIKE '%checkout -b%' OR tool_input LIKE '%switch -c%')`;

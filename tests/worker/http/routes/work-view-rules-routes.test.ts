@@ -8,6 +8,7 @@ import type { Server } from 'node:http';
 import { myRulesImportLine, WorkViewRoutes } from '../../../../src/services/worker/http/routes/WorkViewRoutes.js';
 import { ruleIdForPreference } from '../../../../src/services/work-view/my-rules.mjs';
 import { emitContextInvalidation } from '../../../../src/shared/context-invalidation.js';
+import { claudeCodeImportLine, rulesAndToolsLoadedByClaudeCode } from '../../../../src/shared/claude-code-rules-import.js';
 
 let directory: string;
 let source: Database;
@@ -22,7 +23,7 @@ const PREFERENCE = 'Never open draft pull requests.';
 const SUGGESTED_ID = ruleIdForPreference(PREFERENCE);
 
 beforeEach(async () => {
-  directory = mkdtempSync(join(tmpdir(), 'work-view-rules-test-'));
+  directory = mkdtempSync(join(tmpdir(), 'work view rules test-'));
   const databasePath = join(directory, 'source.db');
   source = new Database(databasePath);
   source.exec('PRAGMA journal_mode=WAL');
@@ -161,6 +162,50 @@ describe('My Rules routes', () => {
     expect(ruleById(await snapshot(), SUGGESTED_ID)).toMatchObject({ status: 'suggested', setBy: 'learned', then: PREFERENCE });
   });
 
+  it('reports evidence omitted on save and clears the count when restoring the suggestion', async () => {
+    writeFileSync(join(directory, 'work-view', 'story.json'), JSON.stringify({
+      preferences: [{ preference: PREFERENCE, kind: 'correction', quotes: [1, 2, 3].map(index => ({
+        quote: String(index).repeat(200), at: '2026-10-18T10:00:00Z',
+      })) }],
+    }));
+    const approved = await saveRule({ action: 'approve', ruleId: SUGGESTED_ID, rule: {
+      scopeTier: 'everywhere', scopeName: 'Everywhere', when: 'x'.repeat(100), then: '"'.repeat(600),
+    } });
+    expect(approved.status).toBe(200);
+    expect(ruleById(await approved.json(), SUGGESTED_ID)).toMatchObject({ quotesOmitted: 2, quotesTotal: 3 });
+    const row = source.prepare("SELECT fields FROM work_state_entries ORDER BY id DESC LIMIT 1").get() as { fields: string };
+    expect(row.fields.length).toBeLessThanOrEqual(2000);
+    expect(JSON.parse(row.fields).quotes_total).toBe(3);
+    await saveRule({ action: 'restore-suggestion', ruleId: SUGGESTED_ID });
+    const restored = ruleById(await snapshot(), SUGGESTED_ID);
+    expect(restored).toMatchObject({ status: 'suggested', quotesOmitted: 0 });
+    expect(restored.quotes).toHaveLength(3);
+  });
+
+  it('recovers partially omitted local evidence when editing the rule to fit', async () => {
+    const quotes = [1, 2, 3].map(index => ({ quote: String(index).repeat(200), at: '2026-10-18T10:00:00Z' }));
+    writeFileSync(join(directory, 'work-view', 'story.json'), JSON.stringify({
+      preferences: [{ preference: PREFERENCE, kind: 'correction', quotes }],
+    }));
+    const approved = await saveRule({ action: 'approve', ruleId: SUGGESTED_ID, rule: {
+      scopeTier: 'everywhere', scopeName: 'Everywhere', when: 'x'.repeat(100), then: '"'.repeat(600),
+    } });
+    expect(approved.status).toBe(200);
+    const saved = ruleById(await approved.json(), SUGGESTED_ID);
+    expect(saved).toMatchObject({ quotesOmitted: 2, quotesTotal: 3 });
+    expect(saved.quotes.map(({ quote }: { quote: string }) => quote)).toEqual(quotes.map(({ quote }) => quote));
+    const edited = await saveRule({ action: 'edit', ruleId: SUGGESTED_ID, rule: {
+      scopeTier: 'everywhere', scopeName: 'Everywhere', when: '', then: 'Keep the supporting evidence.',
+    } });
+    expect(edited.status).toBe(200);
+    expect(ruleById(await edited.json(), SUGGESTED_ID)).toMatchObject({ quotesOmitted: 0, quotesTotal: 3 });
+    const row = source.prepare("SELECT fields FROM work_state_entries ORDER BY id DESC LIMIT 1").get() as { fields: string };
+    const fields = JSON.parse(row.fields);
+    expect(fields.quotes.split('\n')).toHaveLength(3);
+    expect(fields.quotes_total).toBeUndefined();
+    expect(ruleById(await snapshot(), SUGGESTED_ID).quotes).toHaveLength(3);
+  });
+
   it('adds the MY-RULES.md import to the user-level CLAUDE.md once', async () => {
     const load = () => fetch(`${origin}/api/work-view/rules/load-in-claude-code`, { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: origin }, body: '{}' });
     expect((await fetch(`${origin}/api/work-view/rules/load-in-claude-code`, { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: 'https://evil.example' }, body: '{}' })).status).toBe(403);
@@ -168,8 +213,60 @@ describe('My Rules routes', () => {
     await load();
     const instructions = readFileSync(claudeInstructionsPath, 'utf8');
     // The import names the file this worker writes (here a custom folder), not a fixed ~/.claude-mem path.
-    expect(myRulesImportLine(rulesFilePath)).toBe(`@${rulesFilePath}`);
+    expect(myRulesImportLine(rulesFilePath)).toBe(`@${rulesFilePath.replaceAll(' ', '\\ ')}`);
     expect(instructions.split(myRulesImportLine(rulesFilePath)).length - 1).toBe(1);
+    expect(existsSync(rulesFilePath)).toBe(true);
+  });
+
+  it('MY-RULES.md imports RULES-AND-TOOLS.md, so one CLAUDE.md line loads the rules and the tools', async () => {
+    const response = await fetch(`${origin}/api/work-view/rules/load-in-claude-code`, { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: origin }, body: '{}' });
+    expect(response.status).toBe(200);
+    const rulesAndToolsPath = join(directory, 'RULES-AND-TOOLS.md');
+    expect(readFileSync(rulesFilePath, 'utf8')).toEndWith(`\n\n${claudeCodeImportLine(rulesAndToolsPath)}\n`);
+    // The import never dangles: Claude Code skips a missing file without a word.
+    expect(readFileSync(rulesAndToolsPath, 'utf8')).toStartWith('# Claude-Mem Rules + Tools\n');
+    expect(rulesAndToolsLoadedByClaudeCode({ claudeInstructionsPath, myRulesPath: rulesFilePath, rulesAndToolsPath })).toBe(true);
+  });
+
+  it('brings an older MY-RULES.md up to date at startup, and creates none where there was none', async () => {
+    await saveRule({ action: 'approve', ruleId: SUGGESTED_ID });
+    writeFileSync(rulesFilePath, '# My Rules\n\n- written by an older version\n');
+    const restarted = new WorkViewRoutes({
+      databasePath: join(directory, 'source.db'), reviewPath: join(directory, 'review-restart.db'), pollIntervalMs: 20, humanCopy: null,
+      ledgerDir: join(directory, 'work-view'), homeProject: 'home', rulesFilePath, claudeInstructionsPath,
+    });
+    const elsewhere = join(directory, 'never-loaded', 'MY-RULES.md');
+    const untouched = new WorkViewRoutes({
+      databasePath: join(directory, 'source.db'), reviewPath: join(directory, 'review-untouched.db'), pollIntervalMs: 20, humanCopy: null,
+      ledgerDir: join(directory, 'work-view'), homeProject: 'home', rulesFilePath: elsewhere, claudeInstructionsPath,
+    });
+    try {
+      const importLine = claudeCodeImportLine(join(directory, 'RULES-AND-TOOLS.md'));
+      const deadline = Date.now() + 2000;
+      while (!readFileSync(rulesFilePath, 'utf8').includes(importLine) && Date.now() < deadline) await Bun.sleep(5);
+      expect(readFileSync(rulesFilePath, 'utf8')).toContain(`- ${PREFERENCE}`);
+      expect(readFileSync(rulesFilePath, 'utf8')).toContain(importLine);
+      expect(existsSync(elsewhere)).toBe(false);
+    } finally {
+      restarted.close();
+      untouched.close();
+    }
+  });
+
+  it('repairs an unescaped rules import through a directory containing spaces', async () => {
+    mkdirSync(join(directory, 'claude'), { recursive: true });
+    const oldInstructions = `# My instructions\n@${rulesFilePath}\n`;
+    writeFileSync(claudeInstructionsPath, oldInstructions);
+    // Claude Code ends an unescaped import at its first space, so this is not loaded.
+    expect((await snapshot()).rulesFile.loadedInClaudeCode).toBe(false);
+    const load = () => fetch(`${origin}/api/work-view/rules/load-in-claude-code`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Origin: origin }, body: '{}',
+    });
+    expect((await (await load()).json()).rulesFile.loadedInClaudeCode).toBe(true);
+    await load();
+    const instructions = readFileSync(claudeInstructionsPath, 'utf8');
+    const escaped = `@${rulesFilePath.replaceAll(' ', '\\ ')}`;
+    expect(instructions).toBe(`${oldInstructions}${escaped}\n`);
     expect(existsSync(rulesFilePath)).toBe(true);
   });
 
@@ -187,7 +284,8 @@ describe('My Rules routes', () => {
     const fields = JSON.parse((source.prepare("SELECT fields FROM work_state_entries WHERE list_name = 'my-rules' ORDER BY id DESC LIMIT 1").get() as { fields: string }).fields);
     source.prepare('INSERT INTO work_state_entries VALUES (?, ?, ?, ?, ?)').run(nextId++, 'home', 'my-rules', JSON.stringify({ ...fields, status: 'off' }), Date.now() + 1000);
     emitContextInvalidation('all', 'SyncApply.applyOps');
-    await new Promise(resolve => setTimeout(resolve, 50));
+    const deadline = Date.now() + 2000;
+    while (readFileSync(rulesFilePath, 'utf8').includes(PREFERENCE) && Date.now() < deadline) await Bun.sleep(5);
     expect(readFileSync(rulesFilePath, 'utf8')).not.toContain(PREFERENCE);
   });
 

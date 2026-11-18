@@ -36,6 +36,8 @@ import { SyncConflictRecovery, initializeConflictRecoverySchema } from '../src/s
 
 
 const SYNC_API_DIR = resolve(import.meta.dir, '../services/sync-api');
+/** The hosted My Work page's event stream is open: its Live chip says so (components/bits.tsx LiveIndicator). */
+const HOSTED_FEED_IS_LIVE = `document.querySelector('[data-live-chip]')?.dataset.connectionState === 'live'`;
 const SYNC_API_ENTRY = resolve(SYNC_API_DIR, 'src/index.ts');
 const USER_ID = `matrix-user-${crypto.randomUUID()}`;
 const TOKEN = `matrix-token-${crypto.randomUUID()}`;
@@ -592,6 +594,26 @@ async function runViewerMatrix(a: Device, b: Device, c: Device, viewers: MatrixV
   const find = (snapshot: any) => snapshot.humanRequests.find((request: any) => request.groupId === groupId);
   await waitForAsync(async () => !!find(await local.snapshot()) && !!find(await hosted.snapshot()), 'grouped request on both viewers').catch(async error => {
     for (const viewer of [local, hosted]) { const snap = await viewer.snapshot(); console.error('GROUP_DEBUG', JSON.stringify({expected:groupId,source:snap.source,shared:snap.sharedState,requests:snap.humanRequests.map((r:any)=>({id:r.id,groupId:r.groupId,title:r.title,keys:r.conversationKeys})),localShared:viewer.shared.status()})); } throw error; });
+  // A request appearing on two viewers does not mean the origin's provenance has been published or pulled
+  // everywhere, and the middle viewer was never waited on. Repeat the same publish/pull pass until the three
+  // replicas agree. Never loosen the check below: a replica whose descriptor stays incomplete must still fail.
+  const converged = async () => {
+    const [x, y, z] = [find(await local.snapshot()), find(await middle.snapshot()), find(await hosted.snapshot())];
+    if (x && y && z && x.contentFingerprint === y.contentFingerprint && x.contentFingerprint === z.contentFingerprint
+      && x.sharedReviewDescriptor?.fingerprint === z.sharedReviewDescriptor?.fingerprint) return true;
+    await local.shared.reconcile();
+    await drainDevice(a); await drainDevice(b); await drainDevice(c);
+    await Promise.all([pullToHead(a), pullToHead(b), pullToHead(c)]);
+    await hosted.shared.reconcile();
+    return false;
+  };
+  await waitForAsync(converged, 'review fingerprints to converge across replicas').catch(async error => {
+    const views = await Promise.all([local, middle, hosted].map(async viewer => find(await viewer.snapshot())));
+    console.error('FINGERPRINT_DEBUG', JSON.stringify(views.map(v => v && ({ content: v.contentFingerprint,
+      complete: v.sharedReviewDescriptor?.complete, missing: v.sharedReviewDescriptor?.missingEvidence }))),
+      JSON.stringify(local.shared.status()));
+    throw error;
+  });
   const av = find(await local.snapshot()), bv = find(await middle.snapshot()), cv = find(await hosted.snapshot());
   check(av.progress.percent === 60 && cv.progress.percent === 60 && cv.conversationKeys.length === 2,
     'shared group membership and 60 percent progress converge');
@@ -670,11 +692,13 @@ async function runViewerMatrix(a: Device, b: Device, c: Device, viewers: MatrixV
     console.log(`  POLLING_VISIBILITY ${JSON.stringify({ cadenceMs: 30_000, acceptedToVisibleMs: Math.round(visibleAfterMs), forcedPull: false, manualNotification: false })}`);
     for (const page of [pages.local, pages.hosted, pages.classic]) await page.evaluate('window.matrixNavigationSentinel = Math.random()');
     const sentinel = await pages.hosted.evaluate('window.matrixNavigationSentinel');
-    await browserWait(pages.hosted, `document.querySelector('[data-sync-state]')?.parentElement?.dataset.connectionState === 'live'`, 'hosted SSE live');
+    // My Work's Live chip carries the feed's own state (components/bits.tsx LiveIndicator, data-connection-state); the
+    // status line beside it carries the cloud copy's (data-sync-state). Read the chip itself, not a neighbour's parent.
+    await browserWait(pages.hosted, HOSTED_FEED_IS_LIVE, 'hosted SSE live');
     c.gate.pullsOnline = false;
     await c.client.pullOnce({ force: true }); await hosted.notify();
     await browserWait(pages.hosted, `document.querySelector('[data-sync-state="offline"]') !== null`, 'offline cloud status');
-    check(await pages.hosted.evaluate(`document.querySelector('[data-sync-state]')?.parentElement?.dataset.connectionState === 'live'`),
+    check(await pages.hosted.evaluate(HOSTED_FEED_IS_LIVE),
       'browser distinguishes an open SSE stream from an offline cloud pull');
     local.shared.saveFile(`progress/${groupId}.json`, progressEntry(80, 'Recovered progress after offline pull.'));
     const second = a.store.storeObservation(sessions[0].memory, 'matrix-view', observation('MATRIX_FEED_RECOVERED', 'Arrived without reload'), 2, 0);

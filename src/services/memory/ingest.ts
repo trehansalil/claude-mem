@@ -29,23 +29,27 @@ import {
   lstatSync,
   openSync,
   readFileSync,
-  readSync,
   readdirSync,
   realpathSync,
   statSync,
 } from 'fs';
+import { open, type FileHandle } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative } from 'path';
+import { StringDecoder } from 'node:string_decoder';
+import { unified } from 'unified';
+import remarkParse from 'remark-parse';
 import { CLAUDE_CONFIG_DIR } from '../../shared/paths.js';
 import { expandHome } from '../../shared/expand-home.js';
 import { cwdToDashed } from '../context/ObservationCompiler.js';
 import { getProjectContext } from '../../utils/project-name.js';
+import { retainTextHeadTail } from '../../shared/text-truncation.js';
 
 const MD_EXT = '.md';
 const JSONL_EXT = '.jsonl';
 /** The link-only index Claude Code maintains; carries no knowledge of its own. */
 const INDEX_FILE = 'MEMORY.md';
 const MEMORY_SUBDIR = 'memory';
-/** Bytes of a sibling transcript to sniff for the project's real cwd. */
+/** Read chunk size for finding the project's real cwd in a sibling transcript. */
 const CWD_SNIFF_BYTES = 16_384;
 /**
  * Claude Code's memory notes are short distilled prose. Anything larger is not
@@ -132,7 +136,7 @@ function resolveSourceWithinRoot(source: string, root: string): { resolved: stri
 export interface MemoryFrontmatter {
   name?: string;
   description?: string;
-  /** metadata.type — e.g. project | feedback | reference | user. */
+  /** metadata.type, or top-level type before native stamping — project | feedback | reference | user. */
   type?: string;
   /** metadata.originSessionId — the session that produced this memory. */
   originSessionId?: string;
@@ -140,20 +144,39 @@ export interface MemoryFrontmatter {
   nodeType?: string;
 }
 
+const YAML_ESCAPES: Readonly<Record<string, string>> = {
+  '0': '\0', a: '\x07', b: '\b', t: '\t', '\t': '\t', n: '\n',
+  v: '\v', f: '\f', r: '\r', e: '\x1b', ' ': ' ', '"': '"',
+  '/': '/', '\\': '\\', N: '\u0085', _: '\u00a0', L: '\u2028', P: '\u2029',
+};
+
+/** Decode the single-line scalar styles used by these known frontmatter keys. */
 function unquote(value: string): string {
   const v = value.trim();
-  if (v.length >= 2 && ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'")))) {
-    return v.slice(1, -1);
-  }
-  return v;
+  if (v.length < 2) return v;
+  if (v.startsWith("'") && v.endsWith("'")) return v.slice(1, -1).replace(/''/g, "'");
+  if (!v.startsWith('"') || !v.endsWith('"')) return v;
+
+  // One pass: a decoded backslash must not start a second escape. Unknown or
+  // malformed escapes stay literal so a bad metadata value cannot drop a note.
+  return v.slice(1, -1).replace(/\\(x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|.)/g, (match, escape: string) => {
+    if (escape.length === 1) return YAML_ESCAPES[escape] ?? match;
+    const codePoint = Number.parseInt(escape.slice(1), 16);
+    return codePoint <= 0x10ffff && !(codePoint >= 0xd800 && codePoint <= 0xdfff)
+      ? String.fromCodePoint(codePoint)
+      : match;
+  });
 }
 
 /**
  * Split leading `--- ... ---` frontmatter from the body. Returns parsed (known)
  * keys and the remaining markdown body. Files without frontmatter return `{}`
- * and the original text as body.
+ * and the original text as body, apart from a leading UTF-8 byte-order mark.
  */
 export function parseMemoryFrontmatter(raw: string): { frontmatter: MemoryFrontmatter; body: string } {
+  // A UTF-8 signature is encoding metadata, not part of the first Markdown
+  // line. Remove it before recognizing frontmatter or deriving a heading.
+  raw = raw.replace(/^\uFEFF/, '');
   const lines = raw.split('\n');
   // The opener must be a complete `---` line at column 0 (a trailing \r is
   // tolerated for CRLF files): a `----` horizontal rule or an indented `---`
@@ -164,51 +187,69 @@ export function parseMemoryFrontmatter(raw: string): { frontmatter: MemoryFrontm
   // First line is the opening '---'; find the closing one.
   let close = -1;
   for (let i = 1; i < lines.length; i++) {
-    if (lines[i].trim() === '---') { close = i; break; }
+    if (/^---\r?$/.test(lines[i])) { close = i; break; }
   }
   if (close === -1) return { frontmatter: {}, body: raw };
 
   const fm: MemoryFrontmatter = {};
+  let topLevelType: string | undefined;
   let inMetadata = false;
+  let metadataIndent: number | undefined;
   for (let i = 1; i < close; i++) {
     const line = lines[i];
-    if (!line.trim()) continue;
-    const indented = /^\s+/.test(line);
+    const trimmed = line.trimStart();
+    // YAML comments do not end a mapping or establish its child indentation.
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const indent = line.length - trimmed.length;
     const colon = line.indexOf(':');
     if (colon === -1) continue;
     const key = line.slice(0, colon).trim();
     const value = line.slice(colon + 1).trim();
 
-    if (!indented) {
+    if (indent === 0) {
       inMetadata = key === 'metadata';
+      metadataIndent = undefined;
       if (key === 'name') fm.name = unquote(value);
       else if (key === 'description') fm.description = unquote(value);
+      else if (key === 'type') topLevelType = unquote(value);
       continue;
     }
-    // Indented: a child of `metadata:`.
+    // Only direct children belong to this note's metadata. Unknown fields may
+    // contain nested objects or literal examples with the same key names.
     if (inMetadata) {
+      metadataIndent ??= indent;
+      if (indent !== metadataIndent) continue;
       if (key === 'type') fm.type = unquote(value);
       else if (key === 'originSessionId') fm.originSessionId = unquote(value);
       else if (key === 'node_type') fm.nodeType = unquote(value);
     }
   }
 
+  // Notes written outside Claude Code's Write/Edit stamper keep their type at the root.
+  // Preserve the existing stamped value when a file contains both spellings.
+  if (fm.type === undefined && topLevelType !== undefined) fm.type = topLevelType;
   const body = lines.slice(close + 1).join('\n').replace(/^\n+/, '');
   return { frontmatter: fm, body };
 }
 
+const memoryMarkdown = unified().use(remarkParse);
+
 /** Derive a human title: frontmatter name → first H1 → first H2 → filename stem. */
 export function deriveTitle(fileName: string, frontmatter: MemoryFrontmatter, body: string): string {
   if (frontmatter.name && frontmatter.name.trim()) return frontmatter.name.trim();
-  for (const line of body.split('\n')) {
+  let firstH2: string | undefined;
+  // A shell comment or Markdown example inside a code block is not a note
+  // heading. Use the existing Markdown parser for block context, but retain
+  // the source spelling instead of reformatting valid headings.
+  for (const node of memoryMarkdown.parse(body).children) {
+    if (node.type !== 'heading' || node.position?.start.offset === undefined) continue;
+    const line = body.slice(node.position.start.offset, node.position.end.offset).split('\n', 1)[0];
     const h1 = line.match(/^#\s+(.+)/);
     if (h1) return h1[1].trim();
-  }
-  for (const line of body.split('\n')) {
     const h2 = line.match(/^##\s+(.+)/);
-    if (h2) return h2[1].trim();
+    if (h2 && firstH2 === undefined) firstH2 = h2[1].trim();
   }
-  return basename(fileName, MD_EXT);
+  return firstH2 ?? basename(fileName, MD_EXT);
 }
 
 // ───────────────────────────── enumeration ──────────────────────────────
@@ -253,7 +294,7 @@ export interface ScanOptions {
 }
 
 /** Read the first JSONL line that carries a `cwd` from a sibling transcript. */
-function sniffCwd(projectDir: string): string | undefined {
+async function sniffCwd(projectDir: string): Promise<string | undefined> {
   let names: string[];
   try {
     names = readdirSync(projectDir).filter(n => n.endsWith(JSONL_EXT));
@@ -262,28 +303,42 @@ function sniffCwd(projectDir: string): string | undefined {
   }
   for (const name of names) {
     const filePath = join(projectDir, name);
-    let fd: number | undefined;
+    let file: FileHandle | undefined;
     try {
       // A symlinked transcript could point anywhere; only real files are sniffed.
       if (!lstatSync(filePath).isFile()) continue;
-      fd = openSync(filePath, OPEN_NO_FOLLOW_FLAGS);
+      file = await open(filePath, OPEN_NO_FOLLOW_FLAGS);
       const buf = Buffer.alloc(CWD_SNIFF_BYTES);
-      const read = readSync(fd, buf, 0, CWD_SNIFF_BYTES, 0);
-      const chunk = buf.toString('utf-8', 0, read);
-      for (const line of chunk.split('\n')) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-        try {
-          const cwd = (JSON.parse(trimmed) as { cwd?: unknown }).cwd;
-          if (typeof cwd === 'string' && cwd.trim()) return cwd;
-        } catch {
-          // Partial last line from the fixed-size read, or a non-JSON line.
+      const decoder = new StringDecoder('utf8');
+      let pending: string[] = [];
+      for (;;) {
+        // Yield between reads so an unresolved or unfinished transcript does
+        // not block other requests in the worker. Do not truncate a valid
+        // native record just because a pasted prompt is unusually long.
+        const { bytesRead: read } = await file.read(buf, 0, buf.length, null);
+        const chunk = read ? decoder.write(buf.subarray(0, read)) : decoder.end();
+        // A native user record can exceed one chunk. Parse complete records,
+        // stopping at the first cwd without loading the rest of the history.
+        const lines = chunk.split('\n');
+        const tail = read ? lines.pop()! : '';
+        for (const line of lines) {
+          const trimmed = (pending.join('') + line).trim();
+          pending = [];
+          if (!trimmed) continue;
+          try {
+            const cwd = (JSON.parse(trimmed) as { cwd?: unknown }).cwd;
+            if (typeof cwd === 'string' && cwd.trim()) return cwd;
+          } catch {
+            // A malformed record or an incomplete final write has no cwd.
+          }
         }
+        if (!read) break;
+        if (tail) pending.push(tail);
       }
     } catch {
       // Unreadable transcript — try the next sibling.
     } finally {
-      if (fd !== undefined) closeSync(fd);
+      await file?.close();
     }
   }
   return undefined;
@@ -306,10 +361,10 @@ function fallbackProject(cwd: string | undefined, encodedName: string): string {
   return segs.length ? segs[segs.length - 1] : encodedName;
 }
 
-function readMemoryDir(memoryDir: string): MemoryDirRef {
+async function readMemoryDir(memoryDir: string): Promise<MemoryDirRef> {
   const projectDir = dirname(memoryDir);
   const encodedName = basename(projectDir);
-  const cwd = sniffCwd(projectDir);
+  const cwd = await sniffCwd(projectDir);
   const project = fallbackProject(cwd, encodedName);
 
   const ref: MemoryDirRef = { memoryDir, encodedName, cwd, project, files: [], unreadable: [], skipped: [] };
@@ -383,7 +438,7 @@ function hasMemorySubdir(dir: string): boolean {
  * or refused (single target). Throws MemorySourceError for a source that is
  * missing, not a directory, outside the root, or unreadable.
  */
-export function scanMemorySource(source: string, options: ScanOptions = {}): MemoryDirRef[] {
+export async function scanMemorySource(source: string, options: ScanOptions = {}): Promise<MemoryDirRef[]> {
   const { resolved, rootReal } = resolveSourceWithinRoot(source, options.root ?? claudeProjectsDir());
 
   if (options.all) {
@@ -397,7 +452,7 @@ export function scanMemorySource(source: string, options: ScanOptions = {}): Mem
         continue;
       }
       try {
-        refs.push(readMemoryDir(memoryDir));
+        refs.push(await readMemoryDir(memoryDir));
       } catch (error: unknown) {
         refs.push({
           memoryDir,
@@ -422,7 +477,7 @@ export function scanMemorySource(source: string, options: ScanOptions = {}): Mem
     throw new MemorySourceError(`memory ingest reads only Claude Code's projects directory; ${memoryDir} leads outside it`);
   }
   try {
-    return [readMemoryDir(memoryDir)];
+    return [await readMemoryDir(memoryDir)];
   } catch (error: unknown) {
     throw new MemorySourceError(`memory ingest source cannot be read: ${errorMessage(error)}`);
   }
@@ -464,8 +519,8 @@ export interface MemoryDryRunReport {
  * ingest WOULD store. No DB, no Haiku — memory is stored mechanically, so the
  * file count IS the observation count (modulo content-hash dedup at store time).
  */
-export function dryRunMemorySource(source: string, options: ScanOptions = {}): MemoryDryRunReport {
-  const refs = scanMemorySource(source, options);
+export async function dryRunMemorySource(source: string, options: ScanOptions = {}): Promise<MemoryDryRunReport> {
+  const refs = await scanMemorySource(source, options);
   const dirs: MemoryDirCounts[] = refs.map(ref => ({
     encodedName: ref.encodedName,
     project: ref.project,
@@ -596,7 +651,7 @@ export function buildMemoryObservation(ref: MemoryDirRef, file: MemoryFileRef): 
   const concepts = ['memory-import', `memory-type:${memoryType}`];
   const description = file.frontmatter.description?.trim();
   const subtitle = description && description.length
-    ? description.slice(0, 300)
+    ? retainTextHeadTail(description, 300, 0).head
     : `Imported memory (${memoryType})`;
 
   const metadata: Record<string, unknown> = {
@@ -611,7 +666,7 @@ export function buildMemoryObservation(ref: MemoryDirRef, file: MemoryFileRef): 
   return {
     project: ref.project,
     type: 'discovery',
-    title: file.title.slice(0, 200),
+    title: retainTextHeadTail(file.title, 200, 0).head,
     subtitle,
     narrative: file.body,
     concepts,
@@ -633,7 +688,7 @@ export async function ingestMemorySource(
   options: MemoryIngestOptions,
   deps: MemoryIngestDeps
 ): Promise<MemoryIngestReport> {
-  const refs = scanMemorySource(source, { all: options.all, root: options.root });
+  const refs = await scanMemorySource(source, { all: options.all, root: options.root });
 
   const report: MemoryIngestReport = {
     source: expandHome(source),

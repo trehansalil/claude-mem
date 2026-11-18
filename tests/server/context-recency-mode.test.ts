@@ -218,6 +218,7 @@ describe('POST /v1/context recency mode (no query)', () => {
     ]);
     // A category with no rows does not donate its allowance to the other kind.
     const noSummary = await context({ limit: 3, summaryLimit: 3, platformSource: 'cursor' });
+    expect(noSummary.status).toBe(200);
     expect(noSummary.contents).toEqual([]);
     expect((await context({ limit: 2, summaryLimit: 0 })).contents).toHaveLength(2);
     expect((await context({ limit: 2, summaryLimit: 2 })).contents).toHaveLength(2);
@@ -280,7 +281,9 @@ describe('POST /v1/context recency mode (no query)', () => {
     // keys on the worker path. The server must not merge what the worker keeps
     // apart.
     await observation({ content: 'written from the École checkout', minutesAgo: 3, folderProject: 'École' });
-    expect((await context({ folderProjects: ['école'] })).contents).toEqual([]);
+    const differentCase = await context({ folderProjects: ['école'] });
+    expect(differentCase.status).toBe(200);
+    expect(differentCase.contents).toEqual([]);
     expect((await context({ folderProjects: ['ÉCOLE'] })).contents).toEqual(['written from the École checkout']);
   });
 
@@ -338,10 +341,10 @@ describe('POST /v1/context recency mode (no query)', () => {
   });
 
   it('defaults to 50 rows without a query and 10 with one', async () => {
-    for (let index = 0; index < 12; index++) {
+    for (let index = 0; index < 46; index++) {
       await observation({ content: `bulk note number ${index}`, minutesAgo: 60 + index });
     }
-    expect((await context({})).contents).toHaveLength(17);
+    expect((await context({})).contents).toHaveLength(50);
     expect((await context({ query: 'bulk note' })).contents).toHaveLength(10);
   });
 
@@ -359,5 +362,59 @@ describe('POST /v1/context recency mode (no query)', () => {
       body: JSON.stringify({ projectId }),
     });
     expect(response.status).toBe(400);
+  });
+
+  async function seedModeFilteredRows(): Promise<void> {
+    const rows = [
+      { content: 'allowed mode memory', kind: 'decision', concepts: ['pattern'], minutesAgo: 20 },
+      { content: 'excluded type memory', kind: 'bugfix', concepts: ['pattern'], minutesAgo: 1 },
+      { content: 'excluded concept memory', kind: 'decision', concepts: ['other'], minutesAgo: 2 },
+      { content: 'malformed concept memory', kind: 'decision', concepts: { pattern: true }, minutesAgo: 3 },
+      { content: 'retained summary', kind: 'summary', concepts: null, minutesAgo: 10 },
+    ];
+    for (const row of rows) {
+      const created = await storage.observations.create({
+        projectId, teamId, kind: row.kind, content: row.content,
+        metadata: { project: 'mode-filtered', concepts: row.concepts },
+      });
+      await client.query("UPDATE observations SET created_at = now() - ($2::int * interval '1 minute') WHERE id = $1", [created.id, row.minutesAgo]);
+    }
+  }
+
+  it('applies observation mode filters before LIMIT without filtering the summary allowance', async () => {
+    await seedModeFilteredRows();
+    const result = await context({
+      folderProjects: ['mode-filtered'], limit: 2, summaryLimit: 1,
+      observationTypes: ['decision'], observationConcepts: ['pattern'],
+    });
+    expect(result.status).toBe(200);
+    expect(result.contents).toEqual(['retained summary', 'allowed mode memory']);
+  });
+
+  it('treats an empty type or concept selection as no observations and preserves omitted-filter compatibility', async () => {
+    await seedModeFilteredRows();
+    for (const filters of [{ observationTypes: [] }, { observationConcepts: [] }]) {
+      const result = await context({ folderProjects: ['mode-filtered'], ...filters });
+      expect(result.status).toBe(200);
+      expect(result.contents).toEqual(['retained summary']);
+    }
+    expect((await context({ folderProjects: ['mode-filtered'] })).contents).toHaveLength(5);
+  });
+
+  it('applies mode filters to relevance context before the ranked result limit', async () => {
+    await seedModeFilteredRows();
+    const result = await context({
+      folderProjects: ['mode-filtered'], query: 'memory', limit: 1,
+      observationTypes: ['decision'], observationConcepts: ['pattern'],
+    });
+    expect(result.status).toBe(200);
+    expect(result.contents).toEqual(['allowed mode memory']);
+  });
+
+  it('validates mode filter arrays instead of silently ignoring malformed selections', async () => {
+    for (const filters of [
+      { observationTypes: 'decision' }, { observationTypes: [''] },
+      { observationConcepts: 'pattern' }, { observationConcepts: [1] },
+    ]) expect((await context(filters)).status).toBe(400);
   });
 });

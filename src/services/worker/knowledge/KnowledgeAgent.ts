@@ -1,7 +1,7 @@
 
 import { CorpusStore } from './CorpusStore.js';
 import { CorpusRenderer } from './CorpusRenderer.js';
-import type { CorpusFile, QueryResult } from './types.js';
+import type { CorpusFile, KnowledgeAgentCallOptions, QueryResult } from './types.js';
 import { logger } from '../../../utils/logger.js';
 import { SettingsDefaultsManager } from '../../../shared/SettingsDefaultsManager.js';
 import { USER_SETTINGS_PATH } from '../../../shared/paths.js';
@@ -69,9 +69,9 @@ function errorFromUnsuccessfulResult(
  * to error tracking. An unspawnable CLI stays a server fault: only a worker
  * restart fixes it.
  */
-function findClaudeExecutableForKnowledge(): string {
+async function findClaudeExecutableForKnowledge(): Promise<string> {
   try {
-    return findClaudeExecutable('WORKER');
+    return await findClaudeExecutable('WORKER');
   } catch (error) {
     if (isClaudeExecutableUnspawnable(error) || !(error instanceof Error)) throw error;
     throw new AppError(error.message, 424, 'CLAUDE_CLI_SETUP_REQUIRED');
@@ -79,9 +79,7 @@ function findClaudeExecutableForKnowledge(): string {
 }
 
 /** Per-call options. `abortController` is passed to the Agent SDK's `Options.abortController` (sdk.d.ts). */
-export interface KnowledgeAgentCallOptions {
-  abortController?: AbortController;
-}
+export type { KnowledgeAgentCallOptions } from './types.js';
 
 export class KnowledgeAgent {
   private renderer: CorpusRenderer;
@@ -105,7 +103,7 @@ export class KnowledgeAgent {
       'Acknowledge what you\'ve received. Summarize the key themes and topics you can answer questions about.'
     ].join('\n');
 
-    const claudePath = findClaudeExecutableForKnowledge();
+    const claudePath = await findClaudeExecutableForKnowledge();
     const isolatedEnv = sanitizeEnv(await buildIsolatedEnvWithFreshOAuth());
 
     const queryResult = query({
@@ -167,6 +165,9 @@ export class KnowledgeAgent {
 
     try {
       const result = await this.executeQuery(corpus, question, callOptions);
+      // The SDK may end quietly after cancellation, including after a success
+      // result. Check at the commit boundary before changing the saved session.
+      callOptions.abortController?.signal.throwIfAborted();
       if (result.session_id !== corpus.session_id) {
         corpus.session_id = result.session_id;
         this.corpusStore.write(corpus);
@@ -192,6 +193,7 @@ export class KnowledgeAgent {
         throw new Error(`Auto-reprime failed for corpus "${corpus.name}"`);
       }
       const result = await this.executeQuery(refreshedCorpus, question, callOptions);
+      callOptions.abortController?.signal.throwIfAborted();
       if (result.session_id !== refreshedCorpus.session_id) {
         refreshedCorpus.session_id = result.session_id;
         this.corpusStore.write(refreshedCorpus);
@@ -206,7 +208,7 @@ export class KnowledgeAgent {
   }
 
   private async executeQuery(corpus: CorpusFile, question: string, callOptions: KnowledgeAgentCallOptions): Promise<QueryResult> {
-    const claudePath = findClaudeExecutableForKnowledge();
+    const claudePath = await findClaudeExecutableForKnowledge();
     const isolatedEnv = sanitizeEnv(await buildIsolatedEnvWithFreshOAuth());
 
     const queryResult = query({
@@ -237,7 +239,9 @@ export class KnowledgeAgent {
             .filter((b: any) => b.type === 'text')
             .map((b: any) => b.text)
             .join('');
-          answer = text;
+          // The SDK emits one assistant message per completed content block.
+          // Later text extends the answer; non-text blocks do not erase it.
+          answer += text;
         }
       }
     } catch (error) {

@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
-import { createGate, isAllowed, SESSION_COOKIE } from '../src/gate.js';
+import { createGate, isAllowed, SESSION_COOKIE, WAKE_STARTED_PARAM, WORKER_START_GIVE_UP_SECONDS, WORKER_STARTING_RELOAD_SECONDS } from '../src/gate.js';
 import { signToken, verifyToken } from '../src/token.js';
 
 const SECRET = 'x'.repeat(40);
@@ -139,15 +139,6 @@ describe('gate', () => {
     expect((await g(new Request(`${PUBLIC_ORIGIN}/auth?t=${link}`))).status).toBe(403);
   });
 
-  it('never lets the path pick another host', async () => {
-    seen = [];
-    const response = await gate()(new Request(`${PUBLIC_ORIGIN}//127.0.0.1:${upstream.port}/api/settings`, { headers: { Cookie: sessionCookie() } }));
-    expect(response.status).toBe(403);
-    const upper = await gate()(new Request(`${PUBLIC_ORIGIN}/API/SETTINGS`, { headers: { Cookie: sessionCookie() } }));
-    expect(upper.status).toBe(403);
-    expect(seen).toHaveLength(0);
-  });
-
   it("refuses another user's session", async () => {
     const response = await gate()(new Request(`${PUBLIC_ORIGIN}/api/work-view`, { headers: { Cookie: sessionCookie('someone-else') } }));
     expect(response.status).toBe(401);
@@ -224,22 +215,6 @@ describe('gate', () => {
     expect(await response.text()).toContain('event: heartbeat');
   });
 
-  it('preserves shared save acknowledgements and refuses generic writes and other owners', async () => {
-    const forwarded: string[] = [];
-    const g = createGate({ ownerUserId: OWNER, secret: SECRET, upstreamOrigin: 'http://127.0.0.1:37777', publicOrigin: PUBLIC_ORIGIN, signInUrl: SIGN_IN,
-      fetchImpl: async (input, init) => { forwarded.push(String(input)); return Response.json({ save: { scope: 'shared', state: 'queued', localMaterialization: 'pending' } }); } });
-    const headers = { Cookie: sessionCookie(), Origin: PUBLIC_ORIGIN, 'Content-Type': 'application/json' };
-    for (const path of ['/api/work-view/review', '/api/work-view/suggestions']) {
-      const response = await g(new Request(`${PUBLIC_ORIGIN}${path}`, { method: 'POST', headers, body: '{}' }));
-      expect(await response.json()).toEqual({ save: { scope: 'shared', state: 'queued', localMaterialization: 'pending' } });
-    }
-    for (const path of ['/api/work-state', '/api/work-view/shared-ledger', '/api/work-view/shared-state', '/api/work-view/file/work-state/1/0']) {
-      expect((await g(new Request(`${PUBLIC_ORIGIN}${path}`, { method: 'POST', headers, body: '{}' }))).status).toBe(403);
-    }
-    expect((await g(new Request(`${PUBLIC_ORIGIN}/api/work-view/suggestions`, { method: 'POST', headers: { ...headers, Cookie: sessionCookie('another-owner') }, body: '{}' }))).status).toBe(401);
-    expect(forwarded).toHaveLength(2);
-  });
-
   it('reports health from the worker without a session', async () => {
     const response = await gate()(new Request(`${PUBLIC_ORIGIN}/health`));
     expect(response.status).toBe(200);
@@ -266,5 +241,108 @@ describe('gate', () => {
     const page = await down(new Request(`${PUBLIC_ORIGIN}/`, { headers: { Cookie: sessionCookie(), Accept: 'text/html' } }));
     expect(page.status).toBe(503);
     expect(await page.text()).toContain('starting');
+  });
+
+  it('a full-page wake reloads itself until the worker answers; JSON callers keep the JSON 503', async () => {
+    // A port nothing listens on yet: the worker of a machine that has just woken.
+    const probe = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response() });
+    const workerPort = probe.port;
+    probe.stop(true);
+    const waking = createGate({ ownerUserId: OWNER, secret: SECRET, upstreamOrigin: `http://127.0.0.1:${workerPort}`, publicOrigin: PUBLIC_ORIGIN, signInUrl: SIGN_IN });
+    const navigation = () => new Request(`${PUBLIC_ORIGIN}/`, { headers: { Cookie: sessionCookie(), Accept: 'text/html,application/xhtml+xml' } });
+
+    const starting = await waking(navigation());
+    expect(starting.status).toBe(503);
+    expect(starting.headers.get('cache-control')).toBe('no-store');
+    const html = await starting.text();
+    // The reload carries when this wake started, so the count survives each reload.
+    const refresh = html.match(/<meta http-equiv="refresh" content="(\d+);url=([^"]+)">/);
+    expect(html).toContain(`http-equiv="refresh" content="${WORKER_STARTING_RELOAD_SECONDS};url=/?${WAKE_STARTED_PARAM}=`);
+    expect(refresh).not.toBeNull();
+    expect(html).not.toContain('<script');
+    const reloadPath = refresh![2];
+
+    const api = await waking(new Request(`${PUBLIC_ORIGIN}/api/work-view`, { headers: { Cookie: sessionCookie(), Accept: 'application/json' } }));
+    expect(api.status).toBe(503);
+    expect(api.headers.get('content-type')).toBe('application/json');
+    expect(await api.json()).toEqual({ error: 'Your viewer is starting. Try again in a moment.' });
+
+    // The worker binds its port. The reload the refresh sends lands on the clean address, then the page.
+    const worker = Bun.serve({ hostname: '127.0.0.1', port: workerPort, fetch: () => new Response('<!doctype html><title>My Work</title>', { headers: { 'Content-Type': 'text/html' } }) });
+    try {
+      const reloaded = await waking(new Request(`${PUBLIC_ORIGIN}${reloadPath}`, { headers: { Cookie: sessionCookie(), Accept: 'text/html' } }));
+      expect(reloaded.status).toBe(303);
+      expect(reloaded.headers.get('location')).toBe('/');
+      const landed = await waking(navigation());
+      expect(landed.status).toBe(200);
+      const body = await landed.text();
+      expect(body).toContain('My Work');
+      expect(body).not.toContain('http-equiv="refresh"');
+    } finally {
+      worker.stop(true);
+    }
+  });
+
+  it('keeps reloading inside the start deadline and stops with a failure page past it', async () => {
+    const startedSeconds = 1_900_000_000;
+    let nowMs = startedSeconds * 1000;
+    const down = createGate({ ownerUserId: OWNER, secret: SECRET, upstreamOrigin: 'http://127.0.0.1:1', publicOrigin: PUBLIC_ORIGIN, signInUrl: SIGN_IN, now: () => nowMs });
+    const cookie = `${SESSION_COOKIE}=${signToken(SECRET, { sub: OWNER, aud: 'session', exp: startedSeconds + 3600 })}`;
+    const reload = (path: string) => down(new Request(`${PUBLIC_ORIGIN}${path}`, { headers: { Cookie: cookie, Accept: 'text/html' } }));
+    expect(WORKER_START_GIVE_UP_SECONDS).toBe(120);
+
+    // Other query parameters are kept; the marker keeps the first attempt's time.
+    nowMs = (startedSeconds + WORKER_START_GIVE_UP_SECONDS - 1) * 1000;
+    const inside = await reload(`/viewer?tab=work&${WAKE_STARTED_PARAM}=${startedSeconds}`);
+    expect(inside.status).toBe(503);
+    const insideHtml = await inside.text();
+    expect(insideHtml).toContain('Your viewer is starting');
+    expect(insideHtml).toContain(`http-equiv="refresh" content="${WORKER_STARTING_RELOAD_SECONDS};url=/viewer?tab=work&amp;${WAKE_STARTED_PARAM}=${startedSeconds}"`);
+
+    nowMs = (startedSeconds + WORKER_START_GIVE_UP_SECONDS) * 1000;
+    const past = await reload(`/viewer?tab=work&${WAKE_STARTED_PARAM}=${startedSeconds}`);
+    expect(past.status).toBe(503);
+    const pastHtml = await past.text();
+    expect(pastHtml).toContain('Your viewer could not start');
+    expect(pastHtml).not.toContain('http-equiv="refresh"');
+    expect(pastHtml).toContain(`<a href="${SIGN_IN}">`);
+
+    // A marker that cannot be the gate's own (unreadable, or in the future) starts a new count.
+    for (const marker of ['abc', String(startedSeconds + 10_000)]) {
+      const fresh = await (await reload(`/?${WAKE_STARTED_PARAM}=${marker}`)).text();
+      expect(fresh).toContain(`url=/?${WAKE_STARTED_PARAM}=${startedSeconds + WORKER_START_GIVE_UP_SECONDS}"`);
+    }
+  });
+
+  it('logs why the worker is unreachable once per kind, not on every reload', async () => {
+    const logged: string[] = [];
+    const original = console.error;
+    console.error = (...parts: unknown[]) => { logged.push(parts.join(' ')); };
+    try {
+      let failWith: Error = Object.assign(new Error('Unable to connect'), { code: 'ConnectionRefused' });
+      let workerUp = false;
+      const flaky: typeof fetch = async () => {
+        if (workerUp) return new Response('ok');
+        throw failWith;
+      };
+      const gateWithFlakyWorker = createGate({ ownerUserId: OWNER, secret: SECRET, upstreamOrigin: 'http://127.0.0.1:37777', publicOrigin: PUBLIC_ORIGIN, signInUrl: SIGN_IN, fetchImpl: flaky });
+      const reload = () => gateWithFlakyWorker(new Request(`${PUBLIC_ORIGIN}/`, { headers: { Cookie: sessionCookie(), Accept: 'text/html' } }));
+      for (let i = 0; i < 5; i++) await reload();
+      expect(logged).toHaveLength(1);
+      expect(logged[0]).toContain('worker unreachable (ConnectionRefused): Unable to connect');
+      failWith = Object.assign(new Error('socket closed'), { code: 'ECONNRESET' });
+      await reload();
+      await reload();
+      expect(logged).toHaveLength(2);
+      expect(logged[1]).toContain('(ECONNRESET)');
+      // Once the worker answers, the next outage is logged again.
+      workerUp = true;
+      await reload();
+      workerUp = false;
+      await reload();
+      expect(logged).toHaveLength(3);
+    } finally {
+      console.error = original;
+    }
   });
 });

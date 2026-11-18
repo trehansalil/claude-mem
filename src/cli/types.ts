@@ -4,6 +4,8 @@ export interface NormalizedHookInput {
   platform?: string;   
   prompt?: string;
   toolName?: string;
+  /** Exact host tool name before normalization, retained for configured exclusions. */
+  nativeToolName?: string;
   toolInput?: unknown;
   toolResponse?: unknown;
   /**
@@ -24,7 +26,14 @@ export interface NormalizedHookInput {
   stopHookActive?: boolean;
   permissionMode?: string;
   model?: string;
-  sessionSource?: 'startup' | 'resume' | 'clear' | 'compact';
+  sessionSource?: 'startup' | 'resume' | 'clear' | 'compact' | 'fork';
+  /**
+   * Claude Code SessionStart only: the file claude-mem's session-start card
+   * will read the terminal banner from (src/shared/session-start-card-slot.ts).
+   * Set when the card can draw; the context hook then writes the banner there
+   * and sends a one-line systemMessage.
+   */
+  sessionStartCardFile?: string;
   /** Raw hook event name from the payload (e.g. Kimi binds both Stop and PreCompact to the same internal event — handlers use this to tell them apart). */
   hookEventName?: string;
   filePath?: string;

@@ -1,10 +1,13 @@
-import test from 'node:test';
+import { afterEach, test } from 'bun:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { HumanCopyWorker, chatCompletionsHumanCopyProvider, fitGeneratedCopy } from '../../../src/services/work-view/human-copy-worker.mjs';
+import { HumanCopyWorker, MAX_OUTPUT_REJECTION_ATTEMPTS, chatCompletionsHumanCopyProvider, fitGeneratedCopy } from '../../../src/services/work-view/human-copy-worker.mjs';
 import { createHumanCopyInput, validateHumanCopy } from '../../../src/services/work-view/human-copy.mjs';
+
+const disposals = [];
+afterEach(() => { for (const dispose of disposals.splice(0).reverse()) dispose(); });
 
 const request = (id = 'request-one', progress = 'The local source is connected.') => ({
   id, original: { text: 'Show my work in a live tracker.', source: 'user-prompt', sourceId: 10 },
@@ -35,10 +38,10 @@ const waitForWorker = async instance => {
   assert.equal(instance.running.size, 0, 'worker request settles');
 };
 
-test('setup pause suppresses already queued and newly observed user-token calls until setup completes', async t => {
+test('setup pause suppresses already queued and newly observed user-token calls until setup completes', async () => {
   let paused = false, now = 0, calls = 0;
   const instance = worker(async input => { calls++; return { output: copy(input) }; }, { now: () => now, quietMs: 100 });
-  t.after(() => instance.close());
+  disposals.push(() => instance.close());
   instance.pauseWhile(() => paused);
   instance.observe(view(request()));
   assert.equal(instance.status().queued, 1);
@@ -54,10 +57,10 @@ test('setup pause suppresses already queued and newly observed user-token calls 
   assert.equal(calls, 1);
 });
 
-test('a pause that begins between pump and run starts nothing and leaves no request counted as generating', async t => {
+test('a pause that begins between pump and run starts nothing and leaves no request counted as generating', async () => {
   let now = 0, calls = 0;
   const instance = worker(async input => { calls++; return { output: copy(input) }; }, { now: () => now, quietMs: 100 });
-  t.after(() => instance.close());
+  disposals.push(() => instance.close());
   instance.observe(view(request()));
   assert.equal(instance.status().queued, 1);
   now = 1000;
@@ -77,12 +80,12 @@ test('a pause that begins between pump and run starts nothing and leaves no requ
   assert.equal(instance.status().generating, 0);
 });
 
-test('one request stays single-flight and reuses its copy across polling, source ages and display-label changes', async t => {
+test('one request stays single-flight and reuses its copy across polling, source ages and display-label changes', async () => {
   let calls = 0;
   const pending = deferred();
   const source = request();
   const instance = worker(async input => { calls++; return pending.promise; });
-  t.after(() => instance.close());
+  disposals.push(() => instance.close());
   for (let i = 0; i < 8; i++) instance.observe(view(source));
   assert.equal(calls, 1);
   pending.resolve({ output: copy(createHumanCopyInput(source)) });
@@ -95,12 +98,12 @@ test('one request stays single-flight and reuses its copy across polling, source
   assert.equal(calls, 1);
 });
 
-test('new unrelated requests generate only their own copy and one call includes every workstream', async t => {
+test('new unrelated requests generate only their own copy and one call includes every workstream', async () => {
   const inputs = [];
   const source = request();
   source.workstreams.push({ id: 'second-stream', items: [], activity: [] });
   const instance = worker(async input => { inputs.push(input); return { output: copy(input) }; });
-  t.after(() => instance.close());
+  disposals.push(() => instance.close());
   instance.observe(view(source));
   await settle();
   instance.observe(view(source, request('request-two')));
@@ -111,12 +114,12 @@ test('new unrelated requests generate only their own copy and one call includes 
   assert.equal(inputs.length, 2);
 });
 
-test('a changed in-flight input never publishes stale copy and the next call uses the latest input', async t => {
+test('a changed in-flight input never publishes stale copy and the next call uses the latest input', async () => {
   const jobs = [];
   const instance = worker(async input => {
     const job = { input, ...deferred() }; jobs.push(job); return job.promise;
   });
-  t.after(() => instance.close());
+  disposals.push(() => instance.close());
   const first = request(), latest = request('request-one', 'Mobile layout is now verified.');
   instance.observe(view(first));
   instance.observe(view(latest));
@@ -131,10 +134,10 @@ test('a changed in-flight input never publishes stale copy and the next call use
   assert.equal(instance.observe(view(latest)).humanRequests[0].humanCopy.title, 'Latest copy');
 });
 
-test('per-request minimum interval prevents costly repeated generations for changing work', async t => {
+test('per-request minimum interval prevents costly repeated generations for changing work', async () => {
   let now = 1000, calls = 0;
   const instance = worker(async input => { calls++; return { output: copy(input) }; }, { now: () => now, minIntervalMs: 1000 });
-  t.after(() => instance.close());
+  disposals.push(() => instance.close());
   instance.observe(view(request())); await settle();
   now = 1100;
   const changed = request('request-one', 'A new supported result is recorded.');
@@ -145,11 +148,11 @@ test('per-request minimum interval prevents costly repeated generations for chan
   assert.equal(instance.observe(view(changed)).humanRequests[0].humanCopy.state, 'current');
 });
 
-test('a burst is debounced while maximum wait eventually processes its newest content', async t => {
+test('a burst is debounced while maximum wait eventually processes its newest content', async () => {
   let now = 0;
   const inputs = [];
   const instance = worker(async input => { inputs.push(input); return { output: copy(input) }; }, { now: () => now, quietMs: 100, maxWaitMs: 300 });
-  t.after(() => instance.close());
+  disposals.push(() => instance.close());
   for (const at of [0, 80, 160, 240]) {
     now = at; instance.observe(view(request('request-one', `Supported update ${at}.`)));
   }
@@ -160,14 +163,14 @@ test('a burst is debounced while maximum wait eventually processes its newest co
   assert.equal(inputs[0].workstreams[0].currentItems[0].progress, 'Supported latest update.');
 });
 
-test('provider failure preserves last good copy, reports it outdated, and respects retry timing', async t => {
+test('provider failure preserves last good copy, reports it outdated, and respects retry timing', async () => {
   let now = 1000, calls = 0;
   const instance = worker(async input => {
     calls++;
     if (calls === 2) throw new Error('Temporary gateway failure');
     return { output: copy(input, calls === 1 ? 'Last good copy' : 'Recovered copy') };
   }, { now: () => now, retryMs: 100 });
-  t.after(() => instance.close());
+  disposals.push(() => instance.close());
   instance.observe(view(request())); await settle();
   const changed = request('request-one', 'The underlying work changed.');
   now = 1010; instance.observe(view(changed)); await settle();
@@ -180,7 +183,7 @@ test('provider failure preserves last good copy, reports it outdated, and respec
   assert.equal(instance.observe(view(changed)).humanRequests[0].humanCopy.title, 'Recovered copy');
 });
 
-test('permanent HTTP failures are logged safely and wait for provider configuration changes', async t => {
+test('permanent HTTP failures are logged safely and wait for provider configuration changes', async () => {
   let now = 1000, configKey = 'first-config', calls = 0;
   const warnings = [];
   const directory = mkdtempSync(join(tmpdir(), 'human-copy-failure-'));
@@ -191,7 +194,7 @@ test('permanent HTTP failures are logged safely and wait for provider configurat
   }, { getConfigKey: () => configKey });
   const instance = new HumanCopyWorker({ provider, cachePath: join(directory, 'human-copy.json'), quietMs: 0, minIntervalMs: 0,
     retryMs: 100, now: () => now, warn: message => warnings.push(message) });
-  t.after(() => { instance.close(); rmSync(directory, { recursive: true, force: true }); });
+  disposals.push(() => { instance.close(); rmSync(directory, { recursive: true, force: true }); });
 
   instance.observe(view(request())); await waitForWorker(instance);
   assert.equal(calls, 1);
@@ -214,11 +217,11 @@ test('permanent HTTP failures are logged safely and wait for provider configurat
   assert.equal(instance.observe(view(request())).humanRequests[0].humanCopy.title, 'Recovered after settings change');
 });
 
-test('429 failures use exponential backoff', async t => {
+test('429 failures use exponential backoff', async () => {
   let now = 0, calls = 0;
   const instance = worker(async () => { calls++; throw Object.assign(new Error('rate limited'), { status: 429 }); },
     { now: () => now, retryMs: 100, maxRetryMs: 1000 });
-  t.after(() => instance.close());
+  disposals.push(() => instance.close());
   instance.observe(view(request())); await settle();
   assert.equal(calls, 1);
   now = 99; instance.pump(); await settle(); assert.equal(calls, 1);
@@ -227,12 +230,12 @@ test('429 failures use exponential backoff', async t => {
   now = 300; instance.pump(); await settle(); assert.equal(calls, 3);
 });
 
-test('invalid or invented output identities cannot publish copy or change recorded status', async t => {
+test('invalid or invented output identities cannot publish copy or change recorded status', async () => {
   const source = request();
   const instance = worker(async input => ({ output: {
     ...copy(input), status: 'done', workstreams: [{ id: 'invented-stream', title: 'Done', summary: 'Everything delivered.' }],
   } }));
-  t.after(() => instance.close());
+  disposals.push(() => instance.close());
   instance.observe(view(source)); await settle();
   const result = instance.observe(view(source)).humanRequests[0];
   assert.equal(result.humanCopy.state, 'unavailable');
@@ -255,12 +258,12 @@ test('text fitting enforces display limits without repairing malformed identitie
   assert.equal(fitGeneratedCopy('invalid text'), 'invalid text');
 });
 
-test('unchanged current items reordered by a timestamp-only write do not incur a new generation', async t => {
+test('unchanged current items reordered by a timestamp-only write do not incur a new generation', async () => {
   let calls = 0;
   const source = request();
   source.workstreams[0].items.push({ ...structuredClone(source.workstreams[0].items[0]), id: 'task-two', title: 'Review the result' });
   const instance = worker(async input => { calls++; return { output: copy(input) }; });
-  t.after(() => instance.close());
+  disposals.push(() => instance.close());
   instance.observe(view(source)); await settle();
   const reordered = structuredClone(source);
   reordered.workstreams[0].items.reverse();
@@ -271,9 +274,9 @@ test('unchanged current items reordered by a timestamp-only write do not incur a
   await settle();
 });
 
-test('a malformed stale cache entry is never published as outdated display copy', t => {
+test('a malformed stale cache entry is never published as outdated display copy', () => {
   const instance = worker(async input => ({ output: copy(input) }), { quietMs: 1000 });
-  t.after(() => instance.close());
+  disposals.push(() => instance.close());
   const source = request();
   instance.cache.set(source.id, { fingerprint: 'old-fingerprint', generatedAt: 1, copy: { title: 'Invalid cached shape', workstreams: 'not-an-array' } });
   const result = instance.observe(view(source)).humanRequests[0].humanCopy;
@@ -281,19 +284,19 @@ test('a malformed stale cache entry is never published as outdated display copy'
   assert.ok(['pending', 'unavailable'].includes(result.state));
 });
 
-test('without a configured summary provider, requests are marked unavailable and nothing is queued', t => {
+test('without a configured summary provider, requests are marked unavailable and nothing is queued', () => {
   const instance = new HumanCopyWorker({ provider: null, cachePath: null });
-  t.after(() => instance.close());
+  disposals.push(() => instance.close());
   const result = instance.observe(view(request())).humanRequests[0].humanCopy;
   assert.equal(result.state, 'unavailable');
   assert.equal(instance.status().queued, 0);
 });
 
-test('a provider whose settings are off is not queued or called, then resolves after opt-in', async t => {
+test('a provider whose settings are off is not queued or called, then resolves after opt-in', async () => {
   let enabled = false, calls = 0;
   const provider = Object.assign(async input => { calls++; return { output: copy(input) }; }, { isAvailable: () => enabled });
   const instance = worker(provider);
-  t.after(() => instance.close());
+  disposals.push(() => instance.close());
   const source = request();
   assert.equal(instance.observe(view(source)).humanRequests[0].humanCopy.state, 'unavailable');
   assert.equal(instance.status().queued, 0);
@@ -306,13 +309,13 @@ test('a provider whose settings are off is not queued or called, then resolves a
   assert.equal(instance.observe(view(source)).humanRequests[0].humanCopy.state, 'current');
 });
 
-test('explicit off hides cached wording while retaining it for later reuse', async t => {
+test('explicit off hides cached wording while retaining it for later reuse', async () => {
   let enabled = true, off = false, configKey = 'enabled', calls = 0;
   const provider = Object.assign(async input => { calls++; return { output: copy(input, 'Stored wording') }; }, {
     isAvailable: () => enabled, isOff: () => off, getConfigKey: () => configKey,
   });
   const instance = worker(provider);
-  t.after(() => instance.close());
+  disposals.push(() => instance.close());
   const source = request();
   instance.observe(view(source)); await settle();
   assert.equal(instance.observe(view(source)).humanRequests[0].humanCopy.title, 'Stored wording');
@@ -357,11 +360,11 @@ test('any other 400 is not resent', async () => {
   assert.equal(calls, 1);
 });
 
-test('402 (out of credits) retries on the capped backoff instead of waiting for a settings change', async t => {
+test('402 (out of credits) retries on the capped backoff instead of waiting for a settings change', async () => {
   let now = 0, calls = 0;
   const instance = worker(async () => { calls++; throw Object.assign(new Error('insufficient credits'), { status: 402 }); },
     { now: () => now, retryMs: 100, maxRetryMs: 150 });
-  t.after(() => instance.close());
+  disposals.push(() => instance.close());
   instance.observe(view(request())); await settle();
   assert.equal(calls, 1);
   now = 99; instance.pump(); await settle(); assert.equal(calls, 1);
@@ -398,4 +401,186 @@ test('the chat-completions provider sends the configured model and key and parse
   assert.deepEqual(JSON.parse(body.messages[1].content), input);
   assert.deepEqual(result.output, { title: 't' });
   assert.equal(result.error, null);
+});
+
+// A temporary source read failure is not evidence that a queued request was deleted.
+test('failed and stale snapshots do not retire pending requests', async () => {
+  let now = 0, calls = 0;
+  const instance = worker(async input => { calls++; return { output: copy(input) }; }, { now: () => now, quietMs: 100 });
+  disposals.push(() => instance.close());
+  instance.observe({ ...view(request()), source: { connected: true, stale: false } });
+  instance.observe({ ...view(), source: { connected: false, stale: true } });
+  assert.equal(instance.status().queued, 1);
+  instance.observe({ ...view(), source: { connected: true, stale: true } });
+  assert.equal(instance.status().queued, 1);
+  now = 1000;
+  instance.pump();
+  await waitForWorker(instance);
+  assert.equal(calls, 1);
+});
+
+test('validator rejections back off exponentially and wait for change after max attempts', async () => {
+  let now = 0, calls = 0;
+  const source = request();
+  const instance = worker(async input => {
+    calls++;
+    return { output: { ...copy(input), workstreams: [{ id: 'invented-stream', title: 'Done', summary: 'Everything delivered.' }] } };
+  }, { now: () => now, retryMs: 100, maxRetryMs: 1000 });
+  disposals.push(() => instance.close());
+
+  instance.observe(view(source));
+  await settle();
+  assert.equal(calls, 1);
+  assert.equal(instance.status().failures[0].reason, 'Unknown or duplicate workstream id');
+  assert.equal(instance.failures.get(source.id).attempt, 1);
+  assert.equal(instance.failures.get(source.id).waitForChange, false);
+  assert.equal(instance.failures.get(source.id).retryAfterMs, 100);
+
+  // Attempt 2 backoff: 100ms
+  now = 99; instance.pump(); await settle(); assert.equal(calls, 1);
+  now = 100; instance.pump(); await settle(); assert.equal(calls, 2);
+  assert.equal(instance.failures.get(source.id).attempt, 2);
+  assert.equal(instance.failures.get(source.id).waitForChange, false);
+  assert.equal(instance.failures.get(source.id).retryAfterMs, 200);
+
+  // Attempt 3 backoff: 200ms (100 + 200 = 300)
+  now = 299; instance.pump(); await settle(); assert.equal(calls, 2);
+  now = 300; instance.pump(); await settle(); assert.equal(calls, 3);
+  assert.equal(instance.failures.get(source.id).attempt, 3);
+  assert.equal(instance.failures.get(source.id).waitForChange, true);
+
+  // Reached MAX_OUTPUT_REJECTION_ATTEMPTS (3). waitForChange is now true.
+  assert.equal(MAX_OUTPUT_REJECTION_ATTEMPTS, 3);
+  now = 3600 * 1000;
+  instance.pump();
+  await settle();
+  assert.equal(calls, 3, 'validator rejections stop retrying on a timer after MAX_OUTPUT_REJECTION_ATTEMPTS');
+
+  // New input / fingerprint resets attempt and retries
+  const updatedSource = request('request-one', 'Different progress.');
+  instance.observe(view(updatedSource));
+  now += 100;
+  instance.pump();
+  await settle();
+  assert.equal(calls, 4, 'new fingerprint triggers a new attempt');
+  assert.equal(instance.failures.get(source.id).attempt, 1);
+});
+
+test('surfaces clean validation message in failure reason', async () => {
+  const source = request();
+  const instance = worker(async input => {
+    return { output: { ...copy(input), title: '' } };
+  });
+  disposals.push(() => instance.close());
+
+  instance.observe(view(source));
+  await settle();
+  assert.equal(instance.status().failures[0].reason, 'Request title must be 1–100 characters');
+});
+
+test('temporary connection failures do not count as validation errors or block recovered endpoints', async () => {
+  let now = 0, calls = 0;
+  const source = request();
+  const instance = worker(async input => {
+    calls++;
+    if (calls <= 3) throw new TypeError('fetch failed');
+    return { output: copy(input, 'Recovered after network restored') };
+  }, { now: () => now, retryMs: 100 });
+  disposals.push(() => instance.close());
+
+  instance.observe(view(source));
+  await settle();
+  assert.equal(calls, 1);
+  assert.equal(instance.status().failures[0].reason, 'Summary request failed');
+  assert.equal(instance.failures.get(source.id).outputRejectionAttempts, 0);
+  assert.equal(instance.failures.get(source.id).waitForChange, false);
+
+  // Connection fails 3 times
+  now = 100; instance.pump(); await settle(); assert.equal(calls, 2);
+  now = 200; instance.pump(); await settle(); assert.equal(calls, 3);
+  assert.equal(instance.failures.get(source.id).attempt, 3);
+  assert.equal(instance.failures.get(source.id).outputRejectionAttempts, 0);
+  assert.equal(instance.failures.get(source.id).waitForChange, false, 'network TypeError does not set waitForChange');
+
+  // Next retry at now = 300 should run and recover
+  now = 300; instance.pump(); await settle();
+  assert.equal(calls, 4);
+  assert.equal(instance.observe(view(source)).humanRequests[0].humanCopy.title, 'Recovered after network restored');
+});
+
+test('unrelated HTTP failures do not consume validation attempts', async () => {
+  let now = 0, calls = 0;
+  const source = request();
+  const instance = worker(async input => {
+    calls++;
+    if (calls <= 2) throw Object.assign(new Error('rate limited'), { status: 429 });
+    // Returns malformed copy on call 3
+    return { output: { ...copy(input), workstreams: [{ id: 'bad-stream', title: 'T', summary: 'S' }] } };
+  }, { now: () => now, retryMs: 100, maxRetryMs: 1000 });
+  disposals.push(() => instance.close());
+
+  // Call 1: 429
+  instance.observe(view(source)); await settle(); assert.equal(calls, 1);
+  assert.equal(instance.failures.get(source.id).outputRejectionAttempts, 0);
+
+  // Call 2: 429
+  now = 100; instance.pump(); await settle(); assert.equal(calls, 2);
+  assert.equal(instance.failures.get(source.id).outputRejectionAttempts, 0);
+
+  // Call 3: Malformed copy (validation error). attempt is 3, but outputRejectionAttempts should be 1!
+  now = 300; instance.pump(); await settle(); assert.equal(calls, 3);
+  assert.equal(instance.failures.get(source.id).attempt, 3);
+  assert.equal(instance.failures.get(source.id).outputRejectionAttempts, 1);
+  assert.equal(instance.failures.get(source.id).waitForChange, false, 'one validation failure after 429s does not block retries');
+
+  // Call 4: Validation attempt 2
+  now = 400; instance.pump(); await settle(); assert.equal(calls, 4);
+  assert.equal(instance.failures.get(source.id).outputRejectionAttempts, 2);
+  assert.equal(instance.failures.get(source.id).waitForChange, false);
+
+  // Call 5: Validation attempt 3 -> now reaches MAX_OUTPUT_REJECTION_ATTEMPTS
+  now = 600; instance.pump(); await settle(); assert.equal(calls, 5);
+  assert.equal(instance.failures.get(source.id).outputRejectionAttempts, 3);
+  assert.equal(instance.failures.get(source.id).waitForChange, true);
+});
+
+
+
+test('an empty model answer stops after the rejection cap instead of retrying forever (#6037)', async () => {
+  let now = 0, calls = 0;
+  const source = request();
+  const instance = worker(async () => {
+    calls++;
+    return { output: null, error: 'No answer text (finish: length).' };
+  }, { now: () => now, retryMs: 100, maxRetryMs: 1000 });
+  disposals.push(() => instance.close());
+
+  instance.observe(view(source)); await settle();
+  for (let pump = 0; pump < 20; pump++) { now += 1000; instance.pump(); await settle(); }
+
+  assert.equal(calls, MAX_OUTPUT_REJECTION_ATTEMPTS, 'one unchanged request version gets at most the capped number of calls');
+  assert.equal(instance.failures.get(source.id).reason, 'No answer text');
+  assert.equal(instance.failures.get(source.id).waitForChange, true);
+
+  instance.observe(view(request('request-one', 'Different progress.')));
+  now += 1000; instance.pump(); await settle();
+  assert.equal(calls, MAX_OUTPUT_REJECTION_ATTEMPTS + 1, 'changed input is tried again');
+});
+
+test('a reply body that is not JSON keeps the flat retry, since that is a transport problem', async () => {
+  let now = 0, calls = 0;
+  const source = request();
+  const instance = worker(async () => {
+    calls++;
+    throw new SyntaxError('Unexpected token < in JSON');
+  }, { now: () => now, retryMs: 100, maxRetryMs: 1000 });
+  disposals.push(() => instance.close());
+
+  instance.observe(view(source)); await settle();
+  for (let pump = 0; pump < 5; pump++) { now += 100; instance.pump(); await settle(); }
+
+  assert.equal(calls, 6);
+  assert.equal(instance.failures.get(source.id).reason, 'Invalid JSON response');
+  assert.equal(instance.failures.get(source.id).outputRejectionAttempts, 0);
+  assert.equal(instance.failures.get(source.id).waitForChange, false);
 });

@@ -1,11 +1,14 @@
 import { afterAll, beforeAll, describe, it, expect } from 'bun:test';
 import express from 'express';
-import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { formatDeepSearch } from '../../src/shared/deep-search-format.js';
+import type { DeepSearchResult } from '../../src/services/sqlite/tool-use-search.js';
+import { expectSafeMcpToolNames } from './mcp-tool-name-assertions.js';
 
 const mcpServerPath = fileURLToPath(new URL('../../src/servers/mcp-server.ts', import.meta.url));
 
@@ -15,11 +18,22 @@ type ListedTool = { name: string; inputSchema: { properties?: Record<string, unk
 async function withServer(
   runtime: 'worker' | 'server',
   run: (client: Client, workerRequests: Array<{ path: string; body: any; query: any }>, cwd: string) => Promise<void>,
+  autostart = false,
 ): Promise<void> {
   const workerRequests: Array<{ path: string; body: any; query: any }> = [];
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => { workerRequests.push({ path: req.path, body: req.body, query: req.query }); next(); });
+  app.get('/api/search', (req, res) => {
+    const result = {observations: [], sessions: [], prompts: [], totalResults: 0,
+      deep: {status: 'ok', complete: true, count: 1, hasMore: false},
+      toolUses: [{id: 41, tool_name: 'Bash', project: 'test', snippet: 'DB_CONN_1042'}]};
+    res.json(req.query.format === 'json' ? result : {...result, content: [
+      {type:'text', text:'#S1 ' + 'Matching summary 🧪 '.repeat(5000)},
+      {type:'text', text:formatDeepSearch(result as DeepSearchResult)},
+    ]});
+  });
+  app.post('/api/tool-uses/batch', (_req, res) => res.json([]));
   app.get('/api/health', (_req, res) => res.json({ status: 'ok' }));
   app.post('/api/work-state/entries', (_req, res) => res.json({ entries: [] }));
   app.get('/api/work-state', (_req, res) => res.json({ entries: [] }));
@@ -38,7 +52,8 @@ async function withServer(
       CLAUDE_MEM_DATA_DIR: dataDir,
       CLAUDE_MEM_WORKER_PORT: String(port),
       CLAUDE_MEM_WORKER_HOST: '127.0.0.1',
-      CLAUDE_MEM_WORKER_AUTOSTART: 'false',
+      CLAUDE_MEM_WORKER_AUTOSTART: String(autostart),
+      CLAUDE_MEM_LOG_LEVEL: 'INFO',
       CLAUDE_MEM_WORK_STATE_ENABLED: 'true',
       CLAUDE_MEM_RUNTIME: runtime,
       CLAUDE_MEM_SERVER_URL: `http://127.0.0.1:${port}`,
@@ -66,6 +81,10 @@ describe('MCP tool inputSchema declarations', () => {
       tools = new Map((await client.listTools()).tools.map(tool => [tool.name, tool as ListedTool]));
     });
   }, 30_000);
+
+  it('advertises MCP-safe tool names within the qualified-name budget', () => {
+    expectSafeMcpToolNames(tools.values());
+  });
 
   const properties = (name: string) => Object.keys(tools.get(name)?.inputSchema.properties ?? {});
   const required = (name: string) => tools.get(name)?.inputSchema.required ?? [];
@@ -114,18 +133,54 @@ describe('work_state tools', () => {
   }, 30_000);
 });
 
-describe('mcp-server source guards', () => {
-  it('mcp-server skips worker auto-start when runtime=server (anti-pattern guard)', async () => {
-    const src = await Bun.file(mcpServerPath).text();
-    // Phase 1a (cmem-sdk rename): canonical runtime literal is `'server'`.
-    // `selectRuntime()` normalizes the legacy `'server-beta'` to `'server'`.
-    expect(src).toContain("selectRuntime() === 'server'");
-    expect(src).toContain('skipping worker auto-start');
-  });
+describe('mcp-server auto-start', () => {
+  it('server runtime does not probe the worker with auto-start enabled', async () => {
+    await withServer('server', async (client, requests, dataDir) => {
+      await client.listTools();
+      const deadline = Date.now() + 5_000;
+      while (true) {
+        const logs = readdirSync(join(dataDir, 'logs'))
+          .map(file => readFileSync(join(dataDir, 'logs', file), 'utf8')).join('\n');
+        if (/skipping worker auto-start|Worker available|Worker not available/.test(logs)) break;
+        if (Date.now() >= deadline) throw new Error('MCP auto-start did not settle');
+        await Bun.sleep(10);
+      }
+      expect(requests.filter(request => request.path === '/api/health')).toEqual([]);
+    }, true);
+  }, 15_000);
+});
 
-  it('mcp-server does NOT import WorkerService (anti-pattern guard, plan line 772)', async () => {
-    const src = await Bun.file(mcpServerPath).text();
-    expect(src).not.toMatch(/from\s+['"][^'"]*WorkerService[^'"]*['"]/);
-    expect(src).not.toMatch(/import\s+\{[^}]*WorkerService[^}]*\}/);
-  });
+describe('raw-tool deep search MCP contract', () => {
+  it('passes deep to the worker and formats raw IDs in a JSON-shaped worker reply', async () => {
+    await withServer('worker', async (client, requests) => {
+      const result = await client.callTool({ name: 'search', arguments: { query: 'DB_CONN_1042', deep: true, format: 'json' } });
+      const request = requests.find(r => r.path === '/api/search');
+      expect(request?.query.deep).toBe('true');
+      expect(JSON.stringify(result)).toContain('#T41');
+      expect(JSON.stringify(result)).toContain('get_tool_uses');
+    });
+  }, 30_000);
+
+  it('preserves raw hits over stdio when the default text reply has oversized summaries', async () => {
+    await withServer('worker', async (client, requests) => {
+      const result = await client.callTool({name:'search', arguments:{query:'DB_CONN_1042', deep:true}});
+      const request = requests.find(r => r.path === '/api/search');
+      expect(request?.query.format).toBeUndefined();
+      const text = (result.content as Array<{text:string}>).map(block => block.text).join('\n');
+      expect(text).toContain('#S1');
+      expect(text).toContain('#T41');
+      expect(text).toContain('DB_CONN_1042');
+      expect(text).toContain('get_tool_uses');
+      expect(Buffer.byteLength(text)).toBeLessThanOrEqual(32 * 1024);
+    });
+  }, 30_000);
+
+  it('rejects server deep search before any local or server search request', async () => {
+    await withServer('server', async (client, requests) => {
+      const result = await client.callTool({ name: 'search', arguments: { query: 'DB_CONN_1042', deep: true } });
+      expect(result.isError).toBe(true);
+      expect(JSON.stringify(result)).toContain('local-only');
+      expect(requests.filter(r => /search|tool-uses/.test(r.path))).toEqual([]);
+    });
+  }, 30_000);
 });

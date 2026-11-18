@@ -12,7 +12,11 @@ import { createHash } from 'crypto';
 import { createReadStream, existsSync, readdirSync, readFileSync, statSync } from 'fs';
 import { basename, join, resolve } from 'path';
 import { homedir } from 'os';
+import { pipeline, type Transform } from 'node:stream';
+import * as zlib from 'node:zlib';
 import { logger } from '../../utils/logger.js';
+import { scanZstdFramesInFile } from '../transcripts/zstd-frames.js';
+import { streamRows } from '../sqlite/stream-rows.js';
 
 export type PromptAgentId = 'claude-code' | 'codex' | 'gemini-cli' | 'antigravity-cli' | 'opencode';
 
@@ -56,20 +60,55 @@ export interface AgentPromptReader {
 // ---------------------------------------------------------------------------
 // Shared helpers
 
-/** Streams a file's lines without holding the file in memory. */
+/** Streams plain or Codex-compressed JSONL without holding the file in memory. */
 export async function* readLines(path: string): AsyncGenerator<string> {
-  const stream = createReadStream(path, { encoding: 'utf8', highWaterMark: 1 << 20 });
-  let pending = '';
-  for await (const chunk of stream as AsyncIterable<string>) {
-    pending += chunk;
-    let newline = pending.indexOf('\n');
-    while (newline !== -1) {
-      yield pending.slice(0, newline);
-      pending = pending.slice(newline + 1);
-      newline = pending.indexOf('\n');
+  let decompressor: Transform | undefined;
+  if (path.endsWith('.jsonl.zst')) {
+    // Older supported runtimes must still load this module and read plain files.
+    const createZstdDecompress = (zlib as unknown as { createZstdDecompress?: () => Transform }).createZstdDecompress;
+    if (typeof createZstdDecompress !== 'function') {
+      throw new Error('this runtime cannot decode compressed Codex history (zlib.createZstdDecompress is missing)');
     }
+    // Bun's streaming decoder can finish without rejecting a truncated frame.
+    // Reuse the bounded header scan so a partial history is reported as unreadable.
+    const frames = scanZstdFramesInFile(path, 0, statSync(path).size);
+    if (frames.tornStart !== null || !frames.frames.length) {
+      throw new Error('incomplete Zstandard frame in compressed Codex history');
+    }
+    decompressor = createZstdDecompress();
   }
-  if (pending) yield pending;
+  const input = createReadStream(path, { highWaterMark: 1 << 20 });
+  // pipeline forwards input errors to the decoder and closes both streams on
+  // failure or early cancellation. The async iterator below reports the error.
+  const stream = decompressor ? pipeline(input, decompressor, () => {}) : input;
+  stream.setEncoding('utf8');
+  try {
+    let pending: string[] = [];
+    for await (const chunk of stream as AsyncIterable<string>) {
+      // Search each decoded chunk once. A large tool payload may span many
+      // chunks; repeatedly joining and searching that growing line is quadratic.
+      let start = 0;
+      let newline = chunk.indexOf('\n');
+      while (newline !== -1) {
+        const tail = chunk.slice(start, newline);
+        if (pending.length) {
+          pending.push(tail);
+          const line = pending.join('');
+          pending = [];
+          yield line;
+        } else {
+          yield tail;
+        }
+        start = newline + 1;
+        newline = chunk.indexOf('\n', start);
+      }
+      if (start < chunk.length) pending.push(chunk.slice(start));
+    }
+    if (pending.length) yield pending.join('');
+  } finally {
+    stream.destroy();
+    input.destroy();
+  }
 }
 
 /** A line that is not JSON (a torn last line, a partial write) is not a record; the Python reader skips it the same way. */
@@ -199,14 +238,20 @@ export function createClaudeCodeReader(): AgentPromptReader {
           && !record.isSidechain && !record.isMeta;
         const at = isoToEpochMs(record.timestamp);
         if (!text || !isOwnerTyped || at === null || at < sinceEpochMs) continue;
-        const dedupeKey = record.uuid || `${record.timestamp}\u0000${text.slice(0, 200)}`;
+        const sessionId = typeof record.sessionId === 'string' && record.sessionId
+          ? record.sessionId : basename(transcript.path, '.jsonl');
+        const uuid = typeof record.uuid === 'string' && record.uuid ? record.uuid : null;
+        // Keep the existing persisted fallback ID. Only the in-scan key needs
+        // session scope: a shared opening is not the identity of a legacy turn.
+        const nativePromptId = uuid ?? fallbackId(record.timestamp, text);
+        const dedupeKey = uuid ? `native:${uuid}` : `legacy:${fallbackId(sessionId, nativePromptId)}`;
         if (seenKeys.has(dedupeKey)) continue;
         seenKeys.add(dedupeKey);
         const command = claudeCommandSpellings(text);
         sink.prompt({
           agent: 'claude-code',
-          sessionId: typeof record.sessionId === 'string' && record.sessionId ? record.sessionId : basename(transcript.path, '.jsonl'),
-          nativePromptId: typeof record.uuid === 'string' && record.uuid ? record.uuid : fallbackId(record.timestamp, text),
+          sessionId,
+          nativePromptId,
           at,
           cwd: typeof record.cwd === 'string' ? record.cwd : null,
           text: command?.typed ?? text,
@@ -238,9 +283,15 @@ export function createClaudeCodeReader(): AgentPromptReader {
 }
 
 // ---------------------------------------------------------------------------
-// Codex: ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl
+// Codex: ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl and archived_sessions/*.jsonl
+// (either may be .jsonl.zst for cold sessions)
 
 const CODEX_INJECTED_PREFIXES = ['# AGENTS.md', '<environment_context', '<user_instructions', '<permissions', '<INSTRUCTIONS', '<turn_aborted'];
+
+/** Codex Desktop copies another agent's conversation into a rollout as turns with this id prefix, every record
+ * stamped with the import time. Those messages were typed in the other agent, earlier, and its own reader
+ * reports them; the turns after the import are the owner's Codex prompts. */
+const CODEX_IMPORTED_TURN_PREFIX = 'external-import-turn-';
 
 /** Verified creator protocol: a fork persists its own settings before any child turn.
  * Resume retains the creation header; older/unknown creators keep their existing interpretation. */
@@ -251,6 +302,18 @@ export function codexForkThreadId(meta: any): string | null {
     ? meta.id : null;
 }
 
+/** Rollouts in one Codex directory, plain or compressed. */
+function codexRollouts(directory: string): Array<TranscriptSource | null> {
+  const rollouts: Array<TranscriptSource | null> = [];
+  for (const file of listDirectory(directory)) {
+    if (!file.endsWith('.jsonl') && !file.endsWith('.jsonl.zst')) continue;
+    // Codex reads the plain sibling while both exist during compression.
+    if (file.endsWith('.zst') && existsSync(join(directory, file.slice(0, -4)))) continue;
+    rollouts.push(source(join(directory, file)));
+  }
+  return rollouts;
+}
+
 export function createCodexReader(): AgentPromptReader {
   const seenKeys = new Set<string>();
   return {
@@ -258,22 +321,27 @@ export function createCodexReader(): AgentPromptReader {
     label: 'Codex',
     platformSource: 'codex',
     locate(homeDirectory) {
-      const sessions = join(nativeProfileDirectory(homeDirectory, 'CODEX_HOME', '.codex'), 'sessions');
+      const profile = nativeProfileDirectory(homeDirectory, 'CODEX_HOME', '.codex');
+      const sessions = join(profile, 'sessions');
+      const archived = join(profile, 'archived_sessions');
       const sources: Array<TranscriptSource | null> = [];
       for (const year of listDirectory(sessions)) {
         for (const month of listDirectory(join(sessions, year))) {
           for (const day of listDirectory(join(sessions, year, month))) {
-            for (const file of listDirectory(join(sessions, year, month, day))) {
-              if (file.endsWith('.jsonl')) sources.push(source(join(sessions, year, month, day, file)));
-            }
+            sources.push(...codexRollouts(join(sessions, year, month, day)));
           }
         }
       }
-      return { detected: existsSync(sessions), sources: presentSources(sources) };
+      // Archival moves the same rollout into this flat directory, and Codex
+      // compresses it there too. It remains part of the owner's history; the
+      // existing timestamp/window rules apply.
+      sources.push(...codexRollouts(archived));
+      return { detected: existsSync(sessions) || existsSync(archived), sources: presentSources(sources) };
     },
     async readPrompts(transcript, sink, sinceEpochMs) {
       let meta: any = null;
       let awaitingThreadId: string | null = null;
+      let importedTurnId: string | null = null;
       for await (const line of readLines(transcript.path)) {
         if (meta === null) {
           const first = parseLine(line);
@@ -293,14 +361,23 @@ export function createCodexReader(): AgentPromptReader {
           }
           continue;
         }
-        if (!/"role"\s*:\s*"user"/.test(line)) continue;
+        if (line.includes('"task_started"') || line.includes('"task_complete"')) {
+          const event = parseLine(line);
+          const turnId = event?.type === 'event_msg' ? event.payload?.turn_id : null;
+          if (typeof turnId === 'string') {
+            if (event.payload.type === 'task_started') importedTurnId = turnId.startsWith(CODEX_IMPORTED_TURN_PREFIX) ? turnId : null;
+            else if (event.payload.type === 'task_complete' && turnId === importedTurnId) importedTurnId = null;
+            continue;
+          }
+        }
+        if (importedTurnId !== null || !/"role"\s*:\s*"user"/.test(line)) continue;
         const record = parseLine(line);
         const payload = record?.payload ?? {};
         if (record?.type !== 'response_item' || payload.role !== 'user') continue;
         const text = textOf(payload.content, ['input_text']).trim();
         const at = isoToEpochMs(record.timestamp);
         if (!text || CODEX_INJECTED_PREFIXES.some(prefix => text.startsWith(prefix)) || at === null || at < sinceEpochMs) continue;
-        const sessionId = String(meta.id ?? basename(transcript.path, '.jsonl'));
+        const sessionId = String(meta.id ?? basename(transcript.path).replace(/\.jsonl(?:\.zst)?$/, ''));
         const nativePromptId = typeof payload.id === 'string' && payload.id ? payload.id : fallbackId(String(meta.id), record.timestamp, text);
         const dedupeKey = fallbackId(sessionId, nativePromptId, String(at), text);
         if (seenKeys.has(dedupeKey)) continue;
@@ -361,7 +438,7 @@ function geminiProjectDirectories(homeDirectory: string): Map<string, string> {
   return directories;
 }
 
-export async function readGeminiChat(path: string): Promise<{ header: any; messages: any[] }> {
+export async function readGeminiChat(path: string, options: { includeDiscardedMessages?: boolean } = {}): Promise<{ header: any; messages: any[] }> {
   if (!path.endsWith('.jsonl')) {
     const document = JSON.parse(readFileSync(path, 'utf8'));
     return { header: document, messages: Array.isArray(document.messages) ? document.messages : [] };
@@ -371,12 +448,42 @@ export async function readGeminiChat(path: string): Promise<{ header: any; messa
   const keep = (message: any) => {
     if (message && typeof message === 'object' && message.type) byId.set(String(message.id ?? byId.size), message);
   };
+  const patchMessage = (patch: any) => {
+    const message = byId.get(patch?.id);
+    if (!message) return;
+    if (patch.content !== undefined) message.content = patch.content;
+  };
   for await (const line of readLines(path)) {
     const record = parseLine(line);
     if (!record || typeof record !== 'object') continue;
     if (header === null) { header = record; continue; }
-    if (record.$set) for (const message of record.$set.messages ?? []) keep(message);
-    else keep(record);
+    // Native JSONL is an event log: a rewind removes its target and everything
+    // after it, and a checkpoint replaces the live message collection. Usage
+    // and provenance scans retain discarded messages: generated tokens were
+    // spent and the model still authored that text before the rewind.
+    if (typeof record.$rewindTo === 'string') {
+      if (options.includeDiscardedMessages) continue;
+      const ids = [...byId.keys()];
+      const start = ids.indexOf(record.$rewindTo);
+      if (start === -1) byId.clear();
+      else for (const id of ids.slice(start)) byId.delete(id);
+    } else if (record.$patch) {
+      if (options.includeDiscardedMessages) continue;
+      const patch = record.$patch;
+      patchMessage(patch);
+      for (const update of Array.isArray(patch.updates) ? patch.updates : []) patchMessage(update);
+      for (const id of Array.isArray(patch.removeIds) ? patch.removeIds : []) byId.delete(id);
+      const ordered = new Map<string, any>();
+      for (const id of Array.isArray(patch.orderIds) ? patch.orderIds : []) if (byId.has(id)) ordered.set(id, byId.get(id));
+      for (const id of ordered.keys()) byId.delete(id);
+      for (const [id, message] of ordered) byId.set(id, message);
+    } else if (record.$set) {
+      if (Array.isArray(record.$set.messages)) {
+        if (!options.includeDiscardedMessages) byId.clear();
+        for (const message of record.$set.messages) keep(message);
+      }
+      header = { ...header, ...record.$set };
+    } else keep(record);
   }
   return { header: header ?? {}, messages: [...byId.values()] };
 }
@@ -384,7 +491,9 @@ export async function readGeminiChat(path: string): Promise<{ header: any; messa
 function geminiTypedText(message: any): string | null {
   const display = message.displayContent;
   let text: string;
-  if (Array.isArray(display)) {
+  if (typeof display === 'string') {
+    text = display;
+  } else if (Array.isArray(display)) {
     if (!display.some((part: any) => typeof part?.text === 'string')) return null;
     text = textOf(display.map((part: any) => ({ type: 'text', ...part })), ['text']);
   } else {
@@ -405,8 +514,10 @@ export function createGeminiCliReader(): AgentPromptReader {
     label: 'Gemini CLI',
     platformSource: 'gemini-cli',
     locate(homeDirectory) {
-      projectDirectories = geminiProjectDirectories(homeDirectory);
-      const tmp = join(homeDirectory, '.gemini', 'tmp');
+      // Gemini's override names the parent of .gemini, not the config folder.
+      const profileHome = nativeProfileDirectory(homeDirectory, 'GEMINI_CLI_HOME');
+      projectDirectories = geminiProjectDirectories(profileHome);
+      const tmp = join(profileHome, '.gemini', 'tmp');
       const sources: Array<TranscriptSource | null> = [];
       for (const project of listDirectory(tmp)) {
         const chats = join(tmp, project, 'chats');
@@ -442,11 +553,13 @@ export function createGeminiCliReader(): AgentPromptReader {
       }
     },
     async readAgentText(transcript, add) {
-      const { messages } = await readGeminiChat(transcript.path);
+      const { messages } = await readGeminiChat(transcript.path, { includeDiscardedMessages: true });
       for (const message of messages) {
         const at = isoToEpochMs(message.timestamp);
         if (message.type !== 'gemini' || at === null) continue;
-        const pieces = [typeof message.content === 'string' ? message.content : textOf(message.content, ['text'])];
+        // Native Gemini history stores Part[] text as { text }, without a type discriminator.
+        const content = Array.isArray(message.content) ? message.content.map((part: any) => ({ type: 'text', ...part })) : message.content;
+        const pieces = [textOf(content, ['text'])];
         for (const call of Array.isArray(message.toolCalls) ? message.toolCalls : []) {
           const raw = JSON.stringify(call?.args ?? {});
           pieces.push(raw);
@@ -498,25 +611,94 @@ export function createAntigravityCliReader(): AgentPromptReader {
 
 // ---------------------------------------------------------------------------
 // OpenCode: ~/.local/share/opencode/opencode.db (SQLite, opened read-only).
-// `session` (parent_id set for subagent sessions), `message` (data.role),
-// `part` holds typed text (not synthetic/ignored) and model-authored tool inputs.
+// V1 stores message roles and text in `message`/`part`; V2 stores typed user
+// text in `session_message`, with assistant content inline or in `session_part`.
+// Native migration retains V1 rows, preserving their IDs in the V2 tables.
+
+export function openCodeHistoryLayout(database: Database): { legacy: boolean; current: boolean; splitParts: boolean; forkBoundary: boolean } {
+  const tables = new Set((database.prepare(`SELECT name FROM sqlite_master
+    WHERE type = 'table' AND name IN ('message', 'session_message', 'session_part')`).all() as Array<{ name: string }>).map(row => row.name));
+  const legacy = tables.has('message');
+  const current = tables.has('session_message');
+  if (!legacy && !current) throw new Error('No supported OpenCode message table');
+  const sessionColumns = current
+    ? new Set((database.prepare('PRAGMA table_info(session_v2)').all() as Array<{ name: string }>).map(row => row.name))
+    : new Set<string>();
+  return { legacy, current, splitParts: tables.has('session_part'),
+    forkBoundary: sessionColumns.has('fork_session_id') && sessionColumns.has('time_created') };
+}
 
 interface OpenCodePart { messageId: string; sessionId: string; role: string; createdAt: number; directory: string; parentId: string | null; data: string }
 
-function readOpenCodeParts(path: string, role: 'user' | 'assistant'): OpenCodePart[] {
+function* readOpenCodeMessages(path: string, role: 'user' | 'assistant'): Generator<OpenCodePart[]> {
   const database = new Database(path, { readonly: true });
   try {
-    // Tool outputs may be user-authored files; project only model input and its call time.
-    return database.prepare(`SELECT p.message_id AS messageId, m.session_id AS sessionId, json_extract(m.data, '$.role') AS role,
+    const layout = openCodeHistoryLayout(database);
+    const queries: string[] = [];
+    const parameters: string[] = [];
+    if (layout.legacy) {
+      queries.push(`SELECT p.message_id AS messageId, m.session_id AS sessionId, json_extract(m.data, '$.role') AS role,
+        m.time_created AS createdAt, s.directory, s.parent_id AS parentId, p.data,
+        json_extract(p.data, '$.type') AS partType, json_extract(p.data, '$.state.time.start') AS startedAt,
+        0 AS storageOrder, p.id AS ordinal
+        FROM part p JOIN message m ON m.id = p.message_id JOIN session s ON s.id = m.session_id
+        WHERE json_extract(m.data, '$.role') = ? AND (json_extract(p.data, '$.type') = 'text'
+          OR (? = 'assistant' AND json_extract(p.data, '$.type') = 'tool'))
+          ${layout.current ? 'AND NOT EXISTS (SELECT 1 FROM session_message current WHERE current.id = m.id)' : ''}`);
+      parameters.push(role, role);
+    }
+    // Native forks copy settled history under new IDs but retain its timestamps.
+    // Only messages created from the fork onward are new owner activity. Keep
+    // inherited assistant text below: it still proves authorship of later input.
+    if (layout.current && role === 'user') {
+      queries.push(`SELECT m.id AS messageId, m.session_id AS sessionId, m.type AS role,
         m.time_created AS createdAt, s.directory, s.parent_id AS parentId,
-        CASE WHEN json_extract(p.data, '$.type') = 'tool' THEN json_object(
-          'type', 'tool', 'status', json_extract(p.data, '$.state.status'),
-          'input', json_extract(p.data, '$.state.input'), 'startedAt', json_extract(p.data, '$.state.time.start'))
-          ELSE p.data END AS data
-      FROM part p JOIN message m ON m.id = p.message_id JOIN session s ON s.id = m.session_id
-      WHERE json_extract(m.data, '$.role') = ? AND (json_extract(p.data, '$.type') = 'text'
-        OR (? = 'assistant' AND json_extract(p.data, '$.type') = 'tool'))
-      ORDER BY m.time_created, p.message_id, p.id`).all(role, role) as OpenCodePart[];
+        json_object('type', 'text', 'text', json_extract(m.data, '$.text')) AS data,
+        'text' AS partType, NULL AS startedAt, 0 AS storageOrder, 0 AS ordinal
+        FROM session_message m JOIN session_v2 s ON s.id = m.session_id WHERE m.type = 'user'
+          ${layout.forkBoundary ? 'AND (s.fork_session_id IS NULL OR m.time_created >= s.time_created)' : ''}`);
+    }
+    if (layout.current && role === 'assistant') {
+      if (layout.splitParts) {
+        queries.push(`SELECT m.id AS messageId, m.session_id AS sessionId, m.type AS role,
+          m.time_created AS createdAt, s.directory, s.parent_id AS parentId, p.data,
+          p.type AS partType, json_extract(p.data, '$.time.ran') AS startedAt, 0 AS storageOrder, p.ordinal
+          FROM session_message m JOIN session_v2 s ON s.id = m.session_id
+          JOIN session_part p ON p.message_id = m.id
+          WHERE m.type = 'assistant' AND p.type IN ('text', 'tool')`);
+      }
+      // Native history reads ordered split parts before any remaining inline
+      // content. Both can exist when an older build resumes a split message.
+      queries.push(`SELECT m.id AS messageId, m.session_id AS sessionId, m.type AS role,
+        m.time_created AS createdAt, s.directory, s.parent_id AS parentId, p.value AS data,
+        json_extract(p.value, '$.type') AS partType, json_extract(p.value, '$.time.ran') AS startedAt,
+        1 AS storageOrder, CAST(p.key AS INTEGER) AS ordinal
+        FROM session_message m JOIN session_v2 s ON s.id = m.session_id, json_each(m.data, '$.content') p
+        WHERE m.type = 'assistant' AND json_extract(p.value, '$.type') IN ('text', 'tool')`);
+    }
+    // Tool outputs may be user-authored files; project only model input and its call time.
+    const statement = database.prepare(`SELECT messageId, sessionId, role, createdAt, directory, parentId,
+        CASE WHEN partType = 'tool' THEN json_object(
+          'type', 'tool', 'status', json_extract(data, '$.state.status'),
+          'input', json_extract(data, '$.state.input'), 'startedAt', startedAt)
+          ELSE data END AS data
+      FROM (${queries.join('\nUNION ALL\n')}) ORDER BY createdAt, messageId, storageOrder, ordinal`);
+    try {
+      // The query keeps each message's split and inline parts together. Retain
+      // only that message instead of materializing the entire native history.
+      let message: OpenCodePart[] = [];
+      for (const part of streamRows(statement, ...parameters) as Iterable<OpenCodePart>) {
+        if (message.length && message[0].messageId !== part.messageId) {
+          yield message;
+          message = [];
+        }
+        message.push(part);
+      }
+      if (message.length) yield message;
+    } finally {
+      // Bun can leave an iterate() cursor active after an early return.
+      statement.finalize();
+    }
   } finally {
     database.close();
   }
@@ -548,25 +730,28 @@ export function createOpenCodeReader(): AgentPromptReader {
       return { detected: database !== null, sources: presentSources([database]) };
     },
     async readPrompts(transcript, sink, sinceEpochMs) {
-      for (const { first, text } of groupOpenCodeMessages(readOpenCodeParts(transcript.path, 'user'), true)) {
-        sink.session(first.sessionId);
-        if (first.parentId || !text || first.createdAt < sinceEpochMs) continue;
-        sink.prompt({ agent: 'opencode', sessionId: first.sessionId, nativePromptId: first.messageId, at: first.createdAt, cwd: first.directory || null, text });
+      for (const parts of readOpenCodeMessages(transcript.path, 'user')) {
+        for (const { first, text } of groupOpenCodeMessages(parts, true)) {
+          sink.session(first.sessionId);
+          if (first.parentId || !text || first.createdAt < sinceEpochMs) continue;
+          sink.prompt({ agent: 'opencode', sessionId: first.sessionId, nativePromptId: first.messageId, at: first.createdAt, cwd: first.directory || null, text });
+        }
       }
     },
     async readAgentText(transcript, add) {
-      const parts = readOpenCodeParts(transcript.path, 'assistant');
-      for (const { first, text } of groupOpenCodeMessages(parts, false)) {
-        add(Math.floor(first.createdAt / 1000), text);
-      }
-      for (const part of parts) {
-        const data = parseLine(part.data);
-        if (data?.type !== 'tool' || !['running', 'completed', 'error'].includes(data.status)
-          || typeof data.startedAt !== 'number' || !Number.isFinite(data.startedAt) || data.startedAt < 0
-          || !data.input || typeof data.input !== 'object' || Array.isArray(data.input)) continue;
-        const raw = JSON.stringify(data.input);
-        add(Math.floor(data.startedAt / 1000), raw);
-        addJsonStringText(raw, text => add(Math.floor(data.startedAt / 1000), text));
+      for (const parts of readOpenCodeMessages(transcript.path, 'assistant')) {
+        for (const { first, text } of groupOpenCodeMessages(parts, false)) {
+          add(Math.floor(first.createdAt / 1000), text);
+        }
+        for (const part of parts) {
+          const data = parseLine(part.data);
+          if (data?.type !== 'tool' || !['running', 'completed', 'error'].includes(data.status)
+            || typeof data.startedAt !== 'number' || !Number.isFinite(data.startedAt) || data.startedAt < 0
+            || !data.input || typeof data.input !== 'object' || Array.isArray(data.input)) continue;
+          const raw = JSON.stringify(data.input);
+          add(Math.floor(data.startedAt / 1000), raw);
+          addJsonStringText(raw, text => add(Math.floor(data.startedAt / 1000), text));
+        }
       }
     },
   };

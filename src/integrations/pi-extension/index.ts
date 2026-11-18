@@ -9,6 +9,7 @@
  */
 import { Type, type TSchema } from 'typebox';
 import { createHarnessWorkerClient } from '../harness-worker.js';
+import { stripMemoryTags } from '../../utils/tag-stripping.js';
 
 interface PiMessage {
   role?: string;
@@ -78,10 +79,26 @@ export function extractTextContent(content: unknown): string {
     .map(block => block.text).join('\n');
 }
 
+// The worker's file evidence and shell filters use these canonical names.
+// Pi's native file tools call the path argument `path`.
+const CAPTURE_TOOL_NAMES = new Map([
+  ['read', 'Read'], ['write', 'Write'], ['edit', 'Edit'], ['bash', 'Bash'],
+]);
+
+function captureToolInput(toolName: string, input: unknown): unknown {
+  if (!['read', 'write', 'edit'].includes(toolName)
+    || !input || typeof input !== 'object' || Array.isArray(input)) return input;
+  const fields = input as Record<string, unknown>;
+  if (typeof fields.file_path === 'string' && fields.file_path.length > 0) return input;
+  return typeof fields.path === 'string' ? { ...fields, file_path: fields.path } : input;
+}
+
 export default function claudeMemPi(pi: PiExtensionAPI): void {
   const worker = createHarnessWorkerClient();
   let current: Session | undefined;
   let notificationShown = false;
+  const ownsCapture = (session: Session, ctx: PiContext): boolean =>
+    current === session && ctx.sessionManager.getSessionId() === session.id && ctx.cwd === session.cwd;
   const warn = (ctx: PiContext, error: unknown): void => {
     if (!notificationShown && ctx.hasUI && ctx.ui) {
       ctx.ui.notify('Claude-Mem is unavailable. Run npx claude-mem doctor. ' + String(error), 'warning');
@@ -89,6 +106,9 @@ export default function claudeMemPi(pi: PiExtensionAPI): void {
     }
   };
   const enqueue = (session: Session, ctx: PiContext, task: () => Promise<void>): Promise<void> => {
+    // Ownership is checked when work is admitted, not when it runs: admitted
+    // work posts under its own session id and cwd, so an old session's last
+    // observations and summary still land after a switch.
     session.queue = session.queue.then(task).catch(error => warn(ctx, error));
     return session.queue;
   };
@@ -115,7 +135,7 @@ export default function claudeMemPi(pi: PiExtensionAPI): void {
 
   const resetTurn = (_event: PiEvent, ctx: PiContext): Promise<void> | undefined => {
     const session = current;
-    if (!session) return;
+    if (!session || !ownsCapture(session, ctx)) return;
     return enqueue(session, ctx, async () => {
       session.entryId = undefined;
       session.initialized = false;
@@ -151,8 +171,7 @@ export default function claudeMemPi(pi: PiExtensionAPI): void {
     // request's prompt is therefore the user message carrying the persisted
     // entry's timestamp, not whichever user message comes last.
     const selectEntry = (): { entry: PiSessionEntry; prompt: string } | undefined => {
-      if (current !== session || ctx.sessionManager.getSessionId() !== session.id || ctx.cwd !== session.cwd
-        || typeof ctx.sessionManager.getBranch !== 'function') return;
+      if (!ownsCapture(session, ctx) || typeof ctx.sessionManager.getBranch !== 'function') return;
       const branch = ctx.sessionManager.getBranch();
       if (!Array.isArray(branch)) return;
       const entry = [...branch].reverse().find(item => item.type === 'message' && item.message?.role === 'user');
@@ -233,26 +252,33 @@ export default function claudeMemPi(pi: PiExtensionAPI): void {
   pi.on('tool_result', (event, ctx) => {
     const telemetryToolEpochMs = Date.now();
     const session = current;
-    if (!session || !event.toolName || event.toolName.startsWith('mem_')) return;
-    const text = extractTextContent(event.content);
+    if (!session || !ownsCapture(session, ctx) || !event.toolName || event.toolName.startsWith('mem_')) return;
+    // Strip complete private/context regions before the size cap can remove
+    // their closing tag and make the worker see an ordinary unclosed tag.
+    const text = stripMemoryTags(extractTextContent(event.content));
+    const toolName = CAPTURE_TOOL_NAMES.get(event.toolName) ?? event.toolName;
+    const toolInput = captureToolInput(event.toolName, event.input);
     return enqueue(session, ctx, async () => {
       if (!session.anchored || session.excluded) return;
       await worker.post('/api/sessions/observations', {
         contentSessionId: session.id, cwd: session.cwd, platformSource: 'pi',
-        tool_name: event.toolName, tool_input: event.input,
-        tool_response: text.slice(0, 100_000), tool_use_id: event.toolCallId,
+        tool_name: toolName, tool_input: toolInput,
+        tool_response: event.isError === true
+          ? { is_error: true, error: text.slice(0, 100_000) }
+          : text.slice(0, 100_000),
+        tool_use_id: event.toolCallId,
         telemetryToolEpochMs,
       });
     });
   });
-  pi.on('message_end', (event) => {
-    if (current && event.message?.role === 'assistant') {
+  pi.on('message_end', (event, ctx) => {
+    if (current && ownsCapture(current, ctx) && event.message?.role === 'assistant') {
       current.lastAssistant = extractTextContent(event.message.content);
     }
   });
   const summarize = (_event: PiEvent, ctx: PiContext): Promise<void> | undefined => {
     const session = current;
-    if (!session) return;
+    if (!session || !ownsCapture(session, ctx)) return;
     return enqueue(session, ctx, async () => {
       if (!session.anchored || session.excluded || !session.needsSummary) return;
       await worker.post('/api/sessions/summarize', {

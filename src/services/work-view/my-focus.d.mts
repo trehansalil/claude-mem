@@ -11,14 +11,17 @@ export interface FocusArea {
   about: string | null; status: FocusAreaStatus;
   priorityRank: number | null; ownerRank: number | null; source: FocusAreaSource;
   mergedInto: string | null; evidence: string | null; decidedBy: FocusAreaDecidedBy; savedAt: string | null;
+  /** When the row that marked it done was written (ISO); null unless it is done. A later rename or goal edit keeps it. */
+  doneAt: string | null;
 }
-export function focusAreaRowFields(area: Omit<FocusArea, 'savedAt' | 'about'> & { about?: string | null }): Record<string, string | number | null>;
+export function focusAreaRowFields(area: Omit<FocusArea, 'savedAt' | 'doneAt' | 'about'> & { about?: string | null }): Record<string, string | number | null>;
 export function placementRowFields(placement: {
   anchorConversationKey: string; focusAreaId: string; placedBy: 'router' | 'owner'; confidence?: number | null; basis?: string | null; evidence?: string | null;
 }): Record<string, string | number | null>;
 export function newFocusAreaId(): string;
 export interface MinedFocusArea { name: string; goal: string; rank: number; matches: string | null; evidence: string }
-export function ownerGoalsAreaRows(minedAreas: MinedFocusArea[], savedAreas: FocusArea[], newId?: (index: number) => string): {
+export function ownerGoalsSaveKey(areas: MinedFocusArea[], nonce?: string): string;
+export function ownerGoalsAreaRows(minedAreas: MinedFocusArea[], savedAreas: FocusArea[], newId?: (index: number) => string, retry?: { key: string; scope: string }): {
   rows: Array<Record<string, string | number | null>>; focusAreaIds: string[];
 };
 export interface PlacementSide { focusAreaId: string; basis: string | null; evidence: string | null; device: string | null }

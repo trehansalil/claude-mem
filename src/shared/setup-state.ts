@@ -1,39 +1,27 @@
 // The install funnel's state, shared by the worker (which the setup page talks to) and the installer (which waits
 // on it). One file per machine: the funnel shows until `status` is `complete`, for new installs and upgrades alike.
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { isCmemGatewayUrl } from './cmem-gateway.js';
 import { resolveDataDir } from './paths.js';
 import { randomUUID } from 'node:crypto';
-import { isSetupId, type SetupTelemetryContext } from './setup-funnel.js';
+import type { SetupInstallState } from './setup-install.js';
+import {
+  isSetupId, type SetupBranch, type SetupCheckoutState, type SetupInstallerStage, type SetupMemoryBilling,
+  type SetupStatus, type SetupTelemetryContext,
+} from './setup-funnel.js';
 
-export type SetupBranch = 'home' | 'go';
-/** Who generates memories: CMEM Pro (hosted) or the person's own token plan. */
-export type SetupMemoryBilling = 'hosted' | 'existing';
-
-/**
- * What the installer has done with the browser's choice. Phase 8 (checkout) picks up from `go-awaiting-checkout`:
- * the installer holds the started pairing in memory and waits for the checkout request.
- */
-export type SetupInstallerStage =
-  | 'waiting-for-choice'
-  | 'home-ready'
-  | 'go-kept-existing-pro'
-  | 'go-awaiting-checkout'
-  | 'failed';
+// The states themselves are defined in setup-funnel.ts, which the setup page can also load.
+export type { SetupBranch, SetupCheckoutState, SetupInstallerStage, SetupMemoryBilling, SetupStatus };
 
 export interface SetupChoice { branch: SetupBranch; memoryBilling: SetupMemoryBilling; chosenAt: string }
 export interface SetupInstallerReport { stage: SetupInstallerStage; error: string | null; updatedAt: string }
-
-/**
- * On The Go checkout (funnel Phase 8). The page asks (`requested`, counted so a second ask reopens the checkout);
- * the installer runs the existing pairing checkout and reports `waiting`, then `paid` or `failed`.
- */
-export type SetupCheckoutState = 'requested' | 'waiting' | 'paid' | 'failed';
 export interface SetupCheckout { state: SetupCheckoutState; requests: number; error: string | null; updatedAt: string }
 
 export interface SetupStateFile {
-  status: 'pending' | 'complete';
+  status: SetupStatus;
+  /** Present when the installer offers agent and integration configuration in the browser. */
+  install?: SetupInstallState | null;
   choice: SetupChoice | null;
   installer: SetupInstallerReport | null;
   checkout: SetupCheckout | null;
@@ -117,6 +105,7 @@ export function readSetupState(path: string = setupStatePath()): SetupStateFile 
   }
   return {
     status: parsed.status,
+    ...(parsed.install ? { install: parsed.install } : {}),
     choice: parsed.choice ?? null,
     installer: parsed.installer ?? null,
     checkout: parsed.checkout ?? null,
@@ -132,9 +121,16 @@ export function writeSetupState(state: SetupStateFile, path: string = setupState
 
 function writeJsonAtomically(path: string, value: unknown): void {
   mkdirSync(dirname(path), { recursive: true });
-  const temp = `${path}.${process.pid}.tmp`;
-  writeFileSync(temp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
-  renameSync(temp, path);
+  const temp = `${path}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(temp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
+    renameSync(temp, path);
+  } catch (error) {
+    // A failed write or rename (Windows EPERM/EBUSY while the target is held)
+    // would otherwise leave this randomly named temp behind on every attempt.
+    try { unlinkSync(temp); } catch { /* the temp may not exist */ }
+    throw error;
+  }
 }
 
 const filled = (value: unknown): boolean => typeof value === 'string' && value.trim().length > 0;

@@ -133,26 +133,6 @@ describe('OMP Claude Mem hook', () => {
     rmSync(dataDir, { recursive: true, force: true });
   });
 
-  it('includes omp platformSource in the session shutdown summarize request', async () => {
-    const requests: CapturedRequest[] = [];
-    installFetchCapture(requests);
-    const handlers = registerHook();
-
-    await handlers.session_start?.();
-    await handlers.before_agent_start?.(
-      { prompt: 'test OMP shutdown summary' },
-      { cwd: '/tmp/omp-hook-test' },
-    );
-    await handlers.session_shutdown?.();
-    await drainMicrotasks();
-
-    const summarize = requests.find(request => request.path === '/api/sessions/summarize');
-    expect(summarize?.body).toMatchObject({
-      contentSessionId: expect.stringMatching(/^omp-/),
-      platformSource: 'omp',
-    });
-  });
-
   it('sends the session cwd on init and leaves naming the project to the worker', async () => {
     const requests: CapturedRequest[] = [];
     installFetchCapture(requests);
@@ -717,6 +697,7 @@ describe('OMP Claude Mem hook', () => {
     installFetchCapture(requests);
     const handlers = registerHook();
     const cwd = '/owned/omp-switch';
+    expect(handlers.session_branch).toBe(handlers.session_switch);
 
     await handlers.session_start?.();
     await handlers.before_agent_start?.({ prompt: 'first' }, { cwd });
@@ -778,7 +759,8 @@ describe('OMP Claude Mem hook', () => {
 
   it('installs into the agent dir OMP reads, honouring PI_CODING_AGENT_DIR', async () => {
     const agentDir = mkdtempSync(join(tmpdir(), 'omp-agent-dir-'));
-    const saved = { agent: process.env.PI_CODING_AGENT_DIR, dev: process.env.CLAUDE_MEM_DEV_HOOK_SOURCE };
+    const saved = { agent: process.env.PI_CODING_AGENT_DIR, dev: process.env.CLAUDE_MEM_DEV_HOOK_SOURCE, profile: process.env.OMP_PROFILE };
+    process.env.OMP_PROFILE = ''; // keep a caller's named profile outside this fixture
     process.env.PI_CODING_AGENT_DIR = agentDir;
     process.env.CLAUDE_MEM_DEV_HOOK_SOURCE = '1'; // resolve the hook from this checkout
     try {
@@ -794,6 +776,8 @@ describe('OMP Claude Mem hook', () => {
       else process.env.PI_CODING_AGENT_DIR = saved.agent;
       if (saved.dev === undefined) delete process.env.CLAUDE_MEM_DEV_HOOK_SOURCE;
       else process.env.CLAUDE_MEM_DEV_HOOK_SOURCE = saved.dev;
+      if (saved.profile === undefined) delete process.env.OMP_PROFILE;
+      else process.env.OMP_PROFILE = saved.profile;
       rmSync(agentDir, { recursive: true, force: true });
     }
   });

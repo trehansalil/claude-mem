@@ -9,10 +9,10 @@ import {
   createCorsMiddleware,
   createForeignPageDeleteGuard,
   createMiddleware,
-  createRemoteReadOnlyGuard,
+  createLocalApiTokenGuard,
   createWorkerHostGuard,
   requireLocalhost,
-  type RemoteReadOnlyOptions,
+  type LocalApiTokenOptions,
   type WorkerOriginPolicy,
 } from '../worker/http/middleware.js';
 import { errorHandler, notFoundHandler } from './ErrorHandler.js';
@@ -27,6 +27,7 @@ import type { ObservationQueueHealth } from '../../server/queue/queue-health-typ
 import type { ChromaCrashState } from '../sync/ChromaMcpManager.js';
 import { clearWindowsListenSocketInherit } from '../../shared/windows-listen-socket.js';
 import { TERMINAL_INIT_PHASES, type InitPhaseSource, type InitPhaseState } from './init-phase.js';
+import { RUNTIME_SKILLS } from '../../shared/runtime-skills.js';
 
 /**
  * Keep-alive comment cadence on GET /api/ready. Clients treat 5 s of silence
@@ -35,7 +36,7 @@ import { TERMINAL_INIT_PHASES, type InitPhaseSource, type InitPhaseState } from 
  */
 const READY_STREAM_PING_INTERVAL_MS = 2000;
 
-const INSTRUCTIONS_BASE_DIR: string = path.resolve(__dirname, '../skills/mem-search');
+const INSTRUCTIONS_BASE_DIR: string = path.resolve(__dirname, '../skills', RUNTIME_SKILLS.memSearch);
 const INSTRUCTIONS_OPERATIONS_DIR: string = path.join(INSTRUCTIONS_BASE_DIR, 'operations');
 const INSTRUCTIONS_SKILL_PATH: string = path.join(INSTRUCTIONS_BASE_DIR, 'SKILL.md');
 
@@ -141,14 +142,13 @@ export interface ServerOptions {
   // the in-plugin worker runtime is unchanged; the server runtime sets it.
   securityHeaders?: boolean;
   /**
-   * Observation TV remote broadcast. When present, a guard runs BEFORE every
-   * other middleware and route: loopback requests are untouched, and non-loopback
-   * requests may reach only /tv, /tv.html, /stream and GET /api/observations, and
-   * only with the shared secret. Absent (the default, and the server runtime's
-   * choice — it has its own API-key auth) ⇒ nothing is mounted and behavior is
-   * unchanged.
+   * Local API token mode (#5141). When present, a guard runs before everything else
+   * and refuses every request without the token, loopback too, except the exact
+   * routes in shared/local-api-token.ts. A browser page opened with `?token=` keeps
+   * working: see createLocalApiTokenGuard. Absent (the default, and the server
+   * runtime's choice) ⇒ nothing is mounted and behavior is unchanged.
    */
-  remoteReadOnly?: RemoteReadOnlyOptions;
+  localApiToken?: LocalApiTokenOptions;
   /**
    * Worker only: trusted browser origins and Host names (plan-23 step 4). When
    * present, a DNS-rebinding Host check runs before CORS, and CORS also admits
@@ -214,7 +214,7 @@ export class Server {
     // the express.static mount (setupMiddleware), /api/admin/* (setupCoreRoutes)
     // and every route registered later all mount after this point. Anything
     // mounted afterwards leaves earlier routes uncovered.
-    this.setupRemoteReadOnlyGuard();
+    this.setupLocalApiTokenGuard();
     this.setupSecurityHeaders();
     this.setupCors();
     this.setupPreBodyParserRoutes();
@@ -299,14 +299,11 @@ export class Server {
   async close(): Promise<void> {
     if (!this.server) return;
 
-    this.server.closeAllConnections();
-
-    if (process.platform === 'win32') {
-      await new Promise(r => setTimeout(r, 500));
-    }
-
     await new Promise<void>((resolve, reject) => {
+      // Stop accepting connections before the sweep, so a reconnecting stream
+      // cannot arrive afterward and keep close() waiting indefinitely.
       this.server!.close(err => err ? reject(err) : resolve());
+      this.server!.closeAllConnections();
     });
 
     if (process.platform === 'win32') {
@@ -329,10 +326,10 @@ export class Server {
 
   private setupMiddleware(): void {
     // Idle-exit request tracking, ahead of the body parsers and every route
-    // registered from here on. The remote read-only guard, security headers,
+    // registered from here on. The local API token guard, security headers,
     // host/CORS guards and the /api/auth routes mount before it (position
-    // zero belongs to the read-only guard), so a request that only they
-    // answer is not counted; none of those stays open.
+    // zero belongs to the token guard), so a request that only they answer
+    // is not counted; none of those stays open.
     this.app.use((_req: Request, res: Response, next: () => void) => {
       this.trackRequestActivity(res);
       next();
@@ -341,11 +338,11 @@ export class Server {
     middlewares.forEach(mw => this.app.use(mw));
   }
 
-  private setupRemoteReadOnlyGuard(): void {
-    if (!this.options.remoteReadOnly) {
+  private setupLocalApiTokenGuard(): void {
+    if (!this.options.localApiToken) {
       return;
     }
-    this.app.use(createRemoteReadOnlyGuard(this.options.remoteReadOnly));
+    this.app.use(createLocalApiTokenGuard(this.options.localApiToken));
   }
 
   private setupSecurityHeaders(): void {
@@ -395,12 +392,28 @@ export class Server {
     let pingTimer: ReturnType<typeof setInterval> | null = null;
 
     const socket = req.socket;
-    const cleanup = () => {
+    const stopUpdates = () => {
       finished = true;
       if (pingTimer !== null) { clearInterval(pingTimer); pingTimer = null; }
       if (unsubscribe !== null) { unsubscribe(); unsubscribe = null; }
+    };
+    const cleanup = () => {
+      stopUpdates();
       res.off('close', cleanup);
+      res.off('error', onError);
       socket.off('close', cleanup);
+    };
+    const onError = () => {
+      stopUpdates();
+      // Retain the error listener until close: already queued failed writes
+      // must not become unhandled errors while the transport is closing.
+      if (!res.destroyed) res.destroy();
+    };
+    const write = (frame: string): boolean => {
+      if (finished) return false;
+      if (res.destroyed || res.writableEnded) { stopUpdates(); return false; }
+      try { res.write(frame); return true; }
+      catch { onError(); return false; }
     };
 
     const send = (state: InitPhaseState) => {
@@ -412,10 +425,12 @@ export class Server {
         version: BUILT_IN_VERSION,
         pid: process.pid,
       };
-      res.write(`event: phase\ndata: ${JSON.stringify(payload)}\n\n`);
+      // A subscriber's failed transport cannot throw through the phase
+      // tracker and turn an otherwise healthy worker boot into a failure.
+      if (!write(`event: phase\ndata: ${JSON.stringify(payload)}\n\n`)) return;
       if (TERMINAL_INIT_PHASES.includes(state.phase)) {
-        cleanup();
-        res.end();
+        stopUpdates();
+        try { res.end(); } catch { onError(); }
       }
     };
 
@@ -423,6 +438,7 @@ export class Server {
     // (only the socket closes), so listen to both. req 'close' is avoided: on
     // Node it can fire as soon as a GET body is consumed.
     res.on('close', cleanup);
+    res.on('error', onError);
     socket.on('close', cleanup);
     if (source) unsubscribe = source.subscribeInitPhase(send);
     send(readPhase());
@@ -430,7 +446,7 @@ export class Server {
 
     pingTimer = setInterval(() => {
       if (finished) return;
-      res.write(': ping\n\n');
+      if (!write(': ping\n\n')) return;
       // Without a transition source, the ping tick is the only time the
       // derived phase can be re-read.
       if (!source) send(readPhase());

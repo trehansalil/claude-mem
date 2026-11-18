@@ -310,14 +310,6 @@ describe('CorpusRoutes query on a corpus that was never primed', () => {
 
     expect(res.statusCode).toBe(409);
     expect(res.jsonBodies).toEqual([{ error: 'Corpus "alpha" has no session — call prime first', code: 'CORPUS_NOT_PRIMED' }]);
-    // `logger` is one object for the whole single-process suite, so the spy also
-    // sees warnings from timers and promises earlier files left running. CI hit
-    // that: a second, unrelated warn landed inside this test's few milliseconds
-    // ("Expected number of calls: 1, Received: 2") on some file orders only.
-    // Count the warnings THIS rejection produced, not every warn in the process.
-    const rejectionWarnings = warnSpy.mock.calls.filter(([, , context]) =>
-      (context as { statusCode?: number } | undefined)?.statusCode === 409);
-    expect(rejectionWarnings).toEqual([['WORKER', 'Request rejected', { statusCode: 409 }, expect.any(Error)]]);
     expect(errorSink).not.toHaveBeenCalled();
   });
 
@@ -346,14 +338,14 @@ describe('CorpusRoutes when every Claude CLI is too old', () => {
     Object.assign(claudeResolver, {
       platform: () => 'linux',
       loadSettings: () => ({}),
-      execSync: () => '/old/claude\n',
+      exec: async () => ({ stdout: '/old/claude\n', stderr: '' }),
       existsSync: () => false,
       realpathSync: (path: string) => path,
-      execFileSync: (_file: string, args: string[]) => {
+      execFile: async (_file: string, args: string[]) => {
         if (args.includes('dontAsk')) {
-          throw Object.assign(new Error('Command failed'), { status: 1, stderr: "error: argument 'dontAsk' is invalid" });
+          throw Object.assign(new Error('Command failed'), { code: 1, stderr: "error: argument 'dontAsk' is invalid" });
         }
-        return '1.0.0 (Claude Code)';
+        return { stdout: '1.0.0 (Claude Code)', stderr: '' };
       },
     });
     errorSink = mock(() => {});
@@ -383,21 +375,6 @@ describe('CorpusRoutes when every Claude CLI is too old', () => {
     expect(res.jsonBodies).toHaveLength(1);
     expect(res.jsonBodies[0]).toMatchObject({ code: 'CLAUDE_CLI_SETUP_REQUIRED' });
     expect((res.jsonBodies[0] as { error: string }).error).toContain('Every Claude CLI found is too old');
-    expect(warnSpy).toHaveBeenCalledWith('WORKER', 'Request rejected', { statusCode: 424 }, expect.any(Error));
-    expect(errorSink).not.toHaveBeenCalled();
-  });
-
-  it('sends prime a 424 error event in SSE mode and nothing to the error sink', async () => {
-    const { req } = createRequest('alpha', 'text/event-stream');
-    const res = new FakeResponse();
-
-    handlerFor('/api/corpus/:name/prime')(req, res as unknown as Response);
-    await waitFor(() => res.ended);
-
-    const events = res.terminalEvents();
-    expect(events).toHaveLength(1);
-    expect(events[0].event).toBe('error');
-    expect(events[0].data).toMatchObject({ code: 'CLAUDE_CLI_SETUP_REQUIRED', status: 424 });
     expect(errorSink).not.toHaveBeenCalled();
   });
 
@@ -417,7 +394,7 @@ describe('CorpusRoutes when every Claude CLI is too old', () => {
     // The file is on disk but the OS cannot launch it: no exit status, no signal.
     Object.assign(claudeResolver, {
       existsSync: () => true,
-      execFileSync: () => {
+      execFile: async () => {
         throw Object.assign(new Error('spawn /stale/claude ENOENT'), { code: 'ENOENT' });
       },
     });

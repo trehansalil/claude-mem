@@ -105,7 +105,7 @@ describe('kimiAdapter against Kimi Code payloads', () => {
 
   test('records the error of a PostToolUseFailure as the tool response', () => {
     const input = kimiAdapter.normalizeInput(fixture.payloads.PostToolUseFailure);
-    expect(input.toolResponse).toEqual(fixture.payloads.PostToolUseFailure.error);
+    expect(input.toolResponse).toEqual({ is_error: true, error: fixture.payloads.PostToolUseFailure.error });
     expect(input.hookEventName).toBe('PostToolUseFailure');
   });
 
@@ -164,21 +164,5 @@ describe('deriveKimiTranscriptPath', () => {
     writeFileSync(wire, '{}\n');
     expect(deriveKimiTranscriptPath('/etc/passwd')).toBeUndefined();
     expect(deriveKimiTranscriptPath(path.join(home, 'sessions', 'wd_proj_abc123', 'session_abc'))).toBeUndefined();
-  });
-
-  test('memoizes the result so repeated calls do not rescan the sessions directory', () => {
-    const home = makeScratchHome();
-    const wire = path.join(home, 'sessions', 'wd_proj_abc123', 'session_memo', 'agents', 'main', 'wire.jsonl');
-    mkdirSync(path.dirname(wire), { recursive: true });
-    writeFileSync(wire, '{}\n');
-
-    const first = deriveKimiTranscriptPath('session_memo');
-    expect(first).toBe(wire);
-
-    // Remove the file after the first lookup; a memoized result still returns
-    // the original path, while a non-memoized scan would return undefined.
-    rmSync(wire);
-    const second = deriveKimiTranscriptPath('session_memo');
-    expect(second).toBe(wire);
   });
 });

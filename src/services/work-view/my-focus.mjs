@@ -6,10 +6,11 @@
 // A placement is keyed by the request's anchor conversation key (the input groupIdFor
 // hashes), never by the local g_ id. Area ids are never derived from names, so a
 // rename keeps the id. Rows are append-only and replay in write order.
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { MAX_WORK_STATE_FIELDS_JSON_CHARS } from './work-state-limits.mjs';
 import { reduceWorkState } from './work-state-reduce.mjs';
 import { navWordIn } from './nav-words.mjs';
+import { doneAtAfterChange } from './focus-done-date.mjs';
 
 export const MY_FOCUS_LIST = 'my-focus';
 /** The permanent bucket for requests that fit no area. Never an area id. */
@@ -70,6 +71,14 @@ export function placementRowFields(placement) {
   }, 'placement');
 }
 
+/** A retry key is a nonce plus a commitment to the focus route's normalized payload. Fixed tuple
+ * order makes the commitment independent of JSON object property order. Keep the complete key for a
+ * save: using it with different areas is refused, rather than silently creating another set of ids. */
+export function ownerGoalsSaveKey(areas, nonce = randomBytes(12).toString('hex')) {
+  const tuples = areas.map(area => [area.name.trim(), area.goal.trim(), area.rank, area.matches?.trim() ?? null, area.evidence.trim()]);
+  return nonce + ':' + createHash('sha256').update(JSON.stringify(tuples)).digest('hex');
+}
+
 /** A new area id: random, like an owner-written rule's id (`own_` + 6 random bytes), never derived from
  * the name, so a rename keeps it. */
 export const newFocusAreaId = () => `fa_${randomBytes(6).toString('hex')}`;
@@ -91,7 +100,27 @@ export const newFocusAreaId = () => `fa_${randomBytes(6).toString('hex')}`;
  * is wrong, and guessing which area was meant would file the owner's words under the wrong one.
  * Returns the rows to write and each mined area's id, in the mined order.
  */
-export function ownerGoalsAreaRows(minedAreas, savedAreas, newId = newFocusAreaId) {
+export function ownerGoalsAreaRows(minedAreas, savedAreas, newId = newFocusAreaId, retry) {
+  if (retry) {
+    const nonce = retry.key.split(':')[0];
+    if (!/^[a-f0-9]{24}:[a-f0-9]{64}$/.test(retry.key) || ownerGoalsSaveKey(minedAreas, nonce) !== retry.key) {
+      throw new TypeError('The owner-goals save key does not match these focus areas.');
+    }
+    // The key commits to the whole normalized request. The worker supplies the owner/device scope;
+    // neither a lost reply nor a partially appended request needs a separate receipt to recover.
+    newId = index => 'fa_' + createHash('sha256').update(JSON.stringify(['owner-goals-v1', retry.scope, retry.key, index])).digest('hex');
+    const existing = new Map(savedAreas.map(area => [area.focusAreaId, area]));
+    minedAreas = minedAreas.map((area, index) => {
+      if (area.matches !== null) return area;
+      const id = newId(index), saved = existing.get(id);
+      if (!saved) return area;
+      if (saved.source !== 'owner-goals' || isWithdrawnArea(saved)) {
+        throw new TypeError('The saved owner-goals area cannot be reused: ' + id);
+      }
+      // An explicit match preserves owner renames, decisions and merges through the normal path below.
+      return { ...area, matches: id };
+    });
+  }
   // A withdrawn area (a seed undo) is not an area the owner has: a mined area never matches it.
   const savedById = new Map(savedAreas.filter((area) => !isWithdrawnArea(area)).map((area) => [area.focusAreaId, area]));
   const claimed = new Set();
@@ -172,11 +201,14 @@ export function buildFocusAreas(state, { localDeviceId = null } = {}) {
       if (focusAreaId === OTHER_FOCUS_AREA_ID) throw new Error(`A my-focus area row uses the reserved id "${OTHER_FOCUS_AREA_ID}".`);
       const decidedBy = event.fields.decided_by;
       if (!FOCUS_AREA_DECIDED_BY.includes(decidedBy)) throw new Error(`Focus area ${focusAreaId} has an unknown writer: ${decidedBy}`);
-      const area = areas.get(focusAreaId) ?? { fields: {}, ownerDecided: false, savedAt: null };
+      const area = areas.get(focusAreaId) ?? { fields: {}, ownerDecided: false, savedAt: null, doneAt: null };
       if (area.ownerDecided && decidedBy === 'system') continue;
+      const statusBefore = area.fields.status;
       applyPatch(area.fields, event.fields);
       if (decidedBy !== 'system') area.ownerDecided = decidedBy === 'owner';
       area.savedAt = event.at;
+      // When it was marked done: the row that moved it into done (the one rule, focus-done-date.mjs).
+      area.doneAt = doneAtAfterChange({ statusBefore, doneAtBefore: area.doneAt, statusAfter: area.fields.status, changedAt: event.at });
       areas.set(focusAreaId, area);
     } else if (event.task.startsWith(PLACEMENT_TASK_PREFIX)) {
       const anchor = text(event.fields.anchor_conversation_key) || event.task.slice(PLACEMENT_TASK_PREFIX.length);
@@ -193,7 +225,7 @@ export function buildFocusAreas(state, { localDeviceId = null } = {}) {
     }
   }
 
-  const focusAreas = [...areas].map(([focusAreaId, { fields, savedAt }]) => {
+  const focusAreas = [...areas].map(([focusAreaId, { fields, savedAt, doneAt }]) => {
     if (!text(fields.name)) throw new Error(`Focus area ${focusAreaId} has no name.`);
     if (!FOCUS_AREA_STATUSES.includes(fields.status)) throw new Error(`Focus area ${focusAreaId} has an unknown status: ${fields.status}`);
     if (!FOCUS_AREA_SOURCES.includes(fields.source)) throw new Error(`Focus area ${focusAreaId} has an unknown source: ${fields.source}`);
@@ -201,7 +233,7 @@ export function buildFocusAreas(state, { localDeviceId = null } = {}) {
       focusAreaId, name: text(fields.name), goal: text(fields.goal) || null, about: text(fields.about) || null, status: fields.status,
       priorityRank: rank(fields.priority_rank), ownerRank: rank(fields.owner_rank), source: fields.source,
       mergedInto: text(fields.merged_into) || null, evidence: text(fields.evidence) || null,
-      decidedBy: fields.decided_by, savedAt,
+      decidedBy: fields.decided_by, savedAt, doneAt,
     };
   })
     // The owner's order wins; areas they have not ordered follow by suggested priority.

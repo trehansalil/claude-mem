@@ -7,7 +7,7 @@ import { ChromaSync } from '../sync/ChromaSync.js';
 import { CloudSync, isCloudSyncConfigured } from '../sync/CloudSync.js';
 import { BackupManager } from '../backup/BackupManager.js';
 import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
-import { USER_SETTINGS_PATH, DB_PATH, DATA_DIR } from '../../shared/paths.js';
+import { USER_SETTINGS_PATH, DB_PATH, DATA_DIR, ensurePrivateDir } from '../../shared/paths.js';
 import { MediaStore } from '../media/store.js';
 import { MediaCloudClient, MediaCloudReplicaResolver, MediaCloudSync, mediaCloudUploadsEnabled } from '../media/cloud.js';
 import { cmemProOrigin } from '../../shared/cmem-gateway.js';
@@ -36,13 +36,25 @@ export class DatabaseManager {
   private mediaCloudSync: MediaCloudSync | null = null;
   private mediaReplicaResolver: MediaCloudReplicaResolver | null = null;
 
+  private rawSearchEnabled = false;
+  private rawSearchAbort = new AbortController();
+
+  async initializeToolUseSearch(): Promise<void> {
+    await this.sessionSearch?.configureToolUseIndex(this.rawSearchEnabled, this.rawSearchAbort.signal);
+  }
+
   async initialize(): Promise<void> {
+    // The runtime hands this manager an already-open database, so the SessionStore and SessionSearch
+    // constructors never take their path-based branch here. Tighten the directory that is about to
+    // hold the database, its WAL files and the settings before anything opens it.
+    ensurePrivateDir(DATA_DIR);
     // Guard before pragmas: journal_mode = WAL persistently rewrites the file,
     // so a database whose schema is newer than this binary's chain must be
     // refused before the shared open touches it (#3609 step 2).
     this.db = openGuardedSqliteDatabase(DB_PATH);
 
     const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
+    this.rawSearchEnabled = settings.CLAUDE_MEM_TOOL_USES_SEARCH_ENABLED === 'true';
     // Shared local work has an origin before credentials exist. Later cloud
     // configuration reuses this identity rather than orphaning its records.
     settings.CLAUDE_MEM_CLOUD_SYNC_DEVICE_ID = ensureLocalDeviceIdentity(this.db, USER_SETTINGS_PATH, settings.CLAUDE_MEM_CLOUD_SYNC_DEVICE_ID);
@@ -132,6 +144,10 @@ export class DatabaseManager {
   }
 
   async close(): Promise<void> {
+    // Stop any index build in flight, then arm a fresh signal: a busy init
+    // retry (db-init-retry.ts) calls initialize() again on this manager.
+    this.rawSearchAbort.abort();
+    this.rawSearchAbort = new AbortController();
     if (this.mediaCleanupTimer) clearInterval(this.mediaCleanupTimer);
     this.mediaCleanupTimer = null;
     this.mediaCloudSync?.stop();
@@ -146,7 +162,7 @@ export class DatabaseManager {
     this.syncRecoveryReader = null;
     this.syncConflictRecovery = null;
 
-    this.backupManager?.stop();
+    await this.backupManager?.stop();
     this.backupManager = null;
 
     this.sessionStore = null;

@@ -6,6 +6,7 @@
  * Antigravity CLI, OpenCode) instead of the script's two.
  */
 
+import { createHash } from 'node:crypto';
 import { stripMemoryTags } from '../../utils/tag-stripping.js';
 import { mkdirSync, writeFileSync } from 'fs';
 import { basename, join } from 'path';
@@ -29,8 +30,15 @@ export function promptMinute(epochMs: number): string {
 function section(prompt: OwnerPrompt, trim: boolean): string {
   let text = stripMemoryTags(prompt.text).trim();
   if (trim && text.length > MAXIMUM_KEPT_PROMPT_CHARACTERS) {
-    const trimmed = text.length - MAXIMUM_KEPT_PROMPT_CHARACTERS;
-    text = `${text.slice(0, MAXIMUM_KEPT_PROMPT_CHARACTERS)}\n\n[... ${trimmed} more characters, mostly pasted material, trimmed]`;
+    // Python's exporter counts Unicode code points, not UTF-16 units. Count
+    // without allocating an array for an arbitrarily long pasted prompt.
+    let characters = 0, end = 0;
+    for (const character of text) {
+      if (characters < MAXIMUM_KEPT_PROMPT_CHARACTERS) end += character.length;
+      characters++;
+    }
+    const trimmed = characters - MAXIMUM_KEPT_PROMPT_CHARACTERS;
+    if (trimmed > 0) text = `${text.slice(0, end)}\n\n[... ${trimmed} more characters, mostly pasted material, trimmed]`;
   }
   const project = prompt.cwd ? basename(prompt.cwd) : prompt.project || '?';
   return `## ${promptMinute(prompt.at)} · ${TOOL_NAMES[prompt.agent] ?? prompt.agent} · ${project}\nsession \`${prompt.sessionId.slice(0, 8)}\`\n\n${text}\n`;
@@ -41,7 +49,15 @@ function render(title: string, sections: string[]): string {
 }
 
 /** `newPrompts` counts the prompts from `sinceMinute` on (0 without it). */
-export interface OwnerPromptsFile { path: string; ownerPrompts: number; excludedAgentWritten: number; newPrompts: number }
+export interface OwnerPromptSection {
+  /** Exact source identity and content, not a minute or text-only deduplication key. */
+  key: string;
+  markdown: string;
+}
+export interface OwnerPromptsFile {
+  path: string; ownerPrompts: number; excludedAgentWritten: number; newPrompts: number;
+  sections?: OwnerPromptSection[];
+}
 
 /**
  * Reads the last `days` of every agent's transcripts and writes the two files into `folder`. With `sinceMinute`
@@ -60,10 +76,14 @@ export async function writeOwnerPromptsFile(options: {
   const result = await (options.scan ?? scanOwnerPrompts)({ ...options.scanOptions, sinceEpochMs: scanWindowStart(options.now ?? Date.now(), days) });
   mkdirSync(options.folder, { recursive: true });
   const path = join(options.folder, 'owner-prompts.md');
-  writeFileSync(path, render(`Owner prompts (typed by the owner, not written by an agent), last ${days} days`, result.ownerPrompts.map(prompt => section(prompt, true))), { mode: 0o600 });
+  const sections = result.ownerPrompts.map(prompt => ({
+    key: createHash('sha256').update(JSON.stringify([prompt.agent, prompt.sessionId, prompt.nativePromptId, prompt.at, prompt.cwd, prompt.project, prompt.text])).digest('hex'),
+    markdown: section(prompt, true),
+  }));
+  writeFileSync(path, render('Owner prompts (typed by the owner, not written by an agent), last ' + days + ' days', sections.map(prompt => prompt.markdown)), { mode: 0o600 });
   writeFileSync(join(options.folder, 'excluded-agent-written-prompts.md'), render('Excluded: prompts an agent wrote first (audit file)', result.agentWritten.map(prompt => section(prompt, false))), { mode: 0o600 });
   const since = options.sinceMinute;
   const newPrompts = since ? result.ownerPrompts.filter(prompt => promptMinute(prompt.at) >= since) : [];
   if (since) writeFileSync(join(options.folder, 'new-owner-prompts.md'), render(`Owner prompts since ${since}`, newPrompts.map(prompt => section(prompt, true))), { mode: 0o600 });
-  return { path, ownerPrompts: result.ownerPrompts.length, excludedAgentWritten: result.agentWritten.length, newPrompts: newPrompts.length };
+  return { path, ownerPrompts: result.ownerPrompts.length, excludedAgentWritten: result.agentWritten.length, newPrompts: newPrompts.length, sections };
 }

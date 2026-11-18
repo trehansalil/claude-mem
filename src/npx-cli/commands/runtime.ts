@@ -6,8 +6,9 @@ import { styleText } from 'node:util';
 import { ensureServerEmbedder, getBunPath, hasServerEmbedder } from '../install/setup-runtime.js';
 import { npmPackageRootDirectory } from '../utils/paths.js';
 import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
-import { resolvePluginRoot, buildWorkerUrl } from '../../shared/worker-utils.js';
+import { resolvePluginRoot, buildWorkerUrl, withWorkerAuth } from '../../shared/worker-utils.js';
 import { isConnectionRefusedError } from '../../shared/connection-errors.js';
+import { BUN_NO_AUTO_INSTALL_FLAG } from '../../shared/bun-auto-install.js';
 
 /**
  * The plugin root the worker spawns from — the shared resolveWorkerScript()
@@ -60,9 +61,12 @@ function packagePluginScriptPath(scriptName: string): string {
  * process with the child's exit code. `args[0]` is the script path. Sanitizes
  * host CLI bleed-through and Anthropic credentials before launch; credentials
  * are re-read from ~/.claude-mem/.env at SDK spawn time (#2357 / #2375).
+ * Bun's auto-install is off: the worker, server and transcript watcher can
+ * load sharp, which auto-install resolves to a wasm build that freezes on its
+ * first decode (#5601).
  */
 function spawnPlugin(bunPath: string, args: string[], cwd: string, startFailureLabel = 'Bun'): void {
-  const child = spawnHidden(bunPath, args, {
+  const child = spawnHidden(bunPath, [BUN_NO_AUTO_INSTALL_FLAG, ...args], {
     stdio: 'inherit',
     cwd,
     env: sanitizeEnv(process.env),
@@ -74,7 +78,7 @@ function spawnPlugin(bunPath: string, args: string[], cwd: string, startFailureL
   });
 
   child.on('close', (exitCode) => {
-    process.exit(exitCode ?? 0);
+    process.exit(exitCode ?? 1);
   });
 }
 
@@ -215,7 +219,6 @@ export function runMcpCommand(): void {
 
   const child = spawnHidden(process.execPath, [mcpScript], {
     stdio: 'inherit',
-    cwd: npmPackageRootDirectory(),
     env: sanitizeEnv(process.env),
   });
 
@@ -225,7 +228,7 @@ export function runMcpCommand(): void {
   });
 
   child.on('close', (exitCode) => {
-    process.exit(exitCode ?? 0);
+    process.exit(exitCode ?? 1);
   });
 }
 
@@ -249,13 +252,11 @@ export function runHookCommand(extraArgs: string[] = []): void {
   });
 
   child.on('close', (exitCode) => {
-    process.exit(exitCode ?? 0);
+    process.exit(exitCode ?? 1);
   });
 }
 
 export async function runSearchCommand(queryParts: string[]): Promise<void> {
-  pluginRootOrExit();
-
   const query = queryParts.join(' ').trim();
   if (!query) {
     console.error(styleText('red', 'Usage: npx claude-mem search <query>'));
@@ -266,7 +267,7 @@ export async function runSearchCommand(queryParts: string[]): Promise<void> {
 
   let response: Response;
   try {
-    response = await fetch(searchUrl);
+    response = await fetch(searchUrl, withWorkerAuth());
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
     if (isConnectionRefusedError(error)) {

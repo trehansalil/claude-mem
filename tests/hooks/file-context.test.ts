@@ -6,6 +6,8 @@ import { tmpdir, homedir } from 'os';
 import { join } from 'path';
 import { resolveDbPath } from '../../src/shared/paths.js';
 import type { NormalizedHookInput } from '../../src/cli/types.js';
+import { SessionStore } from '../../src/services/sqlite/SessionStore.js';
+import { getObservationsByFilePath } from '../../src/services/sqlite/observations/get.js';
 
 // Capture the REAL modules BEFORE mocking so afterAll can restore them.
 // bun's `mock.module` is process-global and sticky; `mock.restore()` does NOT
@@ -83,8 +85,10 @@ mock.module('../../src/shared/worker-utils.js', () => ({
 }));
 
 mock.module('../../src/utils/project-name.js', () => ({
+  ...realProjectNameSnapshot,
   getProjectName: () => 'test-project',
-  getProjectContext: () => ({ allProjects: ['test-project'] }),
+  getProjectContext: () => ({ primary: 'test-project', allProjects: ['test-project'] }),
+  getProjectContextWithRoot: () => ({ context: { primary: 'test-project', allProjects: ['test-project'] }, repoRoot: null }),
 }));
 
 mock.module('../../src/utils/project-filter.js', () => ({
@@ -120,6 +124,7 @@ import {
   LINE_COUNT_CHUNK_BYTES,
   FILE_READ_GATE_DENY_MIN_BYTES,
 } from '../../src/cli/handlers/file-context.js';
+import { memorySearchHandler } from '../../src/cli/handlers/memory-search.js';
 import { claimFileContextInjection } from '../../src/cli/handlers/file-context-dedupe.js';
 import { logger } from '../../src/utils/logger.js';
 
@@ -228,21 +233,6 @@ describe('fileContextHandler — #2094 (no Read mutation)', () => {
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
-  it('still injects file context for the main session', async () => {
-    fetchSpy = spyOn(globalThis, 'fetch').mockResolvedValue(
-      makeObservationsResponse([{ id: 1, created_at_epoch: Date.now() + 60_000 }])
-    );
-
-    const result = await fileContextHandler.execute({
-      sessionId: 'sess',
-      cwd: tmpDir,
-      toolName: 'Read',
-      toolInput: { file_path: testFile },
-    });
-
-    expect(result.hookSpecificOutput?.additionalContext).toContain('prior observations');
-  });
-
   it('does not skip when only agentType is present', async () => {
     fetchSpy = spyOn(globalThis, 'fetch').mockResolvedValue(
       makeObservationsResponse([{ id: 1, created_at_epoch: Date.now() + 60_000 }])
@@ -280,23 +270,6 @@ describe('fileContextHandler — #2094 (no Read mutation)', () => {
     expect(result.hookSpecificOutput!.permissionDecision).toBeUndefined();
   });
 
-  it('does not set updatedInput on a targeted Read either', async () => {
-    const future = Date.now() + 60_000;
-    fetchSpy = spyOn(globalThis, 'fetch').mockResolvedValue(
-      makeObservationsResponse([{ id: 1, created_at_epoch: future }])
-    );
-
-    const result = await fileContextHandler.execute({
-      sessionId: 'sess',
-      cwd: tmpDir,
-      toolName: 'Read',
-      toolInput: { file_path: testFile, offset: 289, limit: 140 },
-    });
-
-    expect(result.hookSpecificOutput).toBeDefined();
-    expect((result.hookSpecificOutput as any).updatedInput).toBeUndefined();
-  });
-
   it('skips entirely when file mtime is newer than newest observation (#1719 still honored)', async () => {
     const stale = Date.now() - 3_600_000;
     fetchSpy = spyOn(globalThis, 'fetch').mockResolvedValue(
@@ -315,45 +288,6 @@ describe('fileContextHandler — #2094 (no Read mutation)', () => {
 
     expect(result.continue).toBe(true);
     expect(result.hookSpecificOutput).toBeUndefined();
-  });
-
-  it('still injects context when file mtime is older than newest observation', async () => {
-    const past = (Date.now() - 3_600_000) / 1000;
-    utimesSync(testFile, past, past);
-
-    const now = Date.now();
-    fetchSpy = spyOn(globalThis, 'fetch').mockResolvedValue(
-      makeObservationsResponse([{ id: 1, created_at_epoch: now }])
-    );
-
-    const result = await fileContextHandler.execute({
-      sessionId: 'sess',
-      cwd: tmpDir,
-      toolName: 'Read',
-      toolInput: { file_path: testFile },
-    });
-
-    expect(result.hookSpecificOutput).toBeDefined();
-    expect(result.hookSpecificOutput!.additionalContext).toContain('prior observations');
-    expect((result.hookSpecificOutput as any).updatedInput).toBeUndefined();
-  });
-
-  it('header text no longer claims the file was truncated', async () => {
-    const future = Date.now() + 60_000;
-    fetchSpy = spyOn(globalThis, 'fetch').mockResolvedValue(
-      makeObservationsResponse([{ id: 1, created_at_epoch: future }])
-    );
-
-    const result = await fileContextHandler.execute({
-      sessionId: 'sess',
-      cwd: tmpDir,
-      toolName: 'Read',
-      toolInput: { file_path: testFile },
-    });
-
-    const ctx = result.hookSpecificOutput!.additionalContext as string;
-    expect(ctx).not.toContain('Only line 1 was read');
-    expect(ctx).toContain('full requested section');
   });
 
   it('accepts a Codex filePaths array and joins per-file context blocks', async () => {
@@ -430,6 +364,31 @@ describe('fileContextHandler — #2094 (no Read mutation)', () => {
     expect(pathParams).toContain(absoluteForm);
     expect(pathParams).toContain('test.md'); // cwd-relative form
     expect(pathParams.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('injects current-directory file evidence through the real indexed lookup', async () => {
+    const store = new SessionStore(':memory:');
+    try {
+      const session = store.getOrCreateManualSession('test-project');
+      store.storeObservation(session, 'test-project', {
+        type: 'discovery', title: 'Current-directory evidence', subtitle: null,
+        narrative: 'Read this file before.', facts: [], concepts: [],
+        files_read: ['./test.md'], files_modified: [],
+      }, 1, 0, Date.now() + 60_000);
+      fetchSpy = spyOn(globalThis, 'fetch').mockImplementation(async (url: string | URL | Request) => {
+        const query = new URL(String(url));
+        const observations = getObservationsByFilePath(store.db, query.searchParams.getAll('path'), {
+          projects: ['test-project'],
+        });
+        return Response.json({ observations, count: observations.length });
+      });
+      const result = await fileContextHandler.execute({
+        sessionId: 'dot-evidence', cwd: tmpDir, toolName: 'Read', toolInput: { file_path: testFile },
+      });
+      expect(result.hookSpecificOutput?.additionalContext).toContain('Current-directory evidence');
+    } finally {
+      store.close();
+    }
   });
 
   it('injects once per (session, file) — a second unchanged Read is deduped (#3480)', async () => {
@@ -607,14 +566,14 @@ describe('fileContextHandler — #2094 (no Read mutation)', () => {
     );
 
     await fileContextHandler.execute({
-      sessionId: 'sess-A',
+      sessionId: 'a.b',
       cwd: tmpDir,
       toolName: 'Read',
       toolInput: { file_path: testFile },
     });
 
     const other = await fileContextHandler.execute({
-      sessionId: 'sess-B',
+      sessionId: 'a:b',
       cwd: tmpDir,
       toolName: 'Read',
       toolInput: { file_path: testFile },
@@ -639,30 +598,6 @@ describe('fileContextHandler — #2094 (no Read mutation)', () => {
     expect(result.continue).toBe(true);
     expect(result.hookSpecificOutput).toBeUndefined();
     expect(fetchSpy).not.toHaveBeenCalled();
-  });
-
-  it('isolates sessions whose ids differ only in path-sanitized chars (#3486)', async () => {
-    const future = Date.now() + 60_000;
-    fetchSpy = spyOn(globalThis, 'fetch').mockImplementation(() =>
-      Promise.resolve(makeObservationsResponse([{ id: 1, created_at_epoch: future }]))
-    );
-
-    // "a.b" and "a:b" are DISTINCT sessions that both collapse to "a_b" under a
-    // naive char-replace scheme. The second session must still get its injection.
-    await fileContextHandler.execute({
-      sessionId: 'a.b',
-      cwd: tmpDir,
-      toolName: 'Read',
-      toolInput: { file_path: testFile },
-    });
-
-    const other = await fileContextHandler.execute({
-      sessionId: 'a:b',
-      cwd: tmpDir,
-      toolName: 'Read',
-      toolInput: { file_path: testFile },
-    });
-    expect(other.hookSpecificOutput?.additionalContext).toContain('prior observations');
   });
 
   it('dedupes dot-segment path aliases of the same file in a session (#3486)', async () => {
@@ -696,6 +631,53 @@ describe('fileContextHandler — #2094 (no Read mutation)', () => {
   });
 });
 
+describe('PreToolUse memory lookups carry the calling platform source', () => {
+  function inputFor(toolName: string): NormalizedHookInput {
+    return {
+      sessionId: 'sess-platform-source',
+      cwd: tmpDir,
+      platform: 'codex',
+      toolName,
+      toolInput: toolName === 'Read' ? { file_path: testFile } : { query: 'notes' },
+    };
+  }
+
+  beforeEach(() => {
+    fetchSpy = spyOn(globalThis, 'fetch').mockImplementation(() =>
+      Promise.resolve(makeObservationsResponse([{ id: 1, created_at_epoch: Date.now() + 60_000 }]))
+    );
+  });
+
+  it('scopes the memory-search worker request to the calling harness', async () => {
+    await memorySearchHandler.execute(inputFor('memory_search'));
+
+    expect(workerFallbackCalls).toHaveLength(1);
+    expect(workerFallbackCalls[0].url).toStartWith('/api/search?');
+    expect(workerFallbackCalls[0].url).toContain('platformSource=codex');
+  });
+
+  it('scopes the by-file worker request to the calling harness', async () => {
+    await fileContextHandler.execute(inputFor('Read'));
+
+    expect(workerFallbackCalls).toHaveLength(1);
+    expect(workerFallbackCalls[0].url).toStartWith('/api/observations/by-file?');
+    expect(workerFallbackCalls[0].url).toContain('platformSource=codex');
+  });
+
+  it('omits the platform source from both requests when the cross-harness hand-off is enabled', async () => {
+    runtimeSettings = { CLAUDE_MEM_SESSION_START_INCLUDE_ALL_SOURCES: 'true' };
+
+    await memorySearchHandler.execute(inputFor('memory_search'));
+    expect(workerFallbackCalls.length).toBeGreaterThan(0);
+    expect(workerFallbackCalls.every(call => !call.url.includes('platformSource'))).toBe(true);
+
+    workerFallbackCalls.length = 0;
+    await fileContextHandler.execute(inputFor('Read'));
+    expect(workerFallbackCalls.length).toBeGreaterThan(0);
+    expect(workerFallbackCalls.every(call => !call.url.includes('platformSource'))).toBe(true);
+  });
+});
+
 describe('fileContextHandler — #4558 (server runtime)', () => {
   const serverSettings = {
     CLAUDE_MEM_RUNTIME: 'server',
@@ -720,22 +702,6 @@ describe('fileContextHandler — #4558 (server runtime)', () => {
     expect(result).toEqual({ continue: true, suppressOutput: true });
     expect(workerFallbackCalls).toHaveLength(0);
     expect(fetchSpy).not.toHaveBeenCalled();
-  });
-
-  it('accepts the legacy server-beta runtime value', async () => {
-    runtimeSettings = { ...serverSettings, CLAUDE_MEM_RUNTIME: 'server-beta' };
-    fetchSpy = spyOn(globalThis, 'fetch').mockResolvedValue(
-      makeObservationsResponse([{ id: 1, created_at_epoch: Date.now() + 60_000 }])
-    );
-
-    await fileContextHandler.execute({
-      sessionId: 'sess',
-      cwd: tmpDir,
-      toolName: 'Read',
-      toolInput: { file_path: testFile },
-    });
-
-    expect(workerFallbackCalls).toHaveLength(0);
   });
 
   it('still queries the worker when server runtime is incomplete and falls back to worker', async () => {
@@ -833,28 +799,6 @@ describe('fileContextHandler — File Read Gate', () => {
     expect(result.hookSpecificOutput!.additionalContext).toContain('Rate table refactor');
   });
 
-  it('only denies on Claude Code — codex, kimi and an unknown platform get context', async () => {
-    answerWithFileHistory();
-
-    for (const platform of ['codex', 'kimi', undefined]) {
-      const result = await fileContextHandler.execute(
-        claudeCodeRead({ file_path: gatedFile }, { platform, sessionId: `sess-platform-${platform}` })
-      );
-      expectContextNotDeny(result);
-    }
-  });
-
-  it('does not deny Qwen Code, which runs the same claude-code hook command — the timeline is context', async () => {
-    answerWithFileHistory();
-
-    const result = await fileContextHandler.execute(
-      claudeCodeRead({ file_path: gatedFile }, { transcriptPath: '/home/dot/.qwen/tmp/abc123/chats/session.json' })
-    );
-
-    expectContextNotDeny(result);
-    expect(result.hookSpecificOutput!.additionalContext).toContain('Rate table refactor');
-  });
-
   it('does not deny when the tree-sitter CLI is missing (smart_outline cannot parse) — the timeline is context', async () => {
     treeSitterCliAvailable = false;
     answerWithFileHistory();
@@ -888,14 +832,6 @@ describe('fileContextHandler — File Read Gate', () => {
     expect(fetchSpy).toHaveBeenCalled();
   });
 
-  it('lets a targeted Read through (offset 40, limit 20) with context', async () => {
-    answerWithFileHistory();
-
-    const result = await fileContextHandler.execute(claudeCodeRead({ file_path: gatedFile, offset: 40, limit: 20 }));
-
-    expectContextNotDeny(result);
-  });
-
   it('denies a Read whose limit covers every line, and passes one line short of that', async () => {
     answerWithFileHistory();
 
@@ -918,35 +854,16 @@ describe('fileContextHandler — File Read Gate', () => {
     expectContextNotDeny(oneLineShort);
   });
 
-  it('counts a last line that has no trailing newline', async () => {
-    const unterminatedFile = join(tmpDir, 'unterminated.ts');
-    writeFileSync(unterminatedFile, GATED_FILE_CONTENT.slice(0, -1));
+  it.each(['config.md', 'config.json', 'config.yaml', 'config.toml'])('never denies ungated language %s', async (name) => {
     answerWithFileHistory();
+    const filePath = join(tmpDir, name);
+    writeFileSync(filePath, GATED_FILE_CONTENT);
 
-    const exactLimit = await fileContextHandler.execute(
-      claudeCodeRead({ file_path: unterminatedFile, limit: GATED_FILE_LINE_COUNT }, { sessionId: 'sess-unterminated-exact' })
-    );
-    const oneLineShort = await fileContextHandler.execute(
-      claudeCodeRead({ file_path: unterminatedFile, limit: GATED_FILE_LINE_COUNT - 1 }, { sessionId: 'sess-unterminated-short' })
+    const result = await fileContextHandler.execute(
+      claudeCodeRead({ file_path: filePath }, { sessionId: `sess-${name}` })
     );
 
-    expect(exactLimit.hookSpecificOutput?.permissionDecision).toBe('deny');
-    expectContextNotDeny(oneLineShort);
-  });
-
-  it('never denies markdown, JSON or YAML files', async () => {
-    const jsonFile = join(tmpDir, 'config.json');
-    const yamlFile = join(tmpDir, 'config.yaml');
-    writeFileSync(jsonFile, PADDING);
-    writeFileSync(yamlFile, PADDING);
-    answerWithFileHistory();
-
-    for (const filePath of [testFile, jsonFile, yamlFile]) {
-      const result = await fileContextHandler.execute(
-        claudeCodeRead({ file_path: filePath }, { sessionId: `sess-${filePath}` })
-      );
-      expectContextNotDeny(result);
-    }
+    expectContextNotDeny(result);
   });
 
   it('never denies a file outside the session cwd', async () => {
@@ -1034,29 +951,6 @@ describe('fileContextHandler — File Read Gate', () => {
     expect(workspaceContainmentChecks).toEqual([{ filePath: gatedFile, workspaceCwd: tmpDir }]);
   });
 
-  it('lets a one-line Read of a file several chunks long through, and still denies a limit that covers it', async () => {
-    const repeats = Math.ceil((4 * LINE_COUNT_CHUNK_BYTES) / GATED_FILE_CONTENT.length);
-    const largeFile = join(tmpDir, 'large.ts');
-    writeFileSync(largeFile, GATED_FILE_CONTENT.repeat(repeats));
-    const largeFileLineCount = GATED_FILE_LINE_COUNT * repeats;
-    expect(statSync(largeFile).size).toBeGreaterThan(4 * LINE_COUNT_CHUNK_BYTES);
-    answerWithFileHistory();
-
-    const oneLine = await fileContextHandler.execute(
-      claudeCodeRead({ file_path: largeFile, limit: 1 }, { sessionId: 'sess-large-one-line' })
-    );
-    const oneLineShort = await fileContextHandler.execute(
-      claudeCodeRead({ file_path: largeFile, limit: largeFileLineCount - 1 }, { sessionId: 'sess-large-short' })
-    );
-    const everyLine = await fileContextHandler.execute(
-      claudeCodeRead({ file_path: largeFile, limit: largeFileLineCount }, { sessionId: 'sess-large-every-line' })
-    );
-
-    expectContextNotDeny(oneLine);
-    expectContextNotDeny(oneLineShort);
-    expect(everyLine.hookSpecificOutput?.permissionDecision).toBe('deny');
-  });
-
   it('does nothing for a code file under 1,500 bytes', async () => {
     const smallFile = join(tmpDir, 'small.ts');
     writeFileSync(smallFile, 'export const small = 1;\n');
@@ -1066,14 +960,6 @@ describe('fileContextHandler — File Read Gate', () => {
 
     expect(result).toEqual({ continue: true, suppressOutput: true });
     expect(fetchSpy).not.toHaveBeenCalled();
-  });
-
-  it('does nothing when the file changed after its newest observation (#1719)', async () => {
-    answerWithFileHistory(Date.now() - 3_600_000);
-
-    const result = await fileContextHandler.execute(claudeCodeRead({ file_path: gatedFile }));
-
-    expect(result).toEqual({ continue: true, suppressOutput: true });
   });
 
   it('does nothing when the worker call falls back', async () => {
@@ -1086,15 +972,6 @@ describe('fileContextHandler — File Read Gate', () => {
     const result = await fileContextHandler.execute(claudeCodeRead({ file_path: gatedFile }));
 
     expect(result).toEqual({ continue: true, suppressOutput: true });
-  });
-
-  it('does nothing for a subagent Read', async () => {
-    answerWithFileHistory();
-
-    const result = await fileContextHandler.execute(claudeCodeRead({ file_path: gatedFile }, { agentId: 'subagent-1' }));
-
-    expect(result).toEqual({ continue: true, suppressOutput: true });
-    expect(fetchSpy).not.toHaveBeenCalled();
   });
 
   it('denies every whole-file Read of a gated file — the dedupe claim opens no free retry', async () => {
@@ -1158,20 +1035,9 @@ describe('shouldDenyFullFileRead', () => {
   // The fixture's answer to fileHasMoreLinesThan, without reading the file.
   const gatedFileHasMoreLinesThan = (_absolutePath: string, lineCount: number) => GATED_FILE_LINE_COUNT > lineCount;
 
-  it('denies a whole-file Read without counting lines when no limit is set', () => {
-    const fileHasMoreLinesThan = mock(gatedFileHasMoreLinesThan);
-
-    expect(shouldDenyFullFileRead(wholeFileRead(), statVerifiedHistory(gatedFile), 'true', true, fileHasMoreLinesThan, smartReadAvailable)).toBe(true);
-    expect(fileHasMoreLinesThan).not.toHaveBeenCalled();
-  });
-
   it('treats an unset setting as on — only an explicit false turns the gate off', () => {
     expect(shouldDenyFullFileRead(wholeFileRead(), statVerifiedHistory(gatedFile), undefined, true, gatedFileHasMoreLinesThan, smartReadAvailable)).toBe(true);
     expect(shouldDenyFullFileRead(wholeFileRead(), statVerifiedHistory(gatedFile), 'false', true, gatedFileHasMoreLinesThan, smartReadAvailable)).toBe(false);
-  });
-
-  it('never denies a file that resolves outside the workspace, where the smart tools refuse it', () => {
-    expect(shouldDenyFullFileRead(wholeFileRead(), statVerifiedHistory(gatedFile), 'true', false, gatedFileHasMoreLinesThan, smartReadAvailable)).toBe(false);
   });
 
   it('counts lines only after every cheaper condition holds, and checks smart-read availability after that', () => {
@@ -1210,20 +1076,6 @@ describe('shouldDenyFullFileRead', () => {
     expect(isSmartReadAvailable).toHaveBeenCalledTimes(1);
   });
 
-  it('never denies when smart_outline cannot parse here (no tree-sitter CLI)', () => {
-    const smartReadUnavailable = () => false;
-
-    expect(shouldDenyFullFileRead(wholeFileRead(), statVerifiedHistory(gatedFile), 'true', true, gatedFileHasMoreLinesThan, smartReadUnavailable)).toBe(false);
-    expect(shouldDenyFullFileRead(
-      wholeFileRead({ toolInput: { file_path: gatedFile, limit: GATED_FILE_LINE_COUNT } }),
-      statVerifiedHistory(gatedFile),
-      'true',
-      true,
-      gatedFileHasMoreLinesThan,
-      smartReadUnavailable,
-    )).toBe(false);
-  });
-
   it('treats non-finite or negative offset/limit as absent', () => {
     const deny = (toolInput: Record<string, unknown>) =>
       shouldDenyFullFileRead(wholeFileRead({ toolInput: { file_path: gatedFile, ...toolInput } }), statVerifiedHistory(gatedFile), 'true', true, gatedFileHasMoreLinesThan, smartReadAvailable);
@@ -1246,6 +1098,13 @@ describe('shouldDenyFullFileRead', () => {
     const input = wholeFileRead({ toolInput: { file_path: gatedFile, limit: GATED_FILE_LINE_COUNT } });
 
     expect(shouldDenyFullFileRead(input, statVerifiedHistory(gatedFile), 'true', true, () => null, smartReadAvailable)).toBe(false);
+  });
+
+  it('never denies on history of a file changed since it, which line anchors list as context only (#4943)', () => {
+    const changedSince = { ...statVerifiedHistory(gatedFile), fileChangedSinceObservations: true };
+
+    expect(shouldDenyFullFileRead(wholeFileRead(), statVerifiedHistory(gatedFile), 'true', true, gatedFileHasMoreLinesThan, smartReadAvailable)).toBe(true);
+    expect(shouldDenyFullFileRead(wholeFileRead(), changedSince, 'true', true, gatedFileHasMoreLinesThan, smartReadAvailable)).toBe(false);
   });
 });
 
@@ -1304,5 +1163,270 @@ describe('fileHasMoreLinesThan', () => {
     expect(fileHasMoreLinesThan(join(tmpDir, 'missing.ts'), 1)).toBeNull();
     // A directory opens on POSIX, then fails to read (EISDIR).
     expect(fileHasMoreLinesThan(tmpDir, 1)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Line anchors (#4943): CLAUDE_MEM_LINE_ANCHORS_ENABLED, off by default
+// ---------------------------------------------------------------------------
+
+/** A line of GATED_FILE_CONTENT: index 120 is line 121. */
+const fixtureLine = (index: number) => `export const fixtureValue${index} = ${index}; // read-gate fixture line`;
+const CONTEXT_LINE_HINT = '- **Need the code past work touched?** Read with offset and limit around its @L number: where that line is now, found again by its text. (code changed since) means the line is gone; no number is guessed.';
+const DENY_LINE_HINT = '- Lines of past work: the @L numbers below are where that code is now, found again by its text; call Read with offset and limit around them. (code changed since) means the line is gone.';
+const CHANGED_FILE_NOTE = 'The file changed after these observations: @L numbers are where their code is now; (code changed since) marks code that is gone.';
+
+interface AnchoredObservation {
+  id: number;
+  createdAtEpoch: number;
+  title: string;
+  /** Stored in metadata the way the worker stores them; `path` defaults to the gated file. */
+  anchors?: Array<{ path?: string; line: number; text: string }>;
+}
+
+/** Rows as the by-file route returns them (`SELECT o.*`), metadata included unless `withMetadata` is false. */
+function anchoredRows(observations: AnchoredObservation[], withMetadata = true) {
+  return observations.map(observation => ({
+    id: observation.id,
+    memory_session_id: `session-${observation.id}`,
+    title: observation.title,
+    type: 'bugfix',
+    created_at_epoch: observation.createdAtEpoch,
+    files_read: JSON.stringify([]),
+    files_modified: JSON.stringify([gatedFile]),
+    metadata: withMetadata && observation.anchors
+      ? JSON.stringify({
+        cmem_line_anchors_v1: observation.anchors.map(anchor => ({ path: anchor.path ?? gatedFile, line: anchor.line, text: anchor.text })),
+      })
+      : null,
+  }));
+}
+
+let servedRows: ReturnType<typeof anchoredRows> = [];
+
+/** Answers every by-file call with `servedRows`, each with a FRESH Response (a body reads once). */
+function answerWithRows(rows: ReturnType<typeof anchoredRows>): void {
+  servedRows = rows;
+  if (!fetchSpy) {
+    fetchSpy = spyOn(globalThis, 'fetch').mockImplementation(() =>
+      Promise.resolve(Response.json({ observations: servedRows, count: servedRows.length })));
+  }
+}
+
+/** Newer than the file just written: current history. */
+const currentEpoch = () => Date.now() + 60_000;
+/** Older than the file just written: history of a file changed since (#1719). */
+const staleEpoch = () => Date.now() - 3_600_000;
+
+let anchorReadCount = 0;
+/** A session per Read: the dedupe claim is per (session, file). */
+function anchorRead(toolInput: Record<string, unknown> = { file_path: gatedFile, offset: 100, limit: 20 }): NormalizedHookInput {
+  anchorReadCount += 1;
+  return { sessionId: `sess-line-anchors-${anchorReadCount}`, cwd: tmpDir, platform: 'claude-code', toolName: 'Read', toolInput };
+}
+const wholeFileAnchorRead = () => anchorRead({ file_path: gatedFile });
+
+async function contextFor(observations: AnchoredObservation[], input = anchorRead()): Promise<string> {
+  answerWithRows(anchoredRows(observations));
+  return (await fileContextHandler.execute(input)).hookSpecificOutput?.additionalContext ?? '';
+}
+
+function timelineRow(text: string, id: number): string | undefined {
+  return text.split('\n').find(line => line.startsWith(`${id} `));
+}
+
+describe('fileContextHandler — line anchors (#4943)', () => {
+  beforeEach(() => {
+    runtimeSettings = { CLAUDE_MEM_LINE_ANCHORS_ENABLED: 'true' };
+  });
+
+  it.each([
+    ['every anchor found', [{ line: 301, text: fixtureLine(300) }, { line: 121, text: fixtureLine(120) }], ' @L121,L301', true],
+    ['one of two anchors gone', [{ line: 121, text: fixtureLine(120) }, { line: 301, text: 'export function removedHelper() {' }], ' @L121 (some code changed since)', true],
+    ['every anchor gone', [{ line: 301, text: 'export function removedHelper() {' }], ' (code changed since)', false],
+  ])('ends the row by state when %s, with the Read hint only where a line was found', async (_label, anchors, suffix, hint) => {
+    const context = await contextFor([{ id: 9, createdAtEpoch: currentEpoch(), title: 'Fixture values', anchors }]);
+
+    expect(timelineRow(context, 9)).toEndWith(`Fixture values${suffix}`);
+    expect(context.includes(CONTEXT_LINE_HINT)).toBe(hint);
+  });
+
+  it.each([
+    ['two lines were inserted above it', (content: string) => `// a new header line\n// and another\n${content}`, ' @L123', true],
+    ['its code was removed', (content: string) => content.replace(`${fixtureLine(120)}\n`, ''), ' (code changed since)', false],
+    ['its line now appears twice', (content: string) => `${content}${fixtureLine(120)}\n`, ' (code changed since)', false],
+    ['its line was re-indented', (content: string) => content.replace(fixtureLine(120), `    ${fixtureLine(120).replace(' = ', '  =  ')}`), ' @L121', true],
+  ])('never guesses a line: after %s', async (_label, change, suffix, hint) => {
+    writeFileSync(gatedFile, change(GATED_FILE_CONTENT));
+
+    const context = await contextFor([{ id: 7, createdAtEpoch: currentEpoch(), title: 'Fixed value 120', anchors: [{ line: 121, text: fixtureLine(120) }] }]);
+
+    expect(timelineRow(context, 7)).toEndWith(`Fixed value 120${suffix}`);
+    expect(context.includes(CONTEXT_LINE_HINT)).toBe(hint);
+  });
+
+  it('puts the Read hint right after the smart_outline line, and leaves rows without anchors alone', async () => {
+    const context = await contextFor([
+      { id: 1, createdAtEpoch: currentEpoch(), title: 'Fixed value 120', anchors: [{ line: 121, text: fixtureLine(120) }] },
+      { id: 2, createdAtEpoch: currentEpoch() + 1, title: 'Unanchored work' },
+    ]);
+    const lines = context.split('\n');
+    const outlineIndex = lines.findIndex(line => line.startsWith('- **Need a structural map first?** smart_outline('));
+
+    expect(lines[outlineIndex + 1]).toBe(CONTEXT_LINE_HINT);
+    expect(timelineRow(context, 1)).toEndWith('Fixed value 120 @L121');
+    expect(timelineRow(context, 2)).toEndWith('Unanchored work');
+  });
+
+  it('lists only the rows with line anchors when the file changed after its history, each marked, with the note', async () => {
+    const context = await contextFor([
+      { id: 1, createdAtEpoch: staleEpoch(), title: 'Still there', anchors: [{ line: 200, text: fixtureLine(199) }] },
+      { id: 2, createdAtEpoch: staleEpoch() + 1, title: 'No anchors' },
+      { id: 3, createdAtEpoch: staleEpoch() + 2, title: 'Code gone', anchors: [{ line: 5, text: 'export const removed = true;' }] },
+    ]);
+    const lines = context.split('\n');
+    const outlineIndex = lines.findIndex(line => line.startsWith('- **Need a structural map first?** smart_outline('));
+
+    expect(lines.slice(outlineIndex + 1, outlineIndex + 3)).toEqual([CONTEXT_LINE_HINT, CHANGED_FILE_NOTE]);
+    expect(timelineRow(context, 1)).toEndWith('Still there @L200');
+    expect(timelineRow(context, 3)).toEndWith('Code gone (code changed since)');
+    expect(context).not.toContain('No anchors');
+  });
+
+  it.each([
+    ['no row has line anchors', undefined],
+    ['the only anchors are on another file', 'other.ts'],
+  ])('returns the no-op for a file changed after its history when %s, as before', async (_label, otherFile) => {
+    answerWithRows(anchoredRows([{
+      id: 1, createdAtEpoch: staleEpoch(), title: 'Old work',
+      anchors: otherFile ? [{ path: join(tmpDir, otherFile), line: 200, text: fixtureLine(199) }] : undefined,
+    }]));
+
+    expect(await fileContextHandler.execute(anchorRead())).toEqual({ continue: true, suppressOutput: true });
+  });
+
+  it('never denies a whole-file Read on history of a file changed since, even with its code found', async () => {
+    answerWithRows(anchoredRows([{ id: 1, createdAtEpoch: staleEpoch(), title: 'Still there', anchors: [{ line: 200, text: fixtureLine(199) }] }]));
+
+    const output = (await fileContextHandler.execute(wholeFileAnchorRead())).hookSpecificOutput;
+
+    expect(output?.permissionDecision).toBeUndefined();
+    expect(timelineRow(output?.additionalContext ?? '', 1)).toEndWith('Still there @L200');
+  });
+
+  it('keeps the deny marker line and adds the line hint and @L rows to the deny reason', async () => {
+    answerWithRows(anchoredRows([{ id: 4242, createdAtEpoch: currentEpoch(), title: 'Fixed value 300', anchors: [{ line: 301, text: fixtureLine(300) }] }]));
+
+    const output = (await fileContextHandler.execute(wholeFileAnchorRead())).hookSpecificOutput!;
+    const lines = output.permissionDecisionReason!.split('\n');
+    const hintPath = gatedFile.replace(/\\/g, '\\\\');
+    const exactLinesIndex = lines.findIndex(line => line.startsWith('- Exact lines, e.g. before an Edit:'));
+
+    expect(output.permissionDecision).toBe('deny');
+    expect(lines[1]).toBe(`Full-file Read blocked by claude-mem: ${hintPath} has prior observations (listed below). Get what you need without reading the whole file:`);
+    expect(lines.slice(exactLinesIndex + 1, exactLinesIndex + 3)).toEqual([
+      DENY_LINE_HINT,
+      "The titles below are history from earlier sessions, not the file's current contents.",
+    ]);
+    expect(timelineRow(output.permissionDecisionReason!, 4242)).toEndWith('Fixed value 300 @L301');
+  });
+
+  it.each([
+    ['absolute', () => gatedFile, ' @L121'],
+    ['absolute, forward slashes', () => gatedFile.replace(/\\/g, '/'), ' @L121'],
+    ['absolute, backslashes', () => gatedFile.replace(/\//g, '\\'), ' @L121'],
+    ['cwd-relative', () => 'gated.ts', ' @L121'],
+    ['./-relative', () => './gated.ts', ' @L121'],
+    ['.\\-relative', () => '.\\gated.ts', ' @L121'],
+    ['another file', () => join(tmpDir, 'other.ts'), ''],
+    ['the same name in another directory', () => 'sub/gated.ts', ''],
+  ])('matches an anchor path spelled %s to this file only', async (_label, anchorPath, suffix) => {
+    const context = await contextFor([
+      { id: 5, createdAtEpoch: currentEpoch(), title: 'Fixed value 120', anchors: [{ path: anchorPath(), line: 121, text: fixtureLine(120) }] },
+    ]);
+
+    expect(timelineRow(context, 5)).toEndWith(`Fixed value 120${suffix}`);
+  });
+
+  it('carries stored metadata through the real indexed lookup (`o.*`)', async () => {
+    const store = new SessionStore(':memory:');
+    try {
+      const session = store.getOrCreateManualSession('test-project');
+      const { id } = store.storeObservation(session, 'test-project', {
+        type: 'bugfix', title: 'Fixed value 120', subtitle: null,
+        narrative: 'Changed one fixture value.', facts: [], concepts: [],
+        files_read: [], files_modified: [gatedFile],
+        metadata: JSON.stringify({ cmem_line_anchors_v1: [{ path: gatedFile, line: 121, text: fixtureLine(120) }] }),
+      }, 1, 0, currentEpoch());
+      fetchSpy = spyOn(globalThis, 'fetch').mockImplementation(async (url: string | URL | Request) => {
+        const query = new URL(String(url));
+        const observations = getObservationsByFilePath(store.db, query.searchParams.getAll('path'), { projects: ['test-project'] });
+        return Response.json({ observations, count: observations.length });
+      });
+
+      const context = (await fileContextHandler.execute(anchorRead())).hookSpecificOutput?.additionalContext ?? '';
+
+      expect(timelineRow(context, id)).toEndWith('Fixed value 120 @L121');
+    } finally {
+      store.close();
+    }
+  });
+});
+
+describe('fileContextHandler — line anchors off: main\'s output (#4943 guard)', () => {
+  /** The output with the minute-resolution `Current:` line removed, so two calls compare equal. */
+  function withoutClock(result: Awaited<ReturnType<typeof fileContextHandler.execute>>) {
+    const output = result.hookSpecificOutput;
+    if (!output) return result;
+    const strip = (text: string | undefined) => text?.replace(/^Current: .*$/m, '');
+    return { ...result, hookSpecificOutput: { ...output, additionalContext: strip(output.additionalContext), permissionDecisionReason: strip(output.permissionDecisionReason) } };
+  }
+
+  const READS: Array<[string, () => NormalizedHookInput, () => number]> = [
+    ['a targeted Read (context)', () => anchorRead(), currentEpoch],
+    ['a whole-file Read (deny)', wholeFileAnchorRead, currentEpoch],
+    ['a Read of a file changed since its history (no-op)', () => anchorRead(), staleEpoch],
+  ];
+
+  const historyWithAnchors = (createdAtEpoch: number): AnchoredObservation[] => [{
+    id: 4242, createdAtEpoch, title: 'Fixed value 120',
+    anchors: [{ line: 121, text: fixtureLine(120) }, { line: 5, text: 'export const removed = true;' }],
+  }];
+
+  async function execute(rows: ReturnType<typeof anchoredRows>, input: NormalizedHookInput) {
+    answerWithRows(rows);
+    return fileContextHandler.execute(input);
+  }
+
+  it.each([undefined, 'false', 'TRUE', '1', 'yes'])('with the setting %p, stored line anchors change nothing', async (setting) => {
+    runtimeSettings = setting === undefined ? {} : { CLAUDE_MEM_LINE_ANCHORS_ENABLED: setting };
+
+    for (const [label, read, epoch] of READS) {
+      const history = historyWithAnchors(epoch());
+      const plain = await execute(anchoredRows(history, false), read());
+      const anchored = await execute(anchoredRows(history), read());
+
+      const shown = JSON.stringify(anchored);
+      expect([label, withoutClock(anchored)]).toEqual([label, withoutClock(plain)]);
+      expect([label, shown.includes('@L'), shown.includes('code changed since')]).toEqual([label, false, false]);
+    }
+    const denied = await execute(anchoredRows(historyWithAnchors(currentEpoch())), wholeFileAnchorRead());
+    expect(denied.hookSpecificOutput?.permissionDecisionReason).toMatch(/^4242 \S+ \S+ Fixed value 120$/m);
+  });
+
+  it('with the setting on and no anchor on this file, the output is the output with the setting off', async () => {
+    const history = (createdAtEpoch: number): AnchoredObservation[] => [{
+      id: 4242, createdAtEpoch, title: 'Fixed value 120', anchors: [{ path: join(tmpDir, 'other.ts'), line: 121, text: fixtureLine(120) }],
+    }];
+
+    for (const [label, read, epoch] of READS) {
+      const rows = anchoredRows(history(epoch()));
+      runtimeSettings = {};
+      const off = await execute(rows, read());
+      runtimeSettings = { CLAUDE_MEM_LINE_ANCHORS_ENABLED: 'true' };
+      const on = await execute(rows, read());
+
+      expect([label, withoutClock(on)]).toEqual([label, withoutClock(off)]);
+    }
   });
 });

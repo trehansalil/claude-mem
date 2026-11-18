@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync } from 'node:fs';
+import { removeTempDir } from '../../helpers/temp-dir.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SessionStore } from '../../../src/services/sqlite/SessionStore.js';
@@ -28,9 +29,9 @@ beforeEach(() => {
   });
 });
 
-afterEach(() => {
+afterEach(async () => {
   unsubscribe(); routes.close(); store.close();
-  rmSync(directory, { recursive: true, force: true });
+  await removeTempDir(directory);
 });
 
 const background = () => (routes as any).backgroundSnapshot();
@@ -60,9 +61,13 @@ describe('committed prompts invalidate cached My Work activity', () => {
   }
 
   it('does not emit again for native retries, imported duplicates or private transcript prompts', () => {
+    const native = store.saveNativeUserPrompt('conversation', sessionId, 'native-turn', 'New committed ask');
     store.saveNativeUserPrompt('conversation', sessionId, 'native-turn', 'New committed ask');
-    store.saveNativeUserPrompt('conversation', sessionId, 'native-turn', 'New committed ask');
-    store.importUserPrompt(importedPrompt());
+    const [storedPrompt] = store.getUserPromptsByIds([native.id]);
+    expect(store.importUserPrompt(storedPrompt)).toEqual({ imported: false, id: native.id });
+    // An export taken before receipts replays the same ask without its receipt.
+    expect(store.importUserPrompt({ ...storedPrompt, native_prompt_id: null, native_prompt_hash: null }))
+      .toEqual({ imported: false, id: native.id });
     expect(store.importTranscriptUserPrompt({ ...transcriptPrompt(), promptText: '<private>secret</private>' }).reason).toBe('private');
     expect(events).toHaveLength(1);
   });

@@ -1,6 +1,8 @@
+import { configureToolUseIndex, configureToolUseIndexAsync, searchToolUses, emptyDeepResult, toolUseIndexStatus, type ToolUseIndexStatus, type DeepSearchResult } from './tool-use-search.js';
+import { UNSEGMENTED_SCRIPT, MAX_SUBSTRING_TERMS, buildSubstringClause, buildFTSMatchQuery } from './search-query.js';
 import { Database, type Statement } from 'bun:sqlite';
 import { TableNameRow } from '../../types/database.js';
-import { DATA_DIR, DB_PATH, ensureDir } from '../../shared/paths.js';
+import { DATA_DIR, DB_PATH, ensurePrivateDir } from '../../shared/paths.js';
 import { logger } from '../../utils/logger.js';
 import { isDirectChild, normalizePath } from '../../shared/path-utils.js';
 import {
@@ -23,15 +25,6 @@ import {
 } from './connection.js';
 import { projectScopeSql, scopedProjects } from './project-read-keys.js';
 import { pageMatchingRows } from './stream-rows.js';
-
-/**
- * Code-point ranges of the scripts FTS5's unicode61 tokenizer cannot segment: Thai and Lao,
- * Myanmar, Khmer, Hiragana/Katakana, Bopomofo and Hangul compatibility jamo, the CJK
- * ideographs (including supplementary planes), Katakana extensions and halfwidth
- * Katakana, and Hangul syllables. See {@link SessionSearch.UNSEGMENTED_SCRIPT}.
- */
-const UNSEGMENTED_SCRIPT_RANGES =
-  '\\p{Script=Han}\\u31F0-\\u31FF\\uFF66-\\uFF9F\\u0E00-\\u0EFF\\u1000-\\u109F\\u1780-\\u17FF\\u3040-\\u30FF\\u3100-\\u318F\\u3400-\\u4DBF\\u4E00-\\u9FFF\\uAC00-\\uD7AF\\uF900-\\uFAFF';
 
 /**
  * The sync triggers each external-content index depends on. SQLite drops a
@@ -93,6 +86,10 @@ export const SESSION_SUMMARIES_FTS_TRIGGERS_SQL = `
   END;
 `;
 
+// Keep the query tokenizer identical to both persistent memory indexes, including unicode61's default
+// remove_diacritics=1 behavior. No schema migration is needed: existing indexes already use this default.
+const MEMORY_FTS_TOKENIZER = 'unicode61';
+
 type AnyTermFtsTable = 'observations_fts' | 'session_summaries_fts';
 
 /** Rows of an FTS table holding a word, and the table's row count, for one any-term query. */
@@ -111,11 +108,11 @@ export class SessionSearch {
    * writer connection owns them. Temp-schema tables (the FTS5 probe and the
    * fts5vocab term-frequency tables) still work on a read-only open.
    */
-  constructor(dbPathOrDb: string | Database = DB_PATH, options: { readOnly?: boolean } = {}) {
+  constructor(dbPathOrDb: string | Database = DB_PATH, options: { readOnly?: boolean; toolUseIndexEnabled?: boolean } = {}) {
     if (dbPathOrDb instanceof Database) {
       this.db = dbPathOrDb;
     } else {
-      ensureDir(DATA_DIR);
+      ensurePrivateDir(DATA_DIR);
       this.db = new Database(dbPathOrDb);
     }
 
@@ -128,9 +125,42 @@ export class SessionSearch {
     this._fts5Available = this.isFts5Available();
 
     if (!options.readOnly) this.ensureFTSTables();
+    // This optional capability must be checked outside core FTS's early return.
+    if (!options.readOnly && options.toolUseIndexEnabled !== undefined) {
+      if (!this.isFts5Available()) this.rawIndexFailure = 'unsupported';
+      else {
+        try { configureToolUseIndex(this.db, options.toolUseIndexEnabled); }
+        catch (error) {
+          this.rawIndexFailure = 'error';
+          logger.error('DB', 'Raw tool search index initialization failed', {}, error instanceof Error ? error : undefined);
+        }
+      }
+    }
   }
 
   private _fts5Available: boolean;
+  private rawIndexFailure?: ToolUseIndexStatus;
+
+  async configureToolUseIndex(enabled: boolean, signal?: AbortSignal): Promise<void> {
+    this.rawIndexFailure = undefined;
+    if (!this.isFts5Available()) { this.rawIndexFailure = 'unsupported'; return; }
+    try {
+      const status = await configureToolUseIndexAsync(this.db, enabled, signal);
+      logger.info('DB', 'Raw tool search index configured', { status });
+    } catch (error) {
+      this.rawIndexFailure = 'error';
+      logger.error('DB', 'Raw tool search index initialization failed', {}, error instanceof Error ? error : undefined);
+    }
+  }
+
+  getToolUseIndexStatus(): ToolUseIndexStatus {
+    return this.rawIndexFailure ?? toolUseIndexStatus(this.db);
+  }
+
+  searchToolUses(query: string, options: SearchOptions = {}): DeepSearchResult {
+    const status = this.getToolUseIndexStatus();
+    return status === 'ready' ? searchToolUses(this.db, query, options) : emptyDeepResult(status);
+  }
 
   private ensureFTSTables(): void {
     const tables = this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%_fts'").all() as TableNameRow[];
@@ -261,7 +291,8 @@ export class SessionSearch {
           facts,
           concepts,
           content='observations',
-          content_rowid='id'
+          content_rowid='id',
+          tokenize='${MEMORY_FTS_TOKENIZER}'
         );
       `);
 
@@ -284,7 +315,8 @@ export class SessionSearch {
           next_steps,
           notes,
           content='session_summaries',
-          content_rowid='id'
+          content_rowid='id',
+          tokenize='${MEMORY_FTS_TOKENIZER}'
         );
       `);
 
@@ -414,50 +446,9 @@ export class SessionSearch {
    * Thai, Lao, Myanmar and Khmer write words without spaces too, so a run of them folds
    * into one token the same way (`ภาษาไทย` inside a longer Thai run -> 0 rows).
    */
-  private static readonly UNSEGMENTED_SCRIPT = new RegExp(`[${UNSEGMENTED_SCRIPT_RANGES}]`, 'u');
-
-  /**
-   * Split the query into the runs the index cannot segment and the runs it can, so a
-   * mixed-script query is matched term by term instead of as one literal string. A
-   * substring search for the whole of `claude 队列` requires those characters to be
-   * adjacent, which is why mixed queries returned almost nothing (#3801 / #3982).
-   */
-  private static readonly UNSEGMENTED_RUN =
-    new RegExp(`[${UNSEGMENTED_SCRIPT_RANGES}]+|[^\\s${UNSEGMENTED_SCRIPT_RANGES}]+`, 'gu');
-
-  /**
-   * The most distinct terms the substring predicate requires. It adds one LIKE group per
-   * term, and when SQLite plans the project filter's OR across its two indexes it chains
-   * every WHERE term into one AND expression, one level deeper per term. Past ~980 terms
-   * that fails with "Expression tree is too large (maximum depth 1000)", which a pasted
-   * wall of text (FTS never matches one, so it always lands here) used to hit. 500 leaves
-   * room for every other filter. A query with more distinct terms than this matches no
-   * record by its full AND anyway; its leading terms are kept.
-   */
-  static readonly MAX_SUBSTRING_TERMS = 500;
-
-  /**
-   * Build the substring predicate used when the index cannot represent the query. Each
-   * term must appear in at least one column, and every term must appear somewhere. The
-   * escaping matches {@link searchUserPrompts}, which has always searched by substring.
-   * A repeated term adds nothing to the AND, so terms are deduplicated before the cap.
-   */
-  private static buildSubstringClause(query: string, columns: string[]): { clause: string; params: string[] } {
-    const terms = [...new Set(query.match(SessionSearch.UNSEGMENTED_RUN) ?? [])]
-      .slice(0, SessionSearch.MAX_SUBSTRING_TERMS);
-    if (terms.length === 0) {
-      terms.push(query);
-    }
-    const params: string[] = [];
-    const groups = terms.map(term => {
-      const pattern = `%${term.replace(/[\\%_]/g, '\\$&')}%`;
-      for (let i = 0; i < columns.length; i += 1) {
-        params.push(pattern);
-      }
-      return `(${columns.map(column => `${column} LIKE ? ESCAPE '\\'`).join(' OR ')})`;
-    });
-    return { clause: `(${groups.join(' AND ')})`, params };
-  }
+  private static readonly UNSEGMENTED_SCRIPT = UNSEGMENTED_SCRIPT;
+  static readonly MAX_SUBSTRING_TERMS = MAX_SUBSTRING_TERMS;
+  private static readonly buildSubstringClause = buildSubstringClause;
 
   /** Fewest query terms before an AND query with no match is widened to any term (see buildFTSAnyTermQuery). */
   private static readonly MIN_ANY_TERM_TOKENS = 3;
@@ -470,16 +461,7 @@ export class SessionSearch {
    * nothing for them, so each would become an empty phrase that matches no row and, ANDed
    * in, would zero out the whole query.
    */
-  private static buildFTSMatchQuery(query: string): string {
-    const tokens = (query.match(/\S+/g) ?? []).filter(token => /[\p{L}\p{N}]/u.test(token));
-    if (tokens.length === 0) {
-      return `"${query.replace(/"/g, '""')}"`;
-    }
-
-    return tokens
-      .map(token => `"${token.replace(/"/g, '""')}"`)
-      .join(' AND ');
-  }
+  private static readonly buildFTSMatchQuery = buildFTSMatchQuery;
 
   /**
    * The same quoted tokens as buildFTSMatchQuery, joined with OR, for a query whose terms never all appear in one
@@ -521,7 +503,10 @@ export class SessionSearch {
     } else if (length < SessionSearch.ANY_TERM_MEDIUM_PROMPT_CHARS) {
       picked = SessionSearch.pickRareTokens(tokens, docFrequency, SessionSearch.ANY_TERM_MEDIUM_PROMPT_CAP);
     } else {
-      picked = SessionSearch.pickRareWords(query, docFrequency);
+      const words = this.indexedQueryWords(query);
+      picked = words === null
+        ? SessionSearch.dedupeTokens(tokens).slice(0, SessionSearch.ANY_TERM_LONG_PROMPT_CAP)
+        : SessionSearch.pickRareWords(words, docFrequency);
     }
 
     if (picked.length === 0) {
@@ -554,7 +539,8 @@ export class SessionSearch {
 
   /**
    * A document-frequency reader for one query: `(word) => rows holding it`, plus the row count. Null when the
-   * vocabulary is unavailable. Words are folded the way unicode61 indexes them (lowercase, no diacritics).
+   * vocabulary is unavailable. The lookup accepts the exact indexed spelling; JavaScript Unicode folding
+   * differs from unicode61 for Greek accents/final sigma, Cyrillic breve and compound Latin accents.
    */
   private termDocFrequency(ftsTable: AnyTermFtsTable): DocFrequency | null {
     if (!this.vocabLookups.has(ftsTable)) {
@@ -575,8 +561,7 @@ export class SessionSearch {
       const contentTable = SessionSearch.ANY_TERM_CONTENT_TABLES[ftsTable];
       const total = (this.db.prepare(`SELECT count(*) AS n FROM ${contentTable}`).get() as { n: number }).n;
       const cache = new Map<string, number>();
-      const rows = (word: string): number => {
-        const term = word.toLowerCase().normalize('NFD').replace(/\p{Mn}/gu, '');
+      const rows = (term: string): number => {
         let doc = cache.get(term);
         if (doc === undefined) {
           doc = (lookup.get(term) as { doc: number } | null)?.doc ?? 0;
@@ -592,10 +577,51 @@ export class SessionSearch {
     }
   }
 
+  private queryWordReader: { clear: Statement; insert: Statement; read: Statement } | null | undefined;
+
+  /**
+   * Read the words SQLite actually indexes, in their original order. NFD accent stripping is not unicode61:
+   * it keeps non-Latin accents, folds final sigma, and preserves compound Latin accents in its default mode.
+   * The one-document contentless index lives only in this connection's temp schema, including on read-only
+   * database opens. Clear it after every query so neither indexed query words nor content accumulate.
+   */
+  private indexedQueryWords(query: string): string[] | null {
+    try {
+      if (this.queryWordReader === undefined) {
+        this.db.run(`CREATE VIRTUAL TABLE IF NOT EXISTS temp._any_term_words
+          USING fts5(text, content='', tokenize='${MEMORY_FTS_TOKENIZER}')`);
+        this.db.run(`CREATE VIRTUAL TABLE IF NOT EXISTS temp._any_term_words_vocab
+          USING fts5vocab(temp, '_any_term_words', 'instance')`);
+        this.queryWordReader = {
+          clear: this.db.prepare("INSERT INTO temp._any_term_words(_any_term_words) VALUES ('delete-all')"),
+          insert: this.db.prepare('INSERT INTO temp._any_term_words(rowid, text) VALUES (1, ?)'),
+          read: this.db.prepare('SELECT term FROM temp._any_term_words_vocab ORDER BY offset'),
+        };
+      }
+      const reader = this.queryWordReader;
+      if (!reader) return null;
+      // A failed read or cleanup must also undo the insertion. Contentless FTS inserts at the same rowid
+      // do not remove its old indexed words, so leaving any behind would pollute another reader's query.
+      return this.db.transaction(() => {
+        reader.insert.run(query);
+        const words = (reader.read.all() as { term: string }[]).map(row => row.term);
+        reader.clear.run();
+        return words;
+      })();
+    } catch (error) {
+      this.queryWordReader = null;
+      logger.debug('DB', 'FTS5 query tokenizer unavailable; any-term queries are capped without frequencies', {}, error instanceof Error ? error : undefined);
+      return null;
+    }
+  }
+
   /** A token is as common as its rarest word: FTS splits `qa-hub,` into `qa` and `hub`, and a phrase needs both. */
   private static tokenRows(token: string, docFrequency: DocFrequency): number {
     const words = token.match(/[\p{L}\p{N}]+/gu) ?? [];
-    return words.length === 0 ? 0 : Math.min(...words.map(word => docFrequency.rows(word)));
+    // Preserve the short/medium selection contract and its conservative non-ASCII admission cost (#4956).
+    // Long prompts use indexedQueryWords instead: they require a proven positive frequency to retain a word.
+    return words.length === 0 ? 0 : Math.min(...words.map(word =>
+      docFrequency.rows(word.toLowerCase().normalize('NFD').replace(/\p{Mn}/gu, ''))));
   }
 
   /**
@@ -642,7 +668,7 @@ export class SessionSearch {
       .sort((a, b) => a.rows - b.rows);
     for (const { token, rows } of excluded) {
       if (matching.length === cap) break;
-      // The frequency reader's Unicode folding is approximate: unicode61 preserves some non-Latin accents.
+      // Short/medium tokenRows folding is approximate: unicode61 preserves some non-Latin accents.
       // Charge non-ASCII tokens for the whole store so a different indexed spelling cannot exceed the budget.
       const candidates = /[^\x00-\x7F]/.test(token) ? docFrequency.total : rows;
       if (documents + candidates > SessionSearch.ANY_TERM_MATCHING_DOCUMENT_BUDGET) continue;
@@ -652,13 +678,10 @@ export class SessionSearch {
     return matching;
   }
 
-  private static pickRareWords(query: string, docFrequency: DocFrequency): string[] {
+  private static pickRareWords(indexedWords: string[], docFrequency: DocFrequency): string[] {
     const limit = SessionSearch.commonRowLimit(docFrequency.total, SessionSearch.ANY_TERM_LONG_PROMPT_MAX_SHARE);
-    const words = new Set(
-      (query.match(/[\p{L}\p{N}]+/gu) ?? [])
-        .filter(word => [...word].length >= SessionSearch.ANY_TERM_LONG_PROMPT_MIN_WORD_CHARS)
-        .map(word => word.toLowerCase()),
-    );
+    const words = new Set(indexedWords.filter(word =>
+      [...word].length >= SessionSearch.ANY_TERM_LONG_PROMPT_MIN_WORD_CHARS));
     const kept: string[] = [];
     for (const word of words) {
       const rows = docFrequency.rows(word);
@@ -997,8 +1020,10 @@ export class SessionSearch {
     const firstRelativeSegment = /^[A-Za-z]:$/.test(segments[0] ?? '') ? 1 : 0;
     for (let start = firstRelativeSegment; start < segments.length; start += 1) {
       const trailing = segments.slice(start);
-      patterns.push(`${escape(trailing.join('/') + '/')}%`);
-      patterns.push(`${escape(trailing.join('\\') + '\\')}%`);
+      for (const separator of ['/', '\\']) {
+        const prefix = trailing.join(separator) + separator;
+        patterns.push(`${escape(prefix)}%`, `${escape('.' + separator + prefix)}%`);
+      }
     }
     return patterns;
   }

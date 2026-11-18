@@ -43,6 +43,7 @@ import {
 import { writeJsonFileAtomic } from '../../shared/atomic-json.js';
 import { onContextInvalidation, type ContextInvalidation } from '../../shared/context-invalidation.js';
 import { isSessionStartWorkStateList } from '../context/sections/WorkStateRenderer.js';
+import { ContextReadTimeoutError } from '../context/ContextReadWorkerClient.js';
 import { logger } from '../../utils/logger.js';
 
 export const CONTEXT_CACHE_RENDER_DEBOUNCE_MS = 2_000;
@@ -81,8 +82,10 @@ export interface ContextCacheServiceOptions {
 interface KnownVariant {
   keys: ContextCacheKeys;
   learnedAtEpochMs: number;
-  /** Lower-cased projectReadKeys of keys.projects, refreshed on every render. */
+  /** Lower-cased projectReadKeys of the last accepted body. */
   readKeys: Set<string>;
+  /** Additional projects a queued render is reading, until it finishes. */
+  renderReadKeys?: Set<string>;
   /**
    * beginRenderSequence() of the last render whose result reached this
    * variant's file. A render that started earlier (lower sequence) finishing
@@ -184,7 +187,7 @@ export class ContextCacheService {
     }
     const variant = this.variants.get(variantId);
     if (!variant) return;
-    const complete = () => {
+    const complete = (readKeys: string[]) => {
       if (this.stopped || this.variants.get(variantId) !== variant) return;
       if (removalGenerationAtRenderStart !== undefined && removalGenerationAtRenderStart !== this.removalGeneration) {
         this.requeueAfterRemoval(variantId);
@@ -192,15 +195,18 @@ export class ContextCacheService {
       }
       // A render a newer one overtook needs no heal: that newer render started
       // after this one, and any write since it started queued its own render.
-      if (!this.persistRender(variant, keys, render, renderedAtEpochMs, renderSequenceAtStart)) return;
+      if (!this.persistRender(variant, keys, { ...render, readKeys }, renderedAtEpochMs, renderSequenceAtStart)) return;
       if (render.invalidationGenerationAtStart !== undefined && render.invalidationGenerationAtStart !== this.invalidationGeneration) {
         this.pendingVariantIds.add(variantId);
         this.scheduleRender();
       }
     };
-    const refreshed = this.refreshReadKeys(variantId, render.readKeys);
-    if (refreshed) return refreshed.then(complete);
-    complete();
+    // Keep even a fallback lookup local until the body passes both generation
+    // and ordering checks. A discarded response must not change the scope of
+    // the body that remains on disk.
+    const readKeys = render.readKeys ?? this.options.expandProjectReadKeys(keys.projects);
+    if (Array.isArray(readKeys)) complete(readKeys);
+    else return readKeys.then(complete);
   }
 
   /**
@@ -219,7 +225,8 @@ export class ContextCacheService {
       this.scheduleRender();
     };
     if (this.variants.has(variantId)) {
-      if (readKeys) this.refreshReadKeys(variantId, readKeys);
+      // This response is not the body on disk. A fresh cached body keeps its
+      // own scope; a missing one learns the scope of its queued replacement.
       complete();
       return;
     }
@@ -293,8 +300,13 @@ export class ContextCacheService {
     if (dropsFiles) this.removalGeneration++;
     let matched = 0;
     for (const [variantId, variant] of this.variants) {
-      const unresolvedRemoval = removal && (variant.readKeys.size === 0 || this.activeVariantIds.has(variantId));
-      if (unresolvedRemoval || invalidation.scope === 'all' || invalidation.scope.projects.some(project => variant.readKeys.has(project.toLowerCase()))) {
+      // Restored or refreshing variants may not know their full read scope
+      // yet. Closing a task needs the same immediate eviction as a removal.
+      const unresolvedScope = dropsFiles && (variant.readKeys.size === 0 || this.activeVariantIds.has(variantId));
+      if (unresolvedScope || invalidation.scope === 'all' || invalidation.scope.projects.some(project => {
+        const key = project.toLowerCase();
+        return variant.readKeys.has(key) || variant.renderReadKeys?.has(key);
+      })) {
         this.pendingVariantIds.add(variantId);
         // Synchronous: the writer's HTTP route responds only after this returns.
         if (dropsFiles) this.removeFile(variant.keys);
@@ -348,8 +360,11 @@ export class ContextCacheService {
       const renderSequenceAtStart = this.beginRenderSequence();
       this.activeVariantIds.add(variantId);
       try {
-        await this.refreshReadKeys(variantId);
+        const readKeys = await this.options.expandProjectReadKeys(variant.keys.projects);
         if (this.stopped || this.variants.get(variantId) !== variant) continue;
+        // Writes to the pending render's scope still queue a later refresh,
+        // without replacing the scope needed to invalidate the body on disk.
+        variant.renderReadKeys = new Set([...variant.keys.projects, ...readKeys].map(project => project.toLowerCase()));
         const render = await this.options.renderVariant(variant.keys);
         // A queued render owns this exact registry entry. Teardown or eviction
         // can remove it while the renderer awaits, and a later live request
@@ -359,17 +374,24 @@ export class ContextCacheService {
           this.requeueAfterRemoval(variantId);
           continue;
         }
-        this.persistRender(variant, variant.keys, render, renderedAtEpochMs, renderSequenceAtStart);
+        this.persistRender(variant, variant.keys, { ...render, readKeys: render.readKeys ?? readKeys }, renderedAtEpochMs, renderSequenceAtStart);
       } catch (error) {
         // The old file would now be wrong; remove it so the hook takes the live path.
-        logger.error('CONTEXT_CACHE', 'Context re-render failed; removing the cached block', { variantId, keys: variant.keys },
-          error instanceof Error ? error : new Error(String(error)));
+        const failure = error instanceof Error ? error : new Error(String(error));
+        if (failure instanceof ContextReadTimeoutError) {
+          const { method, queuedMs, runningMs } = failure;
+          logger.warn('CONTEXT_CACHE', 'Context re-render failed: a context read ran past the deadline; removing the cached block',
+            { variantId, keys: variant.keys, method, queuedMs, runningMs }, failure);
+        } else {
+          logger.error('CONTEXT_CACHE', 'Context re-render failed; removing the cached block', { variantId, keys: variant.keys }, failure);
+        }
         // A newer render may already have written a good file; the failed one
         // removes it only when nothing that started later reached the file.
         if (this.variants.get(variantId) === variant && this.claimRenderSequence(variant, renderSequenceAtStart)) {
           this.removeFile(variant.keys);
         }
       } finally {
+        variant.renderReadKeys = undefined;
         this.activeVariantIds.delete(variantId);
       }
     }
@@ -383,6 +405,9 @@ export class ContextCacheService {
     renderSequenceAtStart?: number,
   ): boolean {
     if (!this.claimRenderSequence(variant, renderSequenceAtStart)) return false;
+    // The reader may observe changed project mappings after the queue's
+    // preliminary lookup. Its returned scope describes the accepted body.
+    variant.readKeys = new Set([...keys.projects, ...(render.readKeys ?? [])].map(project => project.toLowerCase()));
     if (!render.cacheable || !this.servable) {
       this.removeFile(keys);
       return true;
@@ -426,21 +451,6 @@ export class ContextCacheService {
       logger.error('CONTEXT_CACHE', 'Failed to remove a cached context block', { keys },
         error instanceof Error ? error : new Error(String(error)));
     }
-  }
-
-  private refreshReadKeys(variantId: string, provided?: string[]): void | Promise<void> {
-    const variant = this.variants.get(variantId);
-    if (!variant) return;
-    const expanded = provided ?? this.options.expandProjectReadKeys(variant.keys.projects);
-    const apply = (readKeys: string[]) => {
-      if (this.stopped || this.variants.get(variantId) !== variant) return;
-      variant.readKeys = new Set([...variant.keys.projects, ...readKeys].map(project => project.toLowerCase()));
-    };
-    if (Array.isArray(expanded)) {
-      apply(expanded);
-      return;
-    }
-    return expanded.then(apply);
   }
 
   private evictOldestVariants(): void {

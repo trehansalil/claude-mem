@@ -1,42 +1,37 @@
 import { describe, expect, it } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SessionStore } from '../../src/services/sqlite/SessionStore.js';
+import { removeTempDir } from '../helpers/temp-dir.js';
 
 describe('native prompt receipts', () => {
-  it('migrates an existing prompt table and survives an abrupt process exit after claiming a receipt', () => {
+  it('migrates an existing prompt table and commits receipts visible to another connection', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'cmem-native-exit-'));
     const db = join(dir, 'db.sqlite');
     let store = new SessionStore(db, { syncOpsEnabled: false });
     try {
       const sid = store.createSDKSession('old-session', 'project', 'legacy', undefined, 'hermes');
       store.saveUserPrompt('old-session', 1, 'legacy', sid);
+      store.db.run('DROP INDEX idx_user_prompts_legacy_window');
       store.db.run('DROP INDEX idx_user_prompts_native_identity');
       store.db.run('ALTER TABLE user_prompts DROP COLUMN native_prompt_id');
       store.db.run('ALTER TABLE user_prompts DROP COLUMN native_prompt_hash');
       store.close();
-      const module = new URL('../../src/services/sqlite/SessionStore.ts', import.meta.url).href;
-      const code = `const { SessionStore } = await import(${JSON.stringify(module)});
-        const store = new SessionStore(process.env.CMEM_NATIVE_EXIT_DB, { syncOpsEnabled: false });
-        const sid = store.createSDKSession('old-session', 'project', 'again', undefined, 'hermes');
-        const receipt = store.saveNativeUserPrompt('old-session', sid, 'lost-response-turn', 'again');
-        process.stdout.write(JSON.stringify(receipt)); process.exit(0);`;
-      const child = Bun.spawnSync([process.execPath, '-e', code], {
-        env: { ...process.env, CMEM_NATIVE_EXIT_DB: db }, stdout: 'pipe', stderr: 'pipe',
-      });
-      expect(child.exitCode).toBe(0);
-      const receipt = JSON.parse(child.stdout.toString());
       store = new SessionStore(db, { syncOpsEnabled: false });
-      expect(store.saveNativeUserPrompt('old-session', sid, 'lost-response-turn', 'again')).toEqual({ ...receipt, duplicate: true });
+      const receipt = store.saveNativeUserPrompt('old-session', sid, 'lost-response-turn', 'again');
+      const second = new SessionStore(db, { syncOpsEnabled: false });
+      try {
+        expect(second.saveNativeUserPrompt('old-session', sid, 'lost-response-turn', 'again')).toEqual({ ...receipt, duplicate: true });
+      } finally { second.close(); }
       expect(store.getPromptNumberFromUserPrompts('old-session', sid)).toBe(2);
       const legacy = store.db.query('SELECT native_prompt_id, native_prompt_hash FROM user_prompts WHERE session_db_id = ? AND prompt_number = 1').get(sid);
       expect(legacy).toEqual({ native_prompt_id: null, native_prompt_hash: null });
       expect(store.getUserPrompt('old-session', 1, sid)).toBe('legacy');
-    } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+    } finally { store.close(); await removeTempDir(dir); }
   });
 
-  it('keeps repeated real turns distinct and returns the same receipt after a lost response/restart', () => {
+  it('keeps repeated real turns distinct and returns the same receipt after a lost response/restart', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'cmem-native-prompt-'));
     let store = new SessionStore(join(dir, 'db.sqlite'), { syncOpsEnabled: false });
     try {
@@ -57,7 +52,7 @@ describe('native prompt receipts', () => {
       for (const invalid of ['', 'white space', 'x'.repeat(257), 'control\u0000']) {
         expect(() => store.saveNativeUserPrompt('native-session', sid, invalid, 'again')).toThrow('Invalid native prompt');
       }
-    } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+    } finally { store.close(); await removeTempDir(dir); }
   });
 
   it('scopes native IDs by session/platform, keeps old rows/imports usable, and does not reopen on a retry', () => {

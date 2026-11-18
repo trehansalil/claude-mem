@@ -1,9 +1,13 @@
+import type { DeepSearchExecutor } from '../deep-search/protocol.js';
+import { emptyDeepResult, type DeepSearchResult } from '../sqlite/tool-use-search.js';
+import { formatDeepSearch } from '../../shared/deep-search-format.js';
+import { AppError } from '../server/ErrorHandler.js';
 
 import { SessionSearch } from '../sqlite/SessionSearch.js';
 import { SessionStore } from '../sqlite/SessionStore.js';
 import type { ContextReadWorkerClient } from '../context/ContextReadWorkerClient.js';
 import { ChromaSync, type ChromaFallbackRowIds, type ChromaQueryProgress } from '../sync/ChromaSync.js';
-import { FormattingService } from './FormattingService.js';
+import { FormattingService, singleLineTitle } from './FormattingService.js';
 import { TimelineService } from './TimelineService.js';
 import type { TimelineItem } from './TimelineService.js';
 import type { ObservationSearchResult, SessionSummarySearchResult, UserPromptSearchResult } from '../sqlite/types.js';
@@ -47,6 +51,8 @@ export interface SearchTelemetryEnvelope {
   fallback_reason?: 'none' | 'chroma_connection' | 'chroma_error' | 'chroma_not_initialized' | 'chroma_zero_results';
 }
 
+type ObservationSearchState = { status: 'not_requested' | 'success_empty' | 'success_nonempty' | 'error' };
+
 export class SearchManager {
   private orchestrator: SearchOrchestrator;
 
@@ -63,7 +69,8 @@ export class SearchManager {
      * An explicit `dateRange` on a request always wins over it.
      */
     private searchRecencyWindowMs: number = SEARCH_CONSTANTS.RECENCY_WINDOW_MS,
-    private contextReader: ContextReadWorkerClient | null = null
+    private contextReader: ContextReadWorkerClient | null = null,
+    private deepReader: DeepSearchExecutor | null = null
   ) {
     this.orchestrator = new SearchOrchestrator(
       sessionSearch,
@@ -115,13 +122,13 @@ export class SearchManager {
   }
 
   /**
-   * Shared "Chroma semantic match -> date-window filter -> SQLite hydrate"
+   * Shared "Chroma semantic match -> SQLite hydrate -> date-window filter"
    * pipeline for the single-doc-type hybrid searches. Explicit ranges replace the
    * default 90-day window. Returns the hydrated rows
    * (empty when Chroma yields nothing recent); callers own their own FTS
    * fallback and formatting so per-caller behavior is preserved exactly.
    */
-  private async hybridSemanticHydrate<T extends { id: number }>(
+  private async hybridSemanticHydrate<T extends { id: number; created_at_epoch: number }>(
     query: string,
     docType: string,
     project: string | undefined,
@@ -154,21 +161,21 @@ export class SearchManager {
     while (true) {
       const progress: ChromaQueryProgress = {};
       const chromaResults = await this.queryChroma(query, candidateLimit, whereFilter, requiredResults ? progress : undefined, fallbackRowIds);
-      const recentIds = chromaResults.ids.filter((_id, idx) => {
-        const meta = chromaResults.metadatas[idx];
-        return meta && meta.created_at_epoch != null
-          && (startEpoch === undefined || meta.created_at_epoch >= startEpoch)
-          && (endEpoch === undefined || meta.created_at_epoch <= endEpoch);
-      });
+      const candidateIds = chromaResults.ids.filter((_id, index) => chromaResults.metadatas[index] != null);
       // Repeated ranked prefixes reuse successful and rejected native lookups.
       // Build results in the current Chroma order, including cached matches.
-      const newIds = recentIds.filter(id => !visited.has(id));
+      const newIds = candidateIds.filter(id => !visited.has(id));
       for (let offset = 0; offset < newIds.length; offset += 500) {
         const batch = newIds.slice(offset, offset + 500);
         for (const id of batch) visited.add(id);
-        for (const row of hydrate(batch, readKeys)) hydrated.set(row.id, row);
+        // The canonical date may have changed since the vector was indexed.
+        for (const row of hydrate(batch, readKeys)) {
+          if (row.created_at_epoch != null
+            && (startEpoch === undefined || row.created_at_epoch >= startEpoch)
+            && (endEpoch === undefined || row.created_at_epoch <= endEpoch)) hydrated.set(row.id, row);
+        }
       }
-      const rows = recentIds.flatMap(id => {
+      const rows = candidateIds.flatMap(id => {
         const row = hydrated.get(id);
         return row ? [row] : [];
       });
@@ -186,10 +193,11 @@ export class SearchManager {
   }
 
   private async searchChromaForTimeline(query: string, project?: string, platformSource?: string, projects?: string[]): Promise<ObservationSearchResult[]> {
-    return this.hybridSemanticHydrate(query, 'observation', project, platformSource, (ids, readKeys) =>
-      this.sessionStore.getObservationsByIds(ids, { orderBy: 'relevance', limit: 1, project, projects: readKeys, platformSource }),
+    const rows = await this.hybridSemanticHydrate(query, 'observation', project, platformSource, (ids, readKeys) =>
+      this.sessionStore.getObservationsByIds(ids, { orderBy: 'relevance', project, projects: readKeys, platformSource }),
       projects,
     );
+    return rows.slice(0, 1);
   }
 
   /**
@@ -284,7 +292,7 @@ export class SearchManager {
           const icon = ModeManager.getInstance().getTypeIcon(obs.type);
 
           const time = formatTime(item.epoch);
-          const title = obs.title || 'Untitled';
+          const title = singleLineTitle(obs.title || 'Untitled');
           const tokens = estimateTokens(obs.narrative);
 
           const showTime = time !== lastTime;
@@ -308,7 +316,8 @@ export class SearchManager {
     const normalized: any = { ...args };
 
     if (normalized.filePath && !normalized.files) {
-      normalized.files = normalized.filePath;
+      // A single file path may itself contain commas.
+      normalized.files = typeof normalized.filePath === 'string' ? [normalized.filePath] : normalized.filePath;
       delete normalized.filePath;
     }
 
@@ -453,6 +462,44 @@ export class SearchManager {
   }
 
   async search(args: any, telemetryOut?: SearchTelemetryEnvelope): Promise<any> {
+    if (args.deep !== undefined && ![true, false, 'true', 'false'].includes(args.deep)) {
+      throw new AppError('deep must be true or false', 400, 'INVALID_SEARCH_REQUEST');
+    }
+    const state: ObservationSearchState = { status: 'not_requested' };
+    const result = await this.searchMemory(args, telemetryOut, state);
+    if (args.deep !== true && args.deep !== 'true') return result;
+    const normalized = this.normalizeParams(args);
+    const { query, type, obs_type, concepts, files, format, ...options } = normalized;
+    const { effectiveObsType } = this.resolveTypeFilters(type, obs_type);
+    // Existing search has no session/tool predicate. Do not silently discard a
+    // filter that the raw tier cannot apply with the same observation semantics.
+    const unmapped = effectiveObsType || concepts?.length || files?.length
+      || ['contentSessionId', 'sessionDbId', 'memorySessionId', 'session', 'toolName', 'agentId']
+        .some(key => normalized[key] !== undefined);
+    let raw: DeepSearchResult;
+    if (typeof query !== 'string' || !query.trim()
+      || Number(options.offset || 0) !== 0 || unmapped || state.status === 'not_requested') {
+      raw = emptyDeepResult('not_applicable');
+    } else if (state.status === 'error') raw = emptyDeepResult('observation_error');
+    else if (state.status === 'success_nonempty') raw = emptyDeepResult('observations_found');
+    else {
+      try {
+        const status = this.sessionSearch.getToolUseIndexStatus();
+        const projects = projectReadKeysFor(this.sessionStore, options.project, options.projects);
+        const rawOptions = { ...options, projects };
+        raw = status !== 'ready' ? emptyDeepResult(status)
+          : this.deepReader ? await this.deepReader.search(query, rawOptions)
+            : emptyDeepResult('unsupported');
+      } catch (error) {
+        logger.error('SEARCH', 'Raw tool search failed', {}, error instanceof Error ? error : undefined);
+        raw = emptyDeepResult('error');
+      }
+    }
+    if (format === 'json') return { ...result, ...raw };
+    return { ...result, ...raw, content: [...result.content, { type: 'text', text: formatDeepSearch(raw) }] };
+  }
+
+  private async searchMemory(args: any, telemetryOut: SearchTelemetryEnvelope | undefined, state: ObservationSearchState): Promise<any> {
     const normalized = this.normalizeParams(args);
     const { query, type, obs_type, concepts, files, format, ...options } = normalized;
     // Gate P2-5: every key the requested projects are stored under, so a
@@ -509,7 +556,7 @@ export class SearchManager {
     }
     // PATH 2: CHROMA SEMANTIC SEARCH (query text + Chroma available)
     else if (this.chromaSync) {
-      let chromaSucceeded = false;
+      let chromaResult: StrategySearchResult | undefined;
       logger.debug('SEARCH', 'Using ChromaDB semantic search', { typeFilter: category || 'all' });
 
       // HTTP pagination values can be strings. Keep enough filtered rows to
@@ -520,7 +567,7 @@ export class SearchManager {
       const candidateOptions = { ...options, offset: 0, limit: limit === undefined ? undefined : offset + limit };
 
       try {
-        const chromaResult = await this.orchestrator.searchChroma({
+        chromaResult = await this.orchestrator.searchChroma({
           ...candidateOptions,
           // The strategy resolves stored project keys itself; do not expand
           // the already-resolved candidateOptions.projects a second time.
@@ -534,24 +581,6 @@ export class SearchManager {
           // Omitted-limit JSON searches historically expose the ranked window.
           limit: candidateOptions.limit ?? SEARCH_CONSTANTS.CHROMA_BATCH_SIZE,
         });
-        chromaSucceeded = true;
-        // Same fallback policy as the orchestrator pipeline: SQLite refills every requested
-        // category Chroma left empty, or answers alone when Chroma left them all empty.
-        const supplemented = await this.orchestrator.supplementEmptyCategories(
-          {
-            ...candidateOptions,
-            limit: candidateOptions.limit ?? offset + SEARCH_CONSTANTS.DEFAULT_LIMIT,
-            query,
-            searchType: category ?? 'all',
-            obsType: effectiveObsType,
-            concepts,
-            files,
-            orderBy: options.orderBy ?? 'relevance',
-          },
-          chromaResult
-        );
-        ({ observations, sessions, prompts } = supplemented.results);
-        chromaSupplementStrategy = supplemented.strategy;
       } catch (chromaError) {
         const errorObject = chromaError instanceof Error ? chromaError : new Error(String(chromaError));
         chromaFailureReason = {
@@ -583,6 +612,29 @@ export class SearchManager {
           const ftsErrorObject = ftsError instanceof Error ? ftsError : new Error(String(ftsError));
           logger.error('WORKER', 'FTS5 fallback search failed after a Chroma error', {}, ftsErrorObject);
         }
+      }
+
+      // Only a failed semantic search should trigger the Chroma fallback.
+      // A SQLite refill failure must escape, just as in SearchOrchestrator;
+      // retrying it as a Chroma failure can silently discard semantic matches.
+      if (chromaResult) {
+        // Same fallback policy as the orchestrator pipeline: SQLite refills every requested
+        // category Chroma left empty, or answers alone when Chroma left them all empty.
+        const supplemented = await this.orchestrator.supplementEmptyCategories(
+          {
+            ...candidateOptions,
+            limit: candidateOptions.limit ?? offset + SEARCH_CONSTANTS.DEFAULT_LIMIT,
+            query,
+            searchType: category ?? 'all',
+            obsType: effectiveObsType,
+            concepts,
+            files,
+            orderBy: options.orderBy ?? 'relevance',
+          },
+          chromaResult
+        );
+        ({ observations, sessions, prompts } = supplemented.results);
+        chromaSupplementStrategy = supplemented.strategy;
       }
 
       if (!chromaFailed && (options.orderBy === 'date_desc' || options.orderBy === 'date_asc')) {
@@ -629,6 +681,8 @@ export class SearchManager {
       }
     }
 
+    state.status = !searchObservations ? 'not_requested' : chromaFailed ? 'error'
+      : observations.length ? 'success_nonempty' : 'success_empty';
     const totalResults = observations.length + sessions.length + prompts.length;
 
     // Telemetry envelope (search_performed): derive the strategy from the
@@ -1006,41 +1060,24 @@ export class SearchManager {
   async searchObservations(args: any): Promise<any> {
     const normalized = this.normalizeParams(args);
     const { query, ...options } = normalized;
+    const limit = options.limit || 20;
     let results: ObservationSearchResult[] = [];
-    const semanticWork = { budgetReached: false };
 
-    if (this.chromaSync) {
-      logger.debug('SEARCH', 'Using hybrid semantic search (Chroma + SQLite)', {});
+    if (query && this.chromaSync) {
+      // Use the same filtered candidate window and final page boundary as the
+      // unified search. This endpoint's `type` denotes an observation type.
+      const retrieved = await this.searchMemory({
+        ...options,
+        query,
+        type: 'observations',
+        obs_type: options.type,
+        format: 'json',
+        limit,
+      }, undefined, { status: 'not_requested' });
+      results = retrieved.observations;
+    } else {
       try {
-        const limit = options.limit || 20;
-        // `projects` comes parsed from the route (#4304); the keyword fallback
-        // below already reads it, so Chroma and the hydration must too (#4248).
-        results = await this.hybridSemanticHydrate(query, 'observation', options.project, options.platformSource, (ids, readKeys) =>
-          this.sessionStore.getObservationsByIds(ids, { ...options, orderBy: 'relevance', limit, projects: readKeys }),
-          options.projects,
-          options.dateRange,
-          options.type || options.concepts || options.files || options.dateRange ? limit : undefined,
-          semanticWork
-        );
-      } catch (chromaError) {
-        const errorObject = chromaError instanceof Error ? chromaError : new Error(String(chromaError));
-        logger.error('WORKER', 'Chroma search failed for observations, falling back to FTS', {}, errorObject);
-      }
-    }
-
-    if (results.length === 0 || semanticWork.budgetReached) {
-      try {
-        const ftsResults = this.sessionSearch.searchObservations(query, options);
-        if (ftsResults.length > 0) {
-          // At the work cap, keyword results fill the remaining slots without
-          // discarding valid semantic matches or repeating shared row IDs.
-          const seen = new Set(results.map(row => row.id));
-          results = [...results, ...ftsResults.filter(row => {
-            if (seen.has(row.id)) return false;
-            seen.add(row.id);
-            return true;
-          })].slice(0, options.limit || 20);
-        }
+        results = this.sessionSearch.searchObservations(query, { ...options, limit });
       } catch (ftsError) {
         logger.warn('SEARCH', 'FTS fallback failed for observations', {}, ftsError instanceof Error ? ftsError : undefined);
       }
@@ -1210,7 +1247,7 @@ export class SearchManager {
 
   async getTimelineByQuery(args: any): Promise<any> {
     const normalized = this.normalizeParams(args);
-    const { query, mode, limit = 5, project, platformSource } = normalized;
+    const { query, mode, limit = 5, project, projects, platformSource } = normalized;
 
     if (mode !== 'interactive') {
       return this.timeline(args);
@@ -1221,9 +1258,11 @@ export class SearchManager {
     if (this.chromaSync) {
       logger.debug('SEARCH', 'Using hybrid semantic search for timeline query', {});
       try {
-        results = await this.hybridSemanticHydrate(query, 'observation', project, platformSource, (ids) =>
-          this.sessionStore.getObservationsByIds(ids, { orderBy: 'relevance', limit, project, platformSource })
+        results = await this.hybridSemanticHydrate(query, 'observation', project, platformSource, (ids, readKeys) =>
+          this.sessionStore.getObservationsByIds(ids, { orderBy: 'relevance', project, projects: readKeys, platformSource }),
+          projects,
         );
+        results = results.slice(0, limit);
       } catch (chromaError) {
         const errorObject = chromaError instanceof Error ? chromaError : new Error(String(chromaError));
         logger.error('WORKER', 'Chroma search failed for timeline by query, falling back to FTS', {}, errorObject);
@@ -1232,7 +1271,8 @@ export class SearchManager {
 
     if (results.length === 0) {
       try {
-        const ftsResults = this.sessionSearch.searchObservations(query, { project, platformSource, limit });
+        const readKeys = projectReadKeysFor(this.sessionStore, project, projects);
+        const ftsResults = this.sessionSearch.searchObservations(query, { project, projects: readKeys, platformSource, limit });
         if (ftsResults.length > 0) {
           results = ftsResults;
         }

@@ -19,6 +19,7 @@ import { DisabledServerQueueManager } from '../../src/server/runtime/types.js';
 import { SEMANTIC_CONTEXT_MAX_LIMIT } from '../../src/shared/semantic-context.js';
 import { embedObservationRows, getSharedEmbedder } from '../../src/server/services/ObservationEmbeddingService.js';
 import { PostgresObservationEmbeddingsRepository } from '../../src/storage/postgres/observation-embeddings.js';
+import { LocalEmbedder } from '../../src/services/vector/LocalEmbedder.js';
 import { logger } from '../../src/utils/logger.js';
 import { newApiKey, createIsolatedSchema, dropSchema } from '../sdk/pg-isolation.js';
 
@@ -42,6 +43,11 @@ describe('POST /v1/context/semantic limits', () => {
   beforeEach(async () => {
     spies = (['info', 'warn', 'error', 'debug'] as const).map((level) =>
       spyOn(logger, level).mockImplementation(() => {}),
+    );
+    spies.push(
+      spyOn(LocalEmbedder.prototype, 'embed').mockImplementation(async (texts: string[]) =>
+        texts.map(() => new Float32Array(384).fill(0.05))),
+      spyOn(LocalEmbedder.prototype, 'isReady').mockReturnValue(true),
     );
     schemaName = await createIsolatedSchema(testDatabaseUrl!, 'cm_semantic_ctx');
     // public too, where pgvector's type lives once any test has created it.
@@ -102,33 +108,30 @@ describe('POST /v1/context/semantic limits', () => {
     return { status: 200, count: json.count, context: json.context };
   }
 
-  // An answer with content needs pgvector and the embedding model; without
-  // either the route answers empty and these tests say so and return.
+  // Fixed vectors exercise the route without loading the embedding model.
   async function canAnswer(): Promise<boolean> {
     // Whether this database got the embeddings table, which the bootstrap
     // creates only where pgvector 0.8+ is usable, not merely installable.
     const table = await pool.query<{ present: boolean }>(`SELECT to_regclass('observation_embeddings') IS NOT NULL AS present`);
     const vectors = table.rows[0]?.present === true;
-    const model = await getSharedEmbedder().embed(['probe']).then(() => true, () => false);
-    // The search CI job (CLAUDE_MEM_TEST_PGVECTOR=1) has both; there a
-    // missing one fails these tests instead of passing them untested.
     if (process.env.CLAUDE_MEM_TEST_PGVECTOR === '1') {
-      expect({ vectors, model }).toEqual({ vectors: true, model: true });
+      expect(vectors).toBe(true);
     }
-    if (!vectors || !model) console.warn('vector search or the embedding model is unavailable; semantic answers not tested');
-    return vectors && model;
+    if (!vectors) console.warn('vector search is unavailable; semantic answers not tested');
+    return vectors;
   }
 
   async function seed(rows: Array<{ content: string; kind?: string; metadata?: Record<string, string> }>): Promise<void> {
     const storage = createPostgresStorageRepositories(client);
     const team = (await client.query<{ team_id: string }>('SELECT team_id FROM projects WHERE id = $1', [projectId])).rows[0]!.team_id;
     const embeddings = new PostgresObservationEmbeddingsRepository(pool);
+    const observations = [];
     for (const row of rows) {
-      const observation = await storage.observations.create({ projectId, teamId: team, ...row });
-      // With vectors, so the search finds them by meaning on any Postgres
-      // with pgvector, not only where bm25 matches any keyword.
-      const [embedded] = (await embedObservationRows(pool, [observation])) ?? [];
-      if (embedded) await embeddings.upsert({ observationId: observation.id, model: getSharedEmbedder().modelId, ...embedded });
+      observations.push(await storage.observations.create({ projectId, teamId: team, ...row }));
+    }
+    const embedded = (await embedObservationRows(pool, observations)) ?? [];
+    for (const [index, parts] of embedded.entries()) {
+      await embeddings.upsert({ observationId: observations[index]!.id, model: getSharedEmbedder().modelId, ...parts });
     }
   }
 

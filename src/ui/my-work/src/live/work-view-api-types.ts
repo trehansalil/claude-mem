@@ -1,5 +1,8 @@
 // Types for GET /api/work-view on the local worker (claude-mem 15.0.1), written from a real response
 // (.scratch/work-view-sample.json). Only the keys the mapper reads are typed; the rest are left out on purpose.
+// A status the worker declares a type for is taken from that declaration, never retyped here.
+import type { FocusAreaStatus } from '../../../../services/work-view/my-focus.mjs'
+import type { SavedRule } from '../../../../services/work-view/my-rules.mjs'
 
 /** One image ref, as src/shared/media-contract.ts MediaAttachmentRef defines it. Restated because My Work's tsconfig
  * (erasableSyntaxOnly) cannot load that file; src/services/work-view/overview.ts fails the root typecheck if they differ. */
@@ -20,6 +23,8 @@ export interface WorkViewItem {
   kind: 'work-state' | 'session-request'
   title: string
   status: string
+  /** The recorded status Jev's label stands for (work-state-labels.mjs), when it may replace `status`. Older workers leave it out. */
+  judgedStatus?: string | null
   nextStep: WorkViewTextField | null
   lastUpdateEpoch: number
   sourceRefs: WorkViewSourceRef[]
@@ -174,6 +179,12 @@ export interface WorkViewAgent {
   sessionTitle: string | null
   project: string | null
   contentSessionId: string | null
+  /**
+   * A subagent's launch: its parent's Agent call (agent-view.mjs readAgentLaunches). Only `description`, the call's
+   * short task title, is read; `prompt` is the whole task text and stays off the screens. Null when none is recorded;
+   * older workers leave it out.
+   */
+  launch?: { description?: string | null } | null
 }
 
 export interface WorkViewSource {
@@ -238,7 +249,7 @@ export interface WorkViewRule {
   when: string
   then: string
   setBy: 'owner' | 'approved' | 'learned'
-  status: 'on' | 'off' | 'suggested' | 'replaced' | 'dismissed'
+  status: SavedRule['status']
   kind: string
   source: string
   timesSeen: number
@@ -246,6 +257,8 @@ export interface WorkViewRule {
   latestAt: string | null
   /** `at` is ISO or null. */
   quotes: { at: string | null; quote: string; kind: string }[]
+  /** Absent on older workers. Local evidence can still include omitted saved quotes. */
+  quotesOmitted?: SavedRule['quotesOmitted']
   replacedBy: string | null
   replacedAt: string | null
   savedAt: string | null
@@ -259,7 +272,7 @@ export interface WorkViewFocusArea {
   goal: string | null
   /** What belongs in the area, beyond its goal. Older workers leave it out. */
   about?: string | null
-  status: 'suggested' | 'kept' | 'dismissed' | 'done'
+  status: FocusAreaStatus
   priorityRank: number | null
   /** The owner's order; when set it wins over priorityRank. */
   ownerRank: number | null
@@ -270,6 +283,8 @@ export interface WorkViewFocusArea {
   /** 'owner-restore': the owner handed it back to suggestions, so refreshes may update it again. */
   decidedBy: 'owner' | 'system' | 'owner-restore'
   savedAt: string | null
+  /** When the row that marked it done was written (ISO); null unless done (my-focus.mjs). Older workers leave it out. */
+  doneAt?: string | null
 }
 
 export interface WorkViewRuleScope { id: string; tier: 'everywhere' | 'project' | 'situation'; name: string }
@@ -320,9 +335,16 @@ export interface WorkViewSharedState {
   error?: string
 }
 
+/**
+ * A refresh run's state, as the worker reports it in refresh.json and in the setup extraction view.
+ * `waiting-for-agent`: no logged-in agent could run it yet, and the next check tries again. Every screen that shows
+ * a run uses this one list.
+ */
+export type WorkViewRefreshState = 'idle' | 'running' | 'ok' | 'failed' | 'waiting-for-agent'
+
 /** refresh.json, written by the worker's automatic refresh (auto-refresh-worker.mjs). */
 export interface WorkViewRefresh {
-  state: 'idle' | 'running' | 'ok' | 'failed' | 'waiting-for-agent'
+  state: WorkViewRefreshState
   startedAt?: string
   finishedAt?: string
   error?: string | null

@@ -55,6 +55,8 @@ frontier model.
 </Step>
 
 <Step title="Point claude-mem at it">
+Set the endpoint preset and key in `~/.claude-mem/settings.json`:
+
 ```json
 {
   "CLAUDE_MEM_PROVIDER": "openai-compatible",
@@ -97,6 +99,7 @@ endpoint or model you pinned yourself.
 | `nvidia-nim` | `https://integrate.api.nvidia.com/v1` | yes |
 | `orcarouter` | `https://api.orcarouter.ai/v1` | yes |
 | `api-route` | `https://global.api-route.com/v1` | yes |
+| `modelgo` | `https://api.modelgo.ai/v1` | yes |
 | `opper` | `https://api.opper.ai/v3/compat` | yes |
 | `atlascloud` | `https://api.atlascloud.ai/v1` | yes |
 | `popnow` | `https://api.popnow.ai/v1` | yes |
@@ -104,6 +107,10 @@ endpoint or model you pinned yourself.
 | `cheapaimodel` | `https://api.cheapaimodel.ai/v1` | yes |
 | `obscurify-ai` | `https://obscurify.ai/v1` | yes |
 | `standardcompute` | `https://api.stdcmpt.com/v1` | yes |
+| `uberllm` | `https://api.uberllm.dev/v1` | yes |
+| `hopbase` | `https://api.hop-base.com/v1` | yes |
+| `trustedrouter` | `https://api.trustedrouter.com/v1` | yes |
+| `atmorouter` | `https://atmorouter.dev/v1` | yes |
 | `deepseek` | `https://api.deepseek.com/v1` | yes |
 | `opencode-go` | `https://opencode.ai/zen/go/v1` | yes |
 | `opencode-zen` | `https://opencode.ai/zen/v1` | yes |
@@ -146,8 +153,8 @@ work.
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `CLAUDE_MEM_PROVIDER` | `claude` | Set to `openai-compatible` to select this provider |
-| `CLAUDE_MEM_OPENAI_COMPAT_PRESET` | `''` (= `custom`) | Named endpoint preset from the table above |
-| `CLAUDE_MEM_OPENAI_COMPAT_BASE_URL` | preset's | OpenAI-compatible base URL. `/chat/completions` is appended if absent |
+| `CLAUDE_MEM_OPENAI_COMPAT_PRESET` | `''` (= `custom`) | Named endpoint preset from the table above. Settings file or environment only |
+| `CLAUDE_MEM_OPENAI_COMPAT_BASE_URL` | preset's | OpenAI-compatible base URL. `/chat/completions` is appended if absent. Settings file or environment only |
 | `CLAUDE_MEM_OPENAI_COMPAT_MODEL` | preset's | Model id, passed verbatim |
 | `CLAUDE_MEM_OPENAI_COMPAT_OBSERVATION_BATCH_SIZE` | `1` | Queued tool events per observer request (1–32); see [Observation batching](#observation-batching) |
 | `CLAUDE_MEM_OPENAI_COMPAT_REASONING` | `''` (= off) | `off` sends `reasoning: { enabled: false }` on every request. `on` leaves reasoning to the endpoint |
@@ -157,9 +164,12 @@ work.
 An unknown preset id degrades to `custom` rather than failing, because settings
 are read during status polling and a typo should not crash a poll.
 
-The viewer's **Settings → Advanced** panel edits the provider, preset, base URL
-and model. The API key is set in `~/.claude-mem/settings.json` or
-`~/.claude-mem/.env` only, never through the viewer.
+The viewer's **Settings → Advanced** panel edits the provider and model, and
+displays the endpoint preset and base URL read-only. Set the preset and base URL
+in `~/.claude-mem/settings.json` or environment variables with the same names.
+They determine where requests and stored API keys are sent, so the settings
+HTTP API cannot change them. An unrelated viewer save preserves those values.
+The API key is set in `~/.claude-mem/settings.json` or `~/.claude-mem/.env` only.
 
 ## Observation batching
 
@@ -311,6 +321,27 @@ Alternatively, store the key as `OPENAI_COMPAT_API_KEY` in
 Without a model or key, this provider is unconfigured and dispatch falls
 through to Claude.
 
+## ModelGo
+
+[ModelGo](https://modelgo.ai) exposes OpenAI-compatible chat completions and
+an authenticated model catalog behind one `mgk_` API key. The preset does not
+choose a default model because the logical model names available to each key
+depend on its account policy. List them with `GET https://api.modelgo.ai/v1/models`
+and select one that supports `/chat/completions`.
+
+```json
+{
+  "CLAUDE_MEM_PROVIDER": "openai-compatible",
+  "CLAUDE_MEM_OPENAI_COMPAT_PRESET": "modelgo",
+  "CLAUDE_MEM_OPENAI_COMPAT_API_KEY": "mgk_...",
+  "CLAUDE_MEM_OPENAI_COMPAT_MODEL": "<your chat-completions model id>"
+}
+```
+
+Create a key in the [ModelGo console](https://console.modelgo.ai). Alternatively,
+store it as `OPENAI_COMPAT_API_KEY` in `~/.claude-mem/.env`. Restart the worker
+after changing the configuration.
+
 ## Opper
 
 [Opper](https://opper.ai) is an EU-hosted gateway with one OpenAI-compatible
@@ -443,6 +474,82 @@ endpoint, set `CLAUDE_MEM_OPENAI_COMPAT_BASE_URL` to
   "CLAUDE_MEM_OPENAI_COMPAT_PRESET": "standardcompute",
   "CLAUDE_MEM_OPENAI_COMPAT_API_KEY": "<your Standard Compute key>",
   "CLAUDE_MEM_OPENAI_COMPAT_MODEL": "deepseek/deepseek-v4-flash"
+}
+```
+
+## UberLLM
+
+[UberLLM](https://uberllm.dev) serves models from DeepSeek, Z.ai, Moonshot,
+Qwen, Google, Anthropic and others through one OpenAI-compatible key, billed
+from prepaid credit. Model ids are vendor-prefixed, such as
+`deepseek/deepseek-v4.1-flash` (the preset's default) or `z-ai/glm-5.2`, and are
+passed verbatim. The model list is public at
+`https://api.uberllm.dev/v1/models`, and keys come from the
+[UberLLM dashboard](https://uberllm.dev/dashboard/keys).
+
+```json
+{
+  "CLAUDE_MEM_PROVIDER": "openai-compatible",
+  "CLAUDE_MEM_OPENAI_COMPAT_PRESET": "uberllm",
+  "CLAUDE_MEM_OPENAI_COMPAT_API_KEY": "<your UberLLM key>",
+  "CLAUDE_MEM_OPENAI_COMPAT_MODEL": "deepseek/deepseek-v4.1-flash"
+}
+```
+
+## HopBase
+
+[HopBase](https://hop-base.com) is a model API gateway that serves Claude, GPT,
+Gemini, DeepSeek, Qwen, GLM and other models through one OpenAI-compatible base
+URL. Model ids are passed verbatim, such as `deepseek-v4.1-flash` (the preset's
+default) or `claude-haiku-5-5`. `GET https://api.hop-base.com/v1/models`, called
+with your key, lists the ids that key can call; keys come from the HopBase
+console, and the [API docs](https://hop-base.com/en/docs) cover the endpoint.
+
+```json
+{
+  "CLAUDE_MEM_PROVIDER": "openai-compatible",
+  "CLAUDE_MEM_OPENAI_COMPAT_PRESET": "hopbase",
+  "CLAUDE_MEM_OPENAI_COMPAT_API_KEY": "<your HopBase key>",
+  "CLAUDE_MEM_OPENAI_COMPAT_MODEL": "deepseek-v4.1-flash"
+}
+```
+
+## TrustedRouter
+
+[TrustedRouter](https://trustedrouter.com) is an OpenAI-compatible gateway that
+routes requests across open and frontier model providers behind one key. Model
+ids are vendor-prefixed, such as `deepseek/deepseek-v4-flash` (the preset's
+default, a cheap fixed model suited to high-volume extraction), and are passed
+verbatim. `trustedrouter/auto` is opt-in: it picks a model per request and is
+priced per routed model, up to frontier rates. The model list is public at
+`https://api.trustedrouter.com/v1/models`, and setup notes are in
+[the TrustedRouter docs](https://trustedrouter.com/docs).
+
+```json
+{
+  "CLAUDE_MEM_PROVIDER": "openai-compatible",
+  "CLAUDE_MEM_OPENAI_COMPAT_PRESET": "trustedrouter",
+  "CLAUDE_MEM_OPENAI_COMPAT_API_KEY": "<your TrustedRouter key>",
+  "CLAUDE_MEM_OPENAI_COMPAT_MODEL": "deepseek/deepseek-v4-flash"
+}
+```
+
+## AtmoRouter
+
+[AtmoRouter](https://atmorouter.dev) is a usage-based gateway with an
+OpenAI-compatible Chat Completions endpoint, billed per token from a prepaid
+USD balance. Model ids carry a route prefix, such as `zai/glm-5.3-flash` (the
+preset's default) or `zai/glm-5.3`, and are passed verbatim. The model list is
+public at `https://atmorouter.dev/v1/models`, and keys (`ar-...`) come from
+Dashboard → API Keys in the [AtmoRouter dashboard](https://atmorouter.dev/dashboard).
+Setup notes are in [the AtmoRouter docs](https://atmorouter.dev/docs/quickstart).
+
+```json
+{
+  "CLAUDE_MEM_PROVIDER": "openai-compatible",
+  "CLAUDE_MEM_OPENAI_COMPAT_PRESET": "atmorouter",
+  "CLAUDE_MEM_OPENAI_COMPAT_API_KEY": "<your AtmoRouter key>",
+  "CLAUDE_MEM_OPENAI_COMPAT_MODEL": "zai/glm-5.3-flash"
 }
 ```
 

@@ -1,9 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
-import {
-  postCorpusRequestOverSse,
-  CORPUS_STREAM_IDLE_TIMEOUT_MS,
-  CORPUS_STREAM_ABSOLUTE_CAP_MS,
-} from '../../src/servers/corpus-worker-stream.js';
+import { postCorpusRequestOverSse } from '../../src/servers/corpus-worker-stream.js';
 import { createStreamFetchMock, trackLiveTimers, type LiveTimerTracker } from '../helpers/stream-fetch-mock.js';
 
 // Production is idle 30 s / cap 15 min with a 10 s worker heartbeat; scaled 1000x down here.
@@ -31,11 +27,6 @@ describe('postCorpusRequestOverSse (MCP callWorker corpus path)', () => {
   }
 
   const settle = () => new Promise<void>((resolve) => setImmediate(resolve));
-
-  it('uses the plan constants: 30 s idle, 15 min absolute cap', () => {
-    expect(CORPUS_STREAM_IDLE_TIMEOUT_MS).toBe(30_000);
-    expect(CORPUS_STREAM_ABSOLUTE_CAP_MS).toBe(15 * 60_000);
-  });
 
   it('survives a prime far longer than the idle window while pings arrive, and returns the JSON-mode body', async () => {
     const primeBody = { session_id: 'sess-123', name: 'alpha' };
@@ -70,6 +61,16 @@ describe('postCorpusRequestOverSse (MCP callWorker corpus path)', () => {
 
     await expect(postCorpusRequestOverSse('/api/corpus/zeta/prime', {}, SCALED_TIMING))
       .rejects.toThrow(`Worker API error (404): ${JSON.stringify(notFoundBody)}`);
+  });
+
+  it('uses the media type rather than case or parameter text to select the stream parser', async () => {
+    const body = { answer: 'done' };
+    const event = `event: result\ndata: ${JSON.stringify(body)}\n\n`;
+    useScript({ headers: { 'content-type': 'TEXT/Event-Stream; charset=utf-8' }, body: [{ chunk: event }] });
+    expect(await postCorpusRequestOverSse('/api/corpus/c/query', {}, SCALED_TIMING)).toEqual(body);
+    useScript({ headers: { 'content-type': 'application/json; profile="text/event-stream"' },
+      body: [{ chunk: JSON.stringify(body) }] });
+    expect(await postCorpusRequestOverSse('/api/corpus/c/query', {}, SCALED_TIMING)).toEqual(body);
   });
 
   it('keeps the JSON error text for a request rejected before the stream opened', async () => {

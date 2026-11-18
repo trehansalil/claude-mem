@@ -15,6 +15,7 @@ const packageVersion = typeof __DEFAULT_PACKAGE_VERSION__ !== 'undefined' ? __DE
 import { logger } from '../utils/logger.js';
 import { spoolWorkStateMcpInstruction, spoolWorkStateMcpResult } from '../cli/work-state-telemetry.js';
 import { mcpServerInstructions } from '../shared/memory-instructions.js';
+import { claudeCodeAlreadyLoadsInstructions } from '../shared/claude-code-rules-import.js';
 
 console['log'] = (...args: any[]) => {
   logger.error('CONSOLE', 'Intercepted console output (MCP protocol protection)', undefined, { args });
@@ -61,7 +62,7 @@ import {
   withoutUnjoinedTeamBrainTools,
   WORK_STATE_TOOL_NAMES,
 } from './mcp-tool-visibility.js';
-import { loadFromFileOnce } from '../shared/hook-settings.js';
+import { loadFromFileOnce, readLocalApiToken } from '../shared/hook-settings.js';
 import { teamBrainConnection } from '../shared/teambrain.js';
 import { isWorkStateEnabled } from '../shared/work-state-setting.js';
 import { getProjectContext, type ProjectContext } from '../utils/project-name.js';
@@ -70,7 +71,7 @@ import { parseProjectList, projectsQueryValues } from '../shared/project-list.js
 import { postCorpusRequestOverSse } from './corpus-worker-stream.js';
 import { withWorkerRestartOnRefusedConnection } from './worker-restart.js';
 import { ProgressiveSearchError, progressiveSearchToolError } from '../shared/progressive-search.js';
-import { formatMcpPayload, formatWorkerMcpResponse, mcpTextResult, workerFailureText, serverFailureText, type McpTextPurpose } from './mcp-text-format.js';
+import { formatMcpPayload, formatWorkerMcpResponse, formatWorkStateMcpResponse, mcpTextResult, workerFailureText, serverFailureText, type McpTextPurpose } from './mcp-text-format.js';
 import { getRequestCwd, runWithCwd } from './request-context.js';
 import { parseHttpArgs, startMcpHttpServer, type CwdResolver, type McpHttpOptions } from './mcp-http.js';
 import { createStdioCwdResolver } from './mcp-project-cwd.js';
@@ -192,7 +193,8 @@ async function requestWorker(endpoint: string, opts: WorkerCallOptions): Promise
   logger.debug('SYSTEM', '← Worker API success', undefined, { endpoint });
 
   if (opts.text) {
-    return mcpTextResult(await response.text());
+    const text = await response.text();
+    return endpoint === '/api/work-state' ? formatWorkStateMcpResponse(text) : mcpTextResult(text);
   }
   return formatWorkerMcpResponse(workerResultPurpose(endpoint, Boolean(opts.body)), await response.json());
 }
@@ -576,7 +578,15 @@ const tools: McpToolDefinition[] = [
     },
     handler: async (args: any) => {
       if (selectRuntime() === 'server') return mcpTextResult('save_memory requires worker runtime. To save a note in the selected server, use observation_add with content and optional projectId.', true);
-      return callWorker('/api/memory/save', { body: { ...args, project: args?.project || currentCheckout().primary } });
+      // Send the checkout so the worker applies CLAUDE_MEM_EXCLUDED_PROJECTS to
+      // an explicit note exactly as it does to an HTTP save (#6098). The project
+      // stays the caller's or the active checkout's; the checkout only gates the
+      // exclusion check. On the HTTP transport the caller's workspace reaches
+      // this call through X-Claude-Mem-Cwd or roots/list; without either, the
+      // server's launch directory is used, which is also what names the project.
+      return callWorker('/api/memory/save', {
+        body: { ...args, project: args?.project || currentCheckout().primary, cwd: getRequestCwd() },
+      });
     },
   },
   {
@@ -586,7 +596,7 @@ const tools: McpToolDefinition[] = [
 2. timeline(anchor=ID) → Get context around interesting results
 3. get_observations([IDs]) → Fetch selected details ONLY for filtered IDs
 Exceptional follow-up: get_tool_uses([IDs]) for raw tool_input/tool_response, ONLY when the summary is not enough
-NEVER fetch full details without filtering first. 10x token savings.`,
+NEVER fetch full details without filtering first: an index row is ~50-100 tokens, about a tenth of a ~500-1,000-token record, so filtering decides how many records you fetch, not how large each one is.`,
     inputSchema: {
       type: 'object',
       properties: {}
@@ -617,7 +627,7 @@ Use the original three-step mem-search workflow. Reason about the index and time
    \`get_tool_uses(ids=[...])\`
    Returns: The original tool_input / tool_response bodies (UNSUMMARIZED — can be thousands of tokens each)
 
-**Why:** 10x token savings. Never fetch full details without filtering first, and never reach for raw tool I/O before the three-step workflow.
+**Why:** an index row is ~50-100 tokens, about a tenth of a ~500-1,000-token record, so filtering decides how many records you fetch, not their size. Never fetch full details without filtering first, and never reach for raw tool I/O before the three-step workflow.
 
 Optional Dumb search: \`dumb_search({query, project})\`. Doesn’t reason about the results. Fast, but shallow. Use Smart for reliable recall.`
       }]
@@ -630,6 +640,7 @@ Optional Dumb search: \`dumb_search({query, project})\`. Doesn’t reason about 
       type: 'object',
       properties: {
         query: { type: 'string', description: 'Search query' },
+        deep: { type: 'boolean', description: 'Opt-in local raw-tool search when observations have no matches. Requires CLAUDE_MEM_TOOL_USES_SEARCH_ENABLED; first page only. Results use T IDs; fetch selected numeric IDs with get_tool_uses.' },
         limit: { type: 'number', description: 'Max results (default 20)' },
         project: { type: 'string', description: 'Worker project name' },
         projectId: { type: 'string', description: 'Server project ID; defaults to the configured server project' },
@@ -646,6 +657,7 @@ Optional Dumb search: \`dumb_search({query, project})\`. Doesn’t reason about 
     annotations: READ_ONLY_TOOL_ANNOTATIONS,
     handler: async (args: any) => {
       if (selectRuntime() === 'server') {
+        if (args?.deep !== undefined && args.deep !== false) return mcpTextResult('Raw-tool deep search is local-only; no local worker request was made.', true);
         const ctx = requireServerForObservationTool('search');
         const unsupported = ['project', 'obs_type', 'dateStart', 'dateEnd', 'offset', 'orderBy']
           .filter(key => args?.[key] !== undefined);
@@ -743,7 +755,7 @@ Optional Dumb search: \`dumb_search({query, project})\`. Doesn’t reason about 
     annotations: READ_ONLY_TOOL_ANNOTATIONS,
     handler: async (args: any) => {
       if (selectRuntime() === 'server') return mcpTextResult('Raw tool I/O is unavailable in server runtime. Use selected server observations; no local worker request was made.', true);
-      return await callWorker('/api/tool-uses/batch', { body: args });
+      return await callWorker('/api/tool-uses/batch', { body: withCheckoutProjects(args ?? {}, currentCheckout()) });
     }
   },
   {
@@ -1073,7 +1085,7 @@ Optional Dumb search: \`dumb_search({query, project})\`. Doesn’t reason about 
         name: { type: 'string', description: 'Corpus name (used as filename)' },
         description: { type: 'string', description: 'What this corpus is about' },
         project: { type: 'string', description: 'Filter by project' },
-        types: { type: 'string', description: 'Comma-separated observation types: decision,bugfix,feature,refactor,discovery,change' },
+        types: { type: 'string', description: 'Comma-separated observation type IDs, such as decision, bugfix, or types from other modes' },
         concepts: { type: 'string', description: 'Comma-separated concepts to filter by' },
         files: { type: 'string', description: 'Comma-separated file paths to filter by' },
         query: { type: 'string', description: 'Semantic search query' },
@@ -1190,12 +1202,15 @@ function createMcpServer(getCwd?: CwdResolver): Server {
   // How to use these tools: the work-state rule and the memory-use guidance.
   // They are sent here, at initialize, so the SessionStart context can be the
   // memory timeline alone. Each part follows the setting that turns it off.
+  // Claude Code that already loads this exact text through CLAUDE.md
+  // (MY-RULES.md -> RULES-AND-TOOLS.md) gets none here: one copy, not two.
   const workStateRuleIncluded = workStateEnabled();
-  const instructions = mcpServerInstructions({
+  const toolInstructions = mcpServerInstructions({
     runtime: selectRuntime(),
     workStateEnabled: workStateRuleIncluded,
     memoryInstructionsEnabled: loadFromFileOnce().CLAUDE_MEM_MEMORY_INSTRUCTIONS_ENABLED !== 'false',
   });
+  const instructions = claudeCodeAlreadyLoadsInstructions(toolInstructions) ? '' : toolInstructions;
   const server = new Server(
     {
       name: 'claude-mem',
@@ -1411,6 +1426,7 @@ async function mainHttp(options: McpHttpOptions) {
     ...options,
     pluginRoot: options.pluginRoot ?? MCP_PLUGIN_ROOT,
     originPolicy: buildWorkerOriginPolicy(loadFromFileOnce()),
+    localApiToken: readLocalApiToken(),
     createServer: createMcpServer,
   });
   logger.info('SYSTEM', 'Claude-mem MCP HTTP server started', { host: options.host, port: handle.port });

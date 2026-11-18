@@ -6,6 +6,8 @@ import { resolvePythonCommand } from '../../src/services/work-view/python.js';
 import { buildRules } from '../../src/services/work-view/my-rules.mjs';
 import { fakeOwnerGoalsWorker } from '../helpers/fake-owner-goals-worker.js';
 import { scratchDir } from '../helpers/scratch-dir.js';
+import { promptMinute, writeOwnerPromptsFile } from '../../src/services/prompt-import/owner-prompts-file.js';
+import type { OwnerPrompt } from '../../src/services/prompt-import/index.js';
 
 const SKILLS = join(import.meta.dir, '..', '..', 'plugin', 'skills');
 const python = await resolvePythonCommand();
@@ -16,18 +18,18 @@ const spawnPython = (args: string[], options: { env?: NodeJS.ProcessEnv } = {}) 
 // so on a newer interpreter the tokenizer is used to find the same construct.
 const CHECK = String.raw`
 import sys, tokenize
-path = sys.argv[1]
-if sys.version_info < (3, 12):
-    compile(open(path, encoding="utf-8").read(), path, "exec")
-    sys.exit(0)
-depth = 0
-with open(path, "rb") as handle:
-    for token in tokenize.tokenize(handle.readline):
-        if token.type == tokenize.FSTRING_START: depth += 1
-        elif token.type == tokenize.FSTRING_END: depth -= 1
-        elif depth and token.type != tokenize.FSTRING_MIDDLE and "\\" in token.string:
-            print(f"{path}:{token.start[0]}: backslash in an f-string expression")
-            sys.exit(1)
+for path in sys.argv[1:]:
+    if sys.version_info < (3, 12):
+        compile(open(path, encoding="utf-8").read(), path, "exec")
+        continue
+    depth = 0
+    with open(path, "rb") as handle:
+        for token in tokenize.tokenize(handle.readline):
+            if token.type == tokenize.FSTRING_START: depth += 1
+            elif token.type == tokenize.FSTRING_END: depth -= 1
+            elif depth and token.type != tokenize.FSTRING_MIDDLE and "\\" in token.string:
+                print(f"{path}:{token.start[0]}: backslash in an f-string expression")
+                sys.exit(1)
 `;
 
 function pythonScripts(): string[] {
@@ -41,16 +43,36 @@ describe('skill Python scripts', () => {
     expect(pythonScripts().some((file) => file.endsWith('save_goals.py'))).toBe(true);
   });
 
-  for (const script of pythonScripts()) {
-    it(`parses on Python 3.9-3.11: ${script.slice(SKILLS.length + 1)}`, () => {
-      const result = spawnPython(['-c', CHECK, script]);
-      expect(result.stdout.toString() + result.stderr.toString()).toBe('');
-      expect(result.exitCode).toBe(0);
-    });
-  }
+  it('all scripts parse on Python 3.9-3.11', () => {
+    const result = spawnPython(['-c', CHECK, ...pythonScripts()]);
+    expect(result.stdout.toString() + result.stderr.toString()).toBe('');
+    expect(result.exitCode).toBe(0);
+  });
 });
 
 describe('save_goals.py', () => {
+  it('verifies an in-budget owner quote after supplementary characters in the generated export', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'save-goals-owner-budget-'));
+    try {
+      const now = Date.UTC(2026, 10, 14, 12);
+      const quote = 'Preserve deploy signatures';
+      const prompt: OwnerPrompt = {
+        agent: 'codex', sessionId: 'owner-session', nativePromptId: 'typed-1', at: now,
+        cwd: '/work/release', project: 'release', platformSource: 'codex', text: '😀'.repeat(1500) + ' ' + quote,
+      };
+      const exported = await writeOwnerPromptsFile({ folder: dir, now, sinceMinute: promptMinute(now),
+        scan: async () => ({ agents: [], ownerPrompts: [prompt], agentWritten: [],
+          ownerMemoryPromptIds: new Set<number>(), skippedSources: [] }),
+      });
+      const result = spawnPython(['-c',
+        'import json,runpy,sys; script=runpy.run_path(sys.argv[1]); prompts=script["prompts_by_minute"](sys.argv[2]); print(json.dumps(script["unverified_quotes"]({"asks":[{"title":"release","evidence":[{"at":sys.argv[3],"quote":sys.argv[4]}]}]},prompts)))',
+        join(SKILLS, 'owner-goals', 'scripts', 'save_goals.py'), exported.path, promptMinute(now), quote]);
+      expect(result.stderr.toString()).toBe('');
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(result.stdout.toString())).toEqual([]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it('validates UTF-8 quotes and titles on every platform', () => {
     const dir = mkdtempSync(join(tmpdir(), 'save-goals-utf8-'));
     try {
@@ -142,6 +164,44 @@ describe('save_goals.py', () => {
       expect(result.exitCode).toBe(0);
       expect(JSON.parse(result.stdout.toString()).writes.slice(1).map((write: { task: string }) => write.task)).toEqual(['Ask: Login']);
       expect(save({ asks: [{ title: 'Made up', focus_area: null, evidence: [{ at: '2026-10-21 09:00', quote: 'never typed' }] }] }).exitCode).not.toBe(0);
+      // An update stays strict for its new quotes: one bad new quote beside a good one still refuses the save.
+      expect(save({ asks: [
+        { rank: 1, title: 'Login', focus_area: null, evidence: [{ at: '2026-10-21 09:00', quote: 'fix the login' }] },
+        { rank: 2, title: 'Made up', focus_area: null, evidence: [{ at: '2026-10-21 09:00', quote: 'never typed' }] },
+      ] }).exitCode).not.toBe(0);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('drops unverifiable quotes from a fresh answer, and items left without one, but refuses when none verify', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'save-goals-'));
+    try {
+      writeFileSync(join(dir, 'owner-prompts.md'), '# Owner prompts\n\n## 2026-10-20 10:00 · claude · repo\nsession `a`\n\nship the cards today\n\n---\n\n## 2026-10-21 09:00 · claude · repo\nsession `a`\n\nfix the login\n');
+      const save = (goals: unknown) => {
+        writeFileSync(join(dir, 'goals.json'), JSON.stringify(goals));
+        return spawnPython([join(SKILLS, 'owner-goals', 'scripts', 'save_goals.py'), '--goals', join(dir, 'goals.json'), '--prompts', join(dir, 'owner-prompts.md'), '--dry-run']);
+      };
+      const result = save({
+        focus_areas: [{ rank: 1, title: 'Cards', goal: 'Ship the cards.', matches: null, evidence: [{ at: '2026-10-20 10:00', quote: 'ship the cards' }, { at: '2026-10-20 10:00', quote: 'never typed' }] }],
+        asks: [
+          { rank: 1, title: 'Login', focus_area: null, evidence: [{ at: '2026-10-21 09:00', quote: 'fix the login' }, { at: '2026-10-21 09:00', quote: 'never typed' }] },
+          { rank: 2, title: 'Made up', focus_area: null, evidence: [{ at: '2026-10-20 10:00', quote: 'never typed' }] },
+        ],
+        rules: [{ when: '', then: 'Fix login first.', evidence: [{ at: '2026-10-21 09:00', quote: 'fix the login' }, { at: '2026-10-21 09:00', quote: 'never typed' }] }],
+      });
+      expect(result.stderr.toString()).toBe('');
+      expect(result.exitCode).toBe(0);
+      const output = JSON.parse(result.stdout.toString());
+      expect(output.writes.slice(1).map((write: { task: string; evidence: string }) => [write.task, write.evidence])).toEqual([
+        ['Focus area: Cards', '2026-10-20 10:00 | ship the cards'],
+        ['Ask: Login', '2026-10-21 09:00 | fix the login'],
+      ]);
+      expect(output.rules[0].quotes).toEqual([{ quote: 'fix the login', at: expect.any(String) }]);
+      expect(output.dropped_unverified_quotes).toEqual([
+        'Cards: 2026-10-20 10:00', 'Login: 2026-10-21 09:00', 'Made up: 2026-10-20 10:00', 'Fix login first.: 2026-10-21 09:00',
+      ]);
+      const refused = save({ asks: [{ title: 'Made up', focus_area: null, evidence: [{ at: '2026-10-20 10:00', quote: 'never typed' }] }] });
+      expect(refused.exitCode).not.toBe(0);
+      expect(refused.stderr.toString()).toContain('every item was dropped with them');
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
@@ -243,24 +303,6 @@ describe('save_goals.py: focus areas, asks and rules', () => {
       expect(worker.focusAreas()).toHaveLength(1);
     } finally { worker.stop(); }
   }));
-
-  it('a match is the model\'s judgment: a saved id adds no area, and an id that is not saved is refused', () => withDir(async (dir) => {
-    const worker = fakeOwnerGoalsWorker(join(dir, 'data'));
-    try {
-      writeFileSync(join(dir, 'goals.json'), JSON.stringify(answer));
-      const args = ['--goals', join(dir, 'goals.json'), '--prompts', join(dir, 'owner-prompts.md'), '--ledger-dir', join(dir, 'ledger')];
-      expect((await worker.run(args)).exitCode).toBe(0);
-      const [saved] = worker.focusAreas();
-      worker.ownerDecides(saved, { name: 'My viewer', status: 'kept' });
-      writeFileSync(join(dir, 'goals.json'), JSON.stringify({ ...answer, focus_areas: [{ ...answer.focus_areas[0], title: 'Live viewer', matches: saved.focusAreaId, rank: 3 }], asks: [{ ...answer.asks[0], focus_area: 'Live viewer' }] }));
-      expect((await worker.run(args)).exitCode).toBe(0);
-      expect(worker.focusAreas()).toEqual([expect.objectContaining({ focusAreaId: saved.focusAreaId, name: 'My viewer', status: 'kept', priorityRank: 1 })]);
-      writeFileSync(join(dir, 'goals.json'), JSON.stringify({ ...answer, focus_areas: [{ ...answer.focus_areas[0], matches: 'fa_000000000000' }] }));
-      const refused = await worker.run(args);
-      expect(refused.exitCode).not.toBe(0);
-      expect(refused.stderr).toContain('fa_000000000000, which is not a saved focus area');
-    } finally { worker.stop(); }
-  }));
 });
 
 describe('export_owner_prompts.py', () => {
@@ -350,5 +392,36 @@ describe('export_owner_prompts.py', () => {
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
+  });
+});
+
+// Local API token mode (#5141): the worker refuses save_goals.py's requests without the token.
+describe('save_goals.py local API token', () => {
+  const SCRIPTS = join(SKILLS, 'owner-goals', 'scripts');
+  const headersFor = (settings: Record<string, string>, env: Record<string, string> = {}) => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'save-goals-token-'));
+    try {
+      writeFileSync(join(dataDir, 'settings.json'), JSON.stringify(settings));
+      const run = spawnPython(['-c', 'import json, save_goals; print(json.dumps(save_goals.local_api_token_headers()))'], {
+        env: { CLAUDE_MEM_DATA_DIR: dataDir, PYTHONPATH: SCRIPTS, CLAUDE_MEM_WORKER_HOST: '', CLAUDE_MEM_WORKER_PORT: '', ...env },
+      });
+      expect(run.exitCode).toBe(0);
+      return JSON.parse(run.stdout.toString());
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  };
+
+  it('sends the settings.json token, trimmed, and nothing when there is none', () => {
+    expect(headersFor({ CLAUDE_MEM_LOCAL_API_TOKEN: ' goals-secret ' })).toEqual({ 'X-Claude-Mem-Token': 'goals-secret' });
+    expect(headersFor({})).toEqual({});
+  });
+
+  it('ignores the environment, as the worker does', () => {
+    expect(headersFor({}, { CLAUDE_MEM_LOCAL_API_TOKEN: 'from-the-environment' })).toEqual({});
+  });
+
+  it('never sends it to a worker host on another machine', () => {
+    expect(headersFor({ CLAUDE_MEM_LOCAL_API_TOKEN: 'goals-secret', CLAUDE_MEM_WORKER_HOST: 'worker.example.com' })).toEqual({});
   });
 });

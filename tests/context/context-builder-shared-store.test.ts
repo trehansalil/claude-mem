@@ -1,5 +1,6 @@
+import { rulesAndToolsFilePath, rulesAndToolsPointerLine } from '../../src/services/context/RulesAndToolsFile.js';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, mock } from 'bun:test';
-import { rmSync } from 'fs';
+import { readFileSync, rmSync } from 'fs';
 import { join } from 'path';
 
 import * as realRuntimeSelector from '../../src/services/hooks/runtime-selector.js';
@@ -56,7 +57,9 @@ const serverRuntime = () => ({
 }) as never;
 
 const config = (totalObservationCount: number, sessionCount = 10) =>
-  ({ totalObservationCount, sessionCount } as never);
+  ({ totalObservationCount, sessionCount,
+    observationTypes: new Set(['bugfix']), observationConcepts: new Set(['how-it-works']),
+  });
 
 const rowsRequest = (overrides: Record<string, unknown> = {}) => ({
   config: config(20),
@@ -73,7 +76,11 @@ function observationRow(index: number, extra: Record<string, unknown> = {}) {
     serverSessionId: 'server-session-1',
     kind: 'bugfix',
     content: `Observation ${index} body`,
-    metadata: { title: `Observation ${index}`, narrative: 'n'.repeat(400), project: 'demo' },
+    // Carries a mode concept: a store that honors the filters it was sent
+    // (#5623) only returns rows passing them, and the client enforces them
+    // again on what it receives (#5972) -- a concept-less row is one the
+    // store would never have answered with under this file's config.
+    metadata: { title: `Observation ${index}`, narrative: 'n'.repeat(400), project: 'demo', concepts: ['how-it-works'] },
     createdAtEpoch: 1_760_000_000_000 - index * 60_000,
     ...extra,
   };
@@ -160,10 +167,10 @@ describe('the shared store as a row source', () => {
 
   it('asks the store to leave subagent rows out exactly when CLAUDE_MEM_CONTEXT_MAIN_AGENT_ONLY is on', async () => {
     await fetchServerContextRows(serverRuntime(), rowsRequest({
-      config: { totalObservationCount: 20, sessionCount: 10, mainAgentOnly: true },
+      config: { ...config(20), mainAgentOnly: true },
     }));
     await fetchServerContextRows(serverRuntime(), rowsRequest({
-      config: { totalObservationCount: 20, sessionCount: 10, mainAgentOnly: false },
+      config: { ...config(20), mainAgentOnly: false },
     }));
     expect(contextCalls.map(call => call.excludeSubagents)).toEqual([true, false]);
   });
@@ -242,12 +249,12 @@ describe('session-start context from the shared store', () => {
     respond = async () => ({ observations: Array.from({ length: 200 }, (_, index) => observationRow(index)) });
     const { text, stats } = await generateServerContextWithStats(serverRuntime(), input);
     expect(text.length).toBeLessThanOrEqual(CONTEXT_OUTPUT_LIMIT);
-    expect(text).toContain('# [demo] recent context');
+    expect(text).toStartWith(rulesAndToolsPointerLine());
     expect(text).toContain('Observation 0');
     expect(stats!.observation_count).toBeGreaterThan(0);
   });
 
-  it('prints 8-char display refs and points at observation_search, since server ids have no by-id fetch', async () => {
+  it('prints 8-char display refs, and its Rules + Tools file points at observation_search, since server ids have no by-id fetch', async () => {
     respond = async () => ({
       observations: [
         observationRow(3),
@@ -264,8 +271,9 @@ describe('session-start context from the shared store', () => {
     expect(text).not.toContain('00000003-5048');
     expect(text).toContain('Sabcdef12 Ship the import fix');
     expect(text).not.toContain('abcdef12-5048');
-    expect(text).toContain('observation_search');
-    expect(text).not.toContain('get_observations');
+    const rulesAndTools = readFileSync(rulesAndToolsFilePath(), 'utf-8');
+    expect(rulesAndTools).toContain('Fetch details: observation_search');
+    expect(rulesAndTools).not.toContain('get_observations([IDs])');
   });
 
   it('renders the empty state for an empty answer', async () => {

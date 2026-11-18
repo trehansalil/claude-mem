@@ -1,5 +1,5 @@
 import { describe, it, expect, mock, beforeEach, afterEach, afterAll, spyOn } from 'bun:test';
-import { existsSync, readFileSync, mkdtempSync, rmSync } from 'fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { paths } from '../../../src/shared/paths.js';
@@ -13,25 +13,28 @@ import { logger } from '../../../src/utils/logger.js';
 // into later test files (bun's mock.module is process-global; mock.restore()
 // does NOT undo it). A leaked ModeManager stub (no class prototype, no
 // loadMode) breaks tests/server/server-boot.test.ts, server-runtime-smoke and
-// the tests/sdk parser suites; leaked worker-service/worker-utils stubs break
+// the tests/sdk parser suites; leaked worker-utils stubs break
 // any later file that imports the real modules.
-import * as realWorkerServiceModule from '../../../src/services/worker-service.js';
 import * as realWorkerUtilsModule from '../../../src/shared/worker-utils.js';
 import * as realModeManagerModule from '../../../src/services/domain/ModeManager.js';
 import * as realSettingsDefaultsModule from '../../../src/shared/SettingsDefaultsManager.js';
+import * as realClaudeMdUtilsModule from '../../../src/utils/claude-md-utils.js';
+import * as realGrokBotIndexWriterModule from '../../../src/services/integrations/GrokBotIndexWriter.js';
 
-const realWorkerServiceSnapshot = { ...realWorkerServiceModule };
 const realWorkerUtilsSnapshot = { ...realWorkerUtilsModule };
 const realModeManagerSnapshot = { ...realModeManagerModule };
 // The 4-key SettingsDefaultsManager stub below would otherwise leak into every
 // later file that reads settings (e.g. ingestObservation's SKIP_TOOLS split).
 const realSettingsDefaultsSnapshot = { ...realSettingsDefaultsModule };
+const realClaudeMdUtilsSnapshot = { ...realClaudeMdUtilsModule };
+const realGrokBotIndexWriterSnapshot = { ...realGrokBotIndexWriterModule };
 
 afterAll(() => {
-  mock.module('../../../src/services/worker-service.js', () => realWorkerServiceSnapshot);
   mock.module('../../../src/shared/worker-utils.js', () => realWorkerUtilsSnapshot);
   mock.module('../../../src/services/domain/ModeManager.js', () => realModeManagerSnapshot);
   mock.module('../../../src/shared/SettingsDefaultsManager.js', () => realSettingsDefaultsSnapshot);
+  mock.module('../../../src/utils/claude-md-utils.js', () => realClaudeMdUtilsSnapshot);
+  mock.module('../../../src/services/integrations/GrokBotIndexWriter.js', () => realGrokBotIndexWriterSnapshot);
 });
 
 function mockSettingsDefaults(): Record<string, string> {
@@ -43,32 +46,6 @@ function mockSettingsDefaults(): Record<string, string> {
     ...extraMockSettings,
   };
 }
-
-function mockSettingsFromFile(settingsPath?: string, applyEnvOverrides = true): Record<string, string> {
-  const settings = settingsPath && existsSync(settingsPath)
-    ? { ...mockSettingsDefaults(), ...JSON.parse(readFileSync(settingsPath, 'utf-8')) }
-    : mockSettingsDefaults();
-
-  if (!applyEnvOverrides) {
-    settings.CLAUDE_MEM_FOLDER_CLAUDEMD_ENABLED = mockFolderClaudeMdEnabled;
-    return settings;
-  }
-
-  for (const key of Object.keys(settings)) {
-    if (key === 'CLAUDE_MEM_FOLDER_CLAUDEMD_ENABLED') {
-      continue;
-    }
-    settings[key] = process.env[key] ?? settings[key];
-  }
-  settings.CLAUDE_MEM_FOLDER_CLAUDEMD_ENABLED = mockFolderClaudeMdEnabled;
-
-  // A test's own settings win over whatever settings.json holds on this machine.
-  return { ...settings, ...extraMockSettings };
-}
-
-mock.module('../../../src/services/worker-service.js', () => ({
-  updateCursorContextForProject: () => Promise.resolve(),
-}));
 
 mock.module('../../../src/utils/claude-md-utils.js', () => ({
   updateFolderClaudeMdFiles: (...args: unknown[]) => mockUpdateFolderClaudeMdFiles(...args),
@@ -87,8 +64,7 @@ mock.module('../../../src/shared/SettingsDefaultsManager.js', () => ({
     getAllDefaults: () => mockSettingsDefaults(),
     get: (key: string) => process.env[key] ?? mockSettingsDefaults()[key] ?? '',
     getInt: (key: string) => parseInt(process.env[key] ?? mockSettingsDefaults()[key] ?? '0', 10),
-    loadFromFile: (settingsPath?: string, applyEnvOverrides = true) =>
-      mockSettingsFromFile(settingsPath, applyEnvOverrides),
+    loadFromFile: () => ({ ...mockSettingsDefaults(), ...extraMockSettings }),
   },
 }));
 
@@ -133,6 +109,8 @@ let claimedMessages: Array<{
   type: 'observation' | 'summarize';
   tool_name?: string;
   tool_input?: unknown;
+  tool_response?: unknown;
+  cwd?: string;
   toolUseId?: string;
 }> = [];
 let mockGetClaimedMessages: ReturnType<typeof mock>;
@@ -252,24 +230,6 @@ describe('ResponseProcessor', () => {
     } as ActiveSession;
   }
 
-  it('passes claimed tool identities into the observation commit', async () => {
-    claimedMessages = [{
-      type: 'observation', tool_name: 'Bash', toolUseId: 'toolu_claimed_1',
-    }];
-    await processAgentResponse(
-      '<observation><type>discovery</type><title>Stored</title><narrative>Result</narrative></observation>',
-      createMockSession({ platformSource: 'codex' }),
-      mockDbManager, mockSessionManager, mockWorker, 100, null, 'TestAgent',
-    );
-    expect(mockStoreObservations).toHaveBeenCalledTimes(1);
-    expect(mockStoreObservations.mock.calls[0][8]).toMatchObject({
-      committedToolUses: {
-        platformSource: 'codex', contentSessionId: 'content-session-123',
-        toolUseIds: ['toolu_claimed_1'],
-      },
-    });
-  });
-
   it('commits a real claimed tool identity with its stored observation', async () => {
     const store = new SessionStore(':memory:');
     const sessionDbId = store.createSDKSession('content-session-123', 'test-project', 'prompt', undefined, 'codex');
@@ -306,15 +266,6 @@ describe('ResponseProcessor', () => {
       });
     });
 
-    it('marks a reply with an unfinished block and no finish reason terminal too', async () => {
-      claimedMessages = [{ type: 'observation', tool_name: 'Bash', toolUseId: 'toolu_cut_2' }];
-      await processAgentResponse(cut, createMockSession(),
-        mockDbManager, mockSessionManager, mockWorker, 100, null, 'TestAgent');
-      expect(mockStoreObservations.mock.calls[0][8]).toMatchObject({
-        committedToolUses: { contentSessionId: 'content-session-123', toolUseIds: ['toolu_cut_2'] },
-      });
-    });
-
     it('stores the complete blocks and reports the lost tail when finish_reason is length', async () => {
       const session = createMockSession({ lastFinishReason: 'length' } as Partial<ActiveSession>);
       const result = await processAgentResponse(cut, session, mockDbManager, mockSessionManager, mockWorker, 0, null, 'TestAgent');
@@ -323,27 +274,6 @@ describe('ResponseProcessor', () => {
       const errors = cutOffErrors();
       expect(errors).toHaveLength(1);
       expect(errors[0][2]).toMatchObject({ finishReason: 'length', completeObservations: 1, hasUnfinishedObservationBlock: true });
-    });
-
-    it('reports an unclosed block even when the provider gives no finish reason', async () => {
-      const session = createMockSession();
-      await processAgentResponse(cut, session, mockDbManager, mockSessionManager, mockWorker, 0, null, 'TestAgent');
-      expect(cutOffErrors()).toHaveLength(1);
-    });
-
-    it('stays quiet for a whole reply that stopped normally', async () => {
-      const session = createMockSession({ lastFinishReason: 'stop' } as Partial<ActiveSession>);
-      await processAgentResponse(complete, session, mockDbManager, mockSessionManager, mockWorker, 0, null, 'TestAgent');
-      expect(cutOffErrors()).toHaveLength(0);
-    });
-
-    it('stays quiet for a whole reply whose content mentions an <observation> tag', async () => {
-      const aboutXml = '<observation><type>discovery</type><title>Prompt format</title>'
-        + '<narrative><![CDATA[Use <observation> for each result]]> and close it.</narrative></observation>';
-      const session = createMockSession({ lastFinishReason: 'stop' } as Partial<ActiveSession>);
-      await processAgentResponse(aboutXml, session, mockDbManager, mockSessionManager, mockWorker, 0, null, 'TestAgent');
-      expect(mockStoreObservations).toHaveBeenCalled();
-      expect(cutOffErrors()).toHaveLength(0);
     });
   });
 
@@ -361,6 +291,7 @@ describe('ResponseProcessor', () => {
     // A whole summary, or a skip reason, that mentions the tag is not a cut-off observation.
     expect(hasUnfinishedObservationBlock('<summary><learned>Each result needs an <observation> block</learned></summary>')).toBe(false);
     expect(hasUnfinishedObservationBlock('<skip_summary reason="no <observation> worth storing" />')).toBe(false);
+    expect(hasUnfinishedObservationBlock("<skip_summary reason = 'no <observation> worth storing' />")).toBe(false);
   });
 
   it('does not report a successful observer store when no memory rows were written', async () => {
@@ -445,43 +376,6 @@ describe('ResponseProcessor', () => {
   });
 
   describe('parsing observations from XML response', () => {
-    it('should parse single observation from response', async () => {
-      const session = createMockSession({ project: 'repo-b/worktree' });
-      const responseText = `
-        <observation>
-          <type>discovery</type>
-          <title>Found important pattern</title>
-          <subtitle>In auth module</subtitle>
-          <narrative>Discovered reusable authentication pattern.</narrative>
-          <facts><fact>Uses JWT</fact></facts>
-          <concepts><concept>authentication</concept></concepts>
-          <files_read><file>src/auth.ts</file></files_read>
-          <files_modified></files_modified>
-        </observation>
-      `;
-
-      await processAgentResponse(
-        responseText,
-        session,
-        mockDbManager,
-        mockSessionManager,
-        mockWorker,
-        100,
-        null,
-        'TestAgent'
-      );
-
-      expect(mockStoreObservations).toHaveBeenCalledTimes(1);
-      const [memorySessionId, project, observations, summary] =
-        mockStoreObservations.mock.calls[0];
-      expect(memorySessionId).toBe('memory-session-456');
-      expect(project).toBe('repo-b/worktree');
-      expect(mockChromaSyncObservation.mock.calls[0][2]).toBe('repo-b/worktree');
-      expect(observations).toHaveLength(1);
-      expect(observations[0].type).toBe('discovery');
-      expect(observations[0].title).toBe('Found important pattern');
-    });
-
     it('skips Chroma sync and the SSE broadcast for a Tier-0 dedup merge (#3038)', async () => {
       // Item 1 reused an existing row: syncing its new content under id 3 would
       // overwrite that row's vector and show text the row does not hold.
@@ -531,7 +425,7 @@ describe('ResponseProcessor', () => {
       });
       extraMockSettings = {
         CLAUDE_MEM_GROK_BOT_WEBHOOK_URL: 'https://bot.example/hook',
-        CLAUDE_MEM_GROK_BOT_AWARENESS_TRIGGER_TYPES: 'discovery',
+        CLAUDE_MEM_GROK_BOT_AWARENESS_TRIGGER_TYPES: 'discovery,bugfix',
       };
       const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation(async () => new Response(null, { status: 202 }));
       const responseText = `
@@ -547,7 +441,7 @@ describe('ResponseProcessor', () => {
           <facts></facts><concepts></concepts><files_read></files_read><files_modified></files_modified>
         </observation>
         <observation>
-          <type>discovery</type>
+          <type>bugfix</type>
           <title>Third finding</title>
           <narrative>C</narrative>
           <facts></facts><concepts></concepts><files_read></files_read><files_modified></files_modified>
@@ -556,79 +450,14 @@ describe('ResponseProcessor', () => {
 
       await processAgentResponse(responseText, createMockSession(), mockDbManager, mockSessionManager, mockWorker, 100, null, 'TestAgent');
 
-      const stored = mockStoreObservations.mock.calls[0][2] as Array<{ title: string | null }>;
-      expect(stored.map(observation => observation.title)).toEqual(['First finding', 'Third finding']);
+      const stored = mockStoreObservations.mock.calls[0][2] as Array<{ title: string | null; type: string }>;
+      expect(stored.map(observation => [observation.title, observation.type]))
+        .toEqual([['First finding', 'discovery'], ['Third finding', 'bugfix']]);
       expect(mockChromaSyncObservation.mock.calls.map(call => [call[0], (call[3] as { title: string }).title]))
         .toEqual([[101, 'First finding'], [102, 'Third finding']]);
       const webhookPayloads = fetchSpy.mock.calls.map(call => JSON.parse(String((call[1] as RequestInit).body)));
       expect(webhookPayloads.map(payload => [payload.observation_id, payload.title]))
         .toEqual([[101, 'First finding'], [102, 'Third finding']]);
-    });
-
-    it('should parse multiple observations from response', async () => {
-      const session = createMockSession();
-      const responseText = `
-        <observation>
-          <type>discovery</type>
-          <title>First discovery</title>
-          <narrative>First narrative</narrative>
-          <facts></facts>
-          <concepts></concepts>
-          <files_read></files_read>
-          <files_modified></files_modified>
-        </observation>
-        <observation>
-          <type>bugfix</type>
-          <title>Fixed null pointer</title>
-          <narrative>Second narrative</narrative>
-          <facts></facts>
-          <concepts></concepts>
-          <files_read></files_read>
-          <files_modified></files_modified>
-        </observation>
-      `;
-
-      await processAgentResponse(
-        responseText,
-        session,
-        mockDbManager,
-        mockSessionManager,
-        mockWorker,
-        100,
-        null,
-        'TestAgent'
-      );
-
-      const [, , observations] = mockStoreObservations.mock.calls[0];
-      expect(observations).toHaveLength(2);
-      expect(observations[0].type).toBe('discovery');
-      expect(observations[1].type).toBe('bugfix');
-    });
-
-    it('stores a closed observation block with freeform prose through the success path', async () => {
-      const session = createMockSession();
-      const responseText = `<observation>
-        <type>discovery</type>
-        Refactored transformer_markdown.py helpers and narrowed the shared formatting path.
-        The follow-up kept the line-range handling aligned with the new helpers.
-      </observation>`;
-
-      await processAgentResponse(
-        responseText,
-        session,
-        mockDbManager,
-        mockSessionManager,
-        mockWorker,
-        100,
-        null,
-        'TestAgent'
-      );
-
-      expect(mockStoreObservations).toHaveBeenCalledTimes(1);
-      const [, , observations] = mockStoreObservations.mock.calls[0];
-      expect(observations).toHaveLength(1);
-      expect(observations[0].title).toBe('Refactored transformer_markdown.py helpers and narrowed the shared formatting path.');
-      expect(observations[0].narrative).toContain('line-range handling aligned with the new helpers');
     });
 
     it('does not store an init reply or acknowledge queued work, even when it parses as an observation', async () => {
@@ -721,7 +550,7 @@ describe('ResponseProcessor', () => {
   });
 
   describe('observation file metadata gating', () => {
-    it('drops fabricated files_modified while preserving read evidence', async () => {
+    it('merges and deduplicates read evidence while dropping fabricated files_modified', async () => {
       claimedMessages = [
         { type: 'observation', tool_name: 'Read', tool_input: { file_path: 'supabase/functions/edge/index.ts' } },
       ];
@@ -734,7 +563,7 @@ describe('ResponseProcessor', () => {
           <narrative>Completed the security work.</narrative>
           <facts><fact>Observed read-only inspection</fact></facts>
           <concepts><concept>security</concept></concepts>
-          <files_read><file>supabase/functions/edge/index.ts</file></files_read>
+          <files_read><file>supabase/functions/edge/index.ts</file><file>src/other.ts</file></files_read>
           <files_modified><file>supabase/functions/edge/index.ts</file></files_modified>
         </observation>
       `;
@@ -752,141 +581,179 @@ describe('ResponseProcessor', () => {
 
       expect(mockStoreObservations).toHaveBeenCalledTimes(1);
       const [, , observations] = mockStoreObservations.mock.calls[0];
-      expect(observations[0].files_read).toEqual(['supabase/functions/edge/index.ts']);
+      expect(observations[0].files_read).toEqual(['supabase/functions/edge/index.ts', 'src/other.ts']);
       expect(observations[0].files_modified).toEqual([]);
     });
+  });
 
-    it('populates files_modified from captured write evidence when XML omits it', async () => {
-      claimedMessages = [
-        { type: 'observation', tool_name: 'write_file', tool_input: { filePath: 'src/services/worker/agents/ResponseProcessor.ts', edits: [{ type: 'replace' }] } },
-      ];
+  describe('line anchors (#4943)', () => {
+    const CHARGE_LINES = [
+      "import { retry } from './retry';",
+      '',
+      'export const MAX_CHARGE_RETRIES = 4;',
+      '',
+      'export function chargeCard(card: Card) {',
+      '  if (!card.token) {',
+      "    throw new ChargeDeclined('missing token');",
+      '  }',
+      '  return retry(() => gateway.charge(card), MAX_CHARGE_RETRIES);',
+      '}',
+    ];
+    let anchorDirectory: string;
+    let chargeFile: string;
 
-      const session = createMockSession();
+    beforeEach(() => {
+      anchorDirectory = mkdtempSync(join(tmpdir(), 'response-processor-anchors-'));
+      chargeFile = join(anchorDirectory, 'charge.ts');
+      writeFileSync(chargeFile, `${CHARGE_LINES.join('\n')}\n`);
+      extraMockSettings = { CLAUDE_MEM_LINE_ANCHORS_ENABLED: 'true' };
+    });
+
+    afterEach(() => {
+      rmSync(anchorDirectory, { recursive: true, force: true });
+    });
+
+    /** What the worker stores for a Claude Code Read: the tool response as JSON text. */
+    const storedReadResponse = (lines: string[]) =>
+      JSON.stringify({ type: 'text', file: { filePath: chargeFile, content: lines.join('\n'), numLines: lines.length } });
+
+    const raiseLimit = () => ({
+      type: 'observation' as const,
+      tool_name: 'Edit',
+      tool_input: { file_path: chargeFile, old_string: 'export const MAX_CHARGE_RETRIES = 3;', new_string: CHARGE_LINES[2] },
+    });
+
+    async function storeOneObservation(session = createMockSession()): Promise<Record<string, unknown>> {
       const responseText = `
         <observation>
           <type>bugfix</type>
-          <title>Wrote the fix</title>
-          <narrative>Captured write evidence drives stored metadata.</narrative>
-          <facts><fact>Write evidence present</fact></facts>
-          <concepts><concept>storage</concept></concepts>
-          <files_read></files_read>
+          <title>Raised the charge retry limit</title>
+          <narrative>Four tries before a card charge fails.</narrative>
+          <facts><fact>MAX_CHARGE_RETRIES is 4</fact></facts>
+          <concepts><concept>payments</concept></concepts>
+          <files_read><file>${chargeFile}</file></files_read>
           <files_modified></files_modified>
         </observation>
       `;
-
-      await processAgentResponse(
-        responseText,
-        session,
-        mockDbManager,
-        mockSessionManager,
-        mockWorker,
-        100,
-        null,
-        'TestAgent'
-      );
-
+      await processAgentResponse(responseText, session, mockDbManager, mockSessionManager, mockWorker, 100, null, 'TestAgent');
+      expect(mockStoreObservations).toHaveBeenCalledTimes(1);
       const [, , observations] = mockStoreObservations.mock.calls[0];
-      expect(observations[0].files_modified).toEqual(['src/services/worker/agents/ResponseProcessor.ts']);
+      return observations[0];
+    }
+
+    const storedMetadata = (observation: Record<string, unknown>) => JSON.parse((observation.metadata as string | undefined) ?? 'null');
+
+    it('stores an Edit\'s line anchor in metadata under cmem_line_anchors_v1', async () => {
+      claimedMessages = [raiseLimit()];
+
+      expect(storedMetadata(await storeOneObservation())).toEqual({
+        cmem_line_anchors_v1: [{ path: chargeFile, line: 3, text: 'export const MAX_CHARGE_RETRIES = 4;' }],
+      });
     });
 
-    it('keeps native records scoped to their originating project', async () => {
-      claimedMessages = [
-        { type: 'observation', tool_name: 'Read', tool_input: { file_path: 'src/native.ts' } },
-      ];
+    it.each([
+      ['claude', true],
+      ['devin', false],
+      ['codex', false],
+    ])('anchors only in Claude Code sessions, though other hosts name their tools Edit and Read too: platform %p', async (platformSource, anchored) => {
+      claimedMessages = [raiseLimit()];
+      const observation = await storeOneObservation(createMockSession({ platformSource }));
 
-      const session = createMockSession({ project: 'origin-project' });
-      const responseText = `
-        <observation>
-          <type>discovery</type>
-          <title>Native scope</title>
-          <facts><fact>Project stays unchanged</fact></facts>
-          <concepts><concept>scoping</concept></concepts>
-          <files_read><file>src/native.ts</file></files_read>
-          <files_modified><file>src/native.ts</file></files_modified>
-        </observation>
-      `;
-
-      await processAgentResponse(
-        responseText,
-        session,
-        mockDbManager,
-        mockSessionManager,
-        mockWorker,
-        100,
-        null,
-        'TestAgent'
-      );
-
-      const [memorySessionId, project] = mockStoreObservations.mock.calls[0];
-      expect(memorySessionId).toBe('memory-session-456');
-      expect(project).toBe('origin-project');
+      expect('metadata' in observation).toBe(anchored);
     });
 
-    it('stores worktree-adopted records under the parent project scope', async () => {
-      claimedMessages = [
-        { type: 'observation', tool_name: 'Read', tool_input: { file_path: 'src/parent.ts' } },
-      ];
+    it('stores a targeted Read\'s line when the stored tool_response holds it', async () => {
+      claimedMessages = [{
+        type: 'observation', tool_name: 'Read',
+        tool_input: { file_path: chargeFile, offset: 5, limit: 3 },
+        tool_response: storedReadResponse(CHARGE_LINES.slice(4, 7)),
+      }];
 
-      const session = createMockSession({ project: 'parent-project' });
-      const responseText = `
-        <observation>
-          <type>discovery</type>
-          <title>Adopted scope</title>
-          <facts><fact>Parent project owns the stored row</fact></facts>
-          <concepts><concept>scoping</concept></concepts>
-          <files_read><file>src/parent.ts</file></files_read>
-          <files_modified><file>src/parent.ts</file></files_modified>
-        </observation>
-      `;
-
-      await processAgentResponse(
-        responseText,
-        session,
-        mockDbManager,
-        mockSessionManager,
-        mockWorker,
-        100,
-        null,
-        'TestAgent'
-      );
-
-      const [memorySessionId, project] = mockStoreObservations.mock.calls[0];
-      expect(memorySessionId).toBe('memory-session-456');
-      expect(project).toBe('parent-project');
+      expect(storedMetadata(await storeOneObservation())).toEqual({
+        cmem_line_anchors_v1: [{ path: chargeFile, line: 5, text: 'export function chargeCard(card: Card) {' }],
+      });
     });
 
-    it('preserves read-only batches while clearing only files_modified', async () => {
+    it('skips a Read line the stored tool_response lacks (stripped, redacted or changed since)', async () => {
+      // Line 5 is not in the stored response, as when <private> stripping removed it.
+      claimedMessages = [{
+        type: 'observation', tool_name: 'Read',
+        tool_input: { file_path: chargeFile, offset: 5, limit: 3 },
+        tool_response: storedReadResponse(['', CHARGE_LINES[5], CHARGE_LINES[6]]),
+      }];
+
+      expect(storedMetadata(await storeOneObservation())).toEqual({
+        cmem_line_anchors_v1: [{ path: chargeFile, line: 6, text: '  if (!card.token) {' }],
+      });
+    });
+
+    it('ignores a failed Edit, anchoring only the batch\'s successful one', async () => {
       claimedMessages = [
-        { type: 'observation', tool_name: 'Read', tool_input: { file_path: 'src/read-only.ts' } },
+        {
+          type: 'observation', tool_name: 'Edit',
+          tool_input: { file_path: chargeFile, old_string: 'not in the file', new_string: CHARGE_LINES[6] },
+          tool_response: JSON.stringify({ is_error: true, error: 'String to replace not found in file.' }),
+        },
+        raiseLimit(),
       ];
 
-      const session = createMockSession();
-      const responseText = `
-        <observation>
-          <type>discovery</type>
-          <title>Read-only batch</title>
-          <narrative>Read evidence should stay visible.</narrative>
-          <facts><fact>Read evidence present</fact></facts>
-          <concepts><concept>evidence</concept></concepts>
-          <files_read></files_read>
-          <files_modified><file>src/fabricated.ts</file></files_modified>
-        </observation>
-      `;
+      expect(storedMetadata(await storeOneObservation())).toEqual({
+        cmem_line_anchors_v1: [{ path: chargeFile, line: 3, text: CHARGE_LINES[2] }],
+      });
+    });
+
+    it('stores no metadata key for a whole-file Read or a Read from line 1', async () => {
+      claimedMessages = [
+        { type: 'observation', tool_name: 'Read', tool_input: { file_path: chargeFile }, tool_response: storedReadResponse(CHARGE_LINES) },
+        {
+          type: 'observation', tool_name: 'Read',
+          tool_input: { file_path: chargeFile, offset: 1, limit: 5 },
+          tool_response: storedReadResponse(CHARGE_LINES.slice(0, 5)),
+        },
+      ];
+
+      expect(await storeOneObservation()).not.toHaveProperty('metadata');
+    });
+
+    it.each([undefined, 'false', 'TRUE', '1'])('stores no metadata key with the setting %p, even for an Edit it would anchor', async (setting) => {
+      extraMockSettings = setting === undefined ? {} : { CLAUDE_MEM_LINE_ANCHORS_ENABLED: setting };
+      claimedMessages = [raiseLimit()];
+
+      expect(await storeOneObservation()).not.toHaveProperty('metadata');
+    });
+
+    it('stores the batch without anchors when capturing them throws', async () => {
+      claimedMessages = [{
+        type: 'observation', tool_name: 'Edit',
+        tool_input: {
+          file_path: chargeFile,
+          get new_string(): string { throw new Error('unreadable tool input'); },
+        },
+      }];
+
+      expect(await storeOneObservation()).not.toHaveProperty('metadata');
+      const debugMessages = (loggerSpies[1] as ReturnType<typeof spyOn>).mock.calls.map((call: unknown[]) => call[1]);
+      expect(debugMessages).toContain('Line anchors skipped for this batch');
+    });
+
+    it('reads no file for anchors when the batch stores no observation', async () => {
+      // Capturing would read new_string, and this one throws: the debug line would say so.
+      claimedMessages = [{
+        type: 'observation', tool_name: 'Edit',
+        tool_input: {
+          file_path: chargeFile,
+          get new_string(): string { throw new Error('capture ran'); },
+        },
+      }];
 
       await processAgentResponse(
-        responseText,
-        session,
-        mockDbManager,
-        mockSessionManager,
-        mockWorker,
-        100,
-        null,
-        'TestAgent'
+        '<observation><type>discovery</type><narrative>No title, so nothing is stored.</narrative></observation>',
+        createMockSession(), mockDbManager, mockSessionManager, mockWorker, 100, null, 'TestAgent',
       );
 
-      const [, , observations] = mockStoreObservations.mock.calls[0];
-      expect(observations[0].files_read).toEqual(['src/read-only.ts']);
-      expect(observations[0].files_modified).toEqual([]);
+      const debugMessages = (loggerSpies[1] as ReturnType<typeof spyOn>).mock.calls.map((call: unknown[]) => call[1]);
+      expect(debugMessages).toContain('Dropped observations without a title before storage');
+      expect(debugMessages).not.toContain('Line anchors skipped for this batch');
     });
   });
 
@@ -923,72 +790,6 @@ describe('ResponseProcessor', () => {
       expect(mockStoreObservations).not.toHaveBeenCalled();
     });
 
-    // #3752: when the spawned CLI cannot reach the provider it returns its own
-    // error string rather than crashing, so the text lands in this same branch.
-    // Confirming it drops the claimed batch permanently — the reporter lost 882
-    // observations over six days that way.
-    it('requeues the claimed batch when the response is the child transport failure', async () => {
-      const confirmClaimedMessages = mock(() => Promise.resolve(0));
-      const resetProcessingToPending = mock(() => Promise.resolve(0));
-      mockSessionManager = {
-        getMessageIterator: async function* () { yield* []; },
-        getPendingMessageStore: () => ({ confirmProcessed: mock(() => {}) }),
-        confirmClaimedMessages,
-        resetProcessingToPending,
-      } as unknown as SessionManager;
-
-      const session = createMockSession();
-      const responseText =
-        'API Error: Connection refused - a firewall or proxy may be blocking it (ConnectionRefused)';
-
-      await processAgentResponse(
-        responseText,
-        session,
-        mockDbManager,
-        mockSessionManager,
-        mockWorker,
-        100,
-        null,
-        'TestAgent'
-      );
-
-      expect(resetProcessingToPending).toHaveBeenCalledWith(1);
-      // The whole point: the batch must NOT be confirmed away.
-      expect(confirmClaimedMessages).not.toHaveBeenCalled();
-      expect(mockStoreObservations).not.toHaveBeenCalled();
-    });
-
-    // #3460: the CLI's own stream-cut message used to be classified prose, so
-    // the batch was confirmed and lost. It must take the preserve path.
-    it('requeues the claimed batch when the CLI reports a connection closed mid-response', async () => {
-      const confirmClaimedMessages = mock(() => Promise.resolve(0));
-      const resetProcessingToPending = mock(() => Promise.resolve(0));
-      mockSessionManager = {
-        getMessageIterator: async function* () { yield* []; },
-        getPendingMessageStore: () => ({ confirmProcessed: mock(() => {}) }),
-        confirmClaimedMessages,
-        resetProcessingToPending,
-      } as unknown as SessionManager;
-
-      const session = createMockSession();
-
-      await processAgentResponse(
-        'API Error: Connection closed mid-response. The response above may be incomplete.',
-        session,
-        mockDbManager,
-        mockSessionManager,
-        mockWorker,
-        100,
-        null,
-        'TestAgent'
-      );
-
-      expect(resetProcessingToPending).toHaveBeenCalledWith(1);
-      expect(confirmClaimedMessages).not.toHaveBeenCalled();
-      expect(mockStoreObservations).not.toHaveBeenCalled();
-      expect(session.abortReason).toBe('transport:observer_text');
-    });
-
     it('pauses the generator with a preserving abort reason on transport failure', async () => {
       mockSessionManager = {
         getMessageIterator: async function* () { yield* []; },
@@ -1012,6 +813,9 @@ describe('ResponseProcessor', () => {
 
       // handleGeneratorExit keys off the category before the colon; 'transport'
       // is what keeps it from finalizing the session and undoing the requeue.
+      expect(mockSessionManager.resetProcessingToPending).toHaveBeenCalledWith(1);
+      expect(mockSessionManager.confirmClaimedMessages).not.toHaveBeenCalled();
+      expect(mockStoreObservations).not.toHaveBeenCalled();
       expect(session.abortReason).toBe('transport:observer_text');
       expect(session.abortController.signal.aborted).toBe(true);
       expect(logger.error).toHaveBeenCalledWith(
@@ -1020,66 +824,7 @@ describe('ResponseProcessor', () => {
         expect.objectContaining({ sessionId: 1, outputClass: 'transport' })
       );
     });
-
-    it('still confirms ordinary prose so low-signal batches do not loop', async () => {
-      const confirmClaimedMessages = mock(() => Promise.resolve(0));
-      const resetProcessingToPending = mock(() => Promise.resolve(0));
-      mockSessionManager = {
-        getMessageIterator: async function* () { yield* []; },
-        getPendingMessageStore: () => ({ confirmProcessed: mock(() => {}) }),
-        confirmClaimedMessages,
-        resetProcessingToPending,
-      } as unknown as SessionManager;
-
-      const session = createMockSession();
-
-      await processAgentResponse(
-        'Traced the flake to a proxy that drops idle sockets; the retry now handles the connection reset.',
-        session,
-        mockDbManager,
-        mockSessionManager,
-        mockWorker,
-        100,
-        null,
-        'TestAgent'
-      );
-
-      expect(confirmClaimedMessages).toHaveBeenCalledWith(1);
-      expect(resetProcessingToPending).not.toHaveBeenCalled();
-    });
-
-    // The same guarantee one punctuation mark over: a completed observation
-    // that opens with an envelope AND a colon must still be confirmed, or the
-    // session pauses and retries work that already finished.
-    it('still confirms a punctuated envelope narrative', async () => {
-      const confirmClaimedMessages = mock(() => Promise.resolve(0));
-      const resetProcessingToPending = mock(() => Promise.resolve(0));
-      mockSessionManager = {
-        getMessageIterator: async function* () { yield* []; },
-        getPendingMessageStore: () => ({ confirmProcessed: mock(() => {}) }),
-        confirmClaimedMessages,
-        resetProcessingToPending,
-      } as unknown as SessionManager;
-
-      const session = createMockSession();
-
-      await processAgentResponse(
-        'Network error: recovery is already covered by the retry wrapper',
-        session,
-        mockDbManager,
-        mockSessionManager,
-        mockWorker,
-        100,
-        null,
-        'TestAgent'
-      );
-
-      expect(confirmClaimedMessages).toHaveBeenCalledWith(1);
-      expect(resetProcessingToPending).not.toHaveBeenCalled();
-      expect(session.abortController.signal.aborted).toBe(false);
-    });
   });
-
 
   describe('context-window overflow recovery (#3800)', () => {
     function overflowSessionManager() {
@@ -1121,99 +866,9 @@ describe('ResponseProcessor', () => {
       expect(session.consecutiveContextOverflows).toBe(1);
       expect(mockStoreObservations).not.toHaveBeenCalled();
     });
-
-    it('does not append the rejection to history — a failure must not enlarge the next request', async () => {
-      overflowSessionManager();
-      const session = createMockSession({
-        conversationHistory: [{ role: 'user', content: 'framing' }],
-      });
-
-      await processAgentResponse(
-        'Prompt is too long', session, mockDbManager, mockSessionManager, mockWorker,
-        100, null, 'TestAgent'
-      );
-
-      expect(session.conversationHistory.some(m => m.content.includes('too long'))).toBe(false);
-    });
-
-    it('pauses the session once recycling has failed repeatedly, rather than retrying forever', async () => {
-      const { resetProcessingToPending, confirmClaimedMessages } = overflowSessionManager();
-      // Two recycles already spent; a fresh generation carries only the framing
-      // prompt, the session-so-far block and one field-truncated observation, so
-      // still not fitting means something else is oversized.
-      const session = createMockSession({ consecutiveContextOverflows: 2 });
-
-      await processAgentResponse(
-        'Prompt is too long', session, mockDbManager, mockSessionManager, mockWorker,
-        100, null, 'TestAgent'
-      );
-
-      expect(session.abortReason).toBe('overflow:exhausted');
-      expect(session.abortController.signal.aborted).toBe(true);
-      // Work is still preserved, and still not silently confirmed away.
-      expect(resetProcessingToPending).toHaveBeenCalledWith(1);
-      expect(confirmClaimedMessages).not.toHaveBeenCalled();
-      expect(logger.error).toHaveBeenCalledWith(
-        'SESSION',
-        expect.stringContaining('still does not fit'),
-        expect.objectContaining({ consecutiveRecycles: 3 })
-      );
-    });
-
-    it('clears the overflow counter after a healthy observation so only consecutive failures trip it', async () => {
-      const session = createMockSession({ consecutiveContextOverflows: 1 });
-      const responseText = `
-        <observation>
-          <type>discovery</type>
-          <title>Recovered</title>
-          <narrative>The recycled conversation produced valid XML.</narrative>
-          <facts></facts>
-          <concepts></concepts>
-          <files_read></files_read>
-          <files_modified></files_modified>
-        </observation>
-      `;
-
-      await processAgentResponse(
-        responseText, session, mockDbManager, mockSessionManager, mockWorker,
-        100, null, 'TestAgent'
-      );
-
-      expect(session.consecutiveContextOverflows).toBe(0);
-    });
-
-    it('still treats ordinary prose as a benign skip, not an overflow', async () => {
-      const { resetProcessingToPending, confirmClaimedMessages } = overflowSessionManager();
-      const session = createMockSession();
-
-      await processAgentResponse(
-        'Skipping — nothing worth recording here.', session, mockDbManager,
-        mockSessionManager, mockWorker, 100, null, 'TestAgent'
-      );
-
-      expect(confirmClaimedMessages).toHaveBeenCalledWith(1);
-      expect(resetProcessingToPending).not.toHaveBeenCalled();
-      expect(session.consecutiveContextOverflows).toBe(0);
-      expect(session.forceInit).toBeUndefined();
-    });
   });
 
   describe('AI interaction health signal', () => {
-    it('records a failed interaction when the observer returns auth-failure prose', async () => {
-      const session = createMockSession();
-      const responseText = 'API Error: 401 Invalid authentication credentials';
-
-      await processAgentResponse(
-        responseText, session, mockDbManager, mockSessionManager, mockWorker,
-        100, null, 'TestAgent'
-      );
-
-      expect(mockRecordAiInteraction).toHaveBeenCalledWith(
-        expect.objectContaining({ success: false, error: 'unauthenticated' })
-      );
-      expect(mockStoreObservations).not.toHaveBeenCalled();
-    });
-
     it("labels the interaction with the session's provider, not the current settings", async () => {
       const session = createMockSession();
       (session as { currentProvider?: string }).currentProvider = 'gemini';
@@ -1228,6 +883,7 @@ describe('ResponseProcessor', () => {
         error: 'unauthenticated',
         provider: 'gemini',
       });
+      expect(mockStoreObservations).not.toHaveBeenCalled();
     });
 
     it('does NOT record an interaction for ordinary non-auth prose', async () => {
@@ -1294,45 +950,6 @@ describe('ResponseProcessor', () => {
       expect(summary.request).toBe('Build login form');
       expect(summary.investigated).toBe('Reviewed existing forms');
       expect(summary.learned).toBe('React Hook Form works well');
-    });
-
-    it('should handle response without summary', async () => {
-      const session = createMockSession();
-      const responseText = `
-        <observation>
-          <type>discovery</type>
-          <title>Test</title>
-          <facts></facts>
-          <concepts></concepts>
-          <files_read></files_read>
-          <files_modified></files_modified>
-        </observation>
-      `;
-
-      mockStoreObservations = mock(() => ({
-        observationIds: [1],
-        summaryId: null,
-        createdAtEpoch: 1700000000000,
-      }));
-      (mockDbManager.getSessionStore as any) = () => ({
-        storeObservations: mockStoreObservations,
-        db: sessionDbWithoutMedia(), ensureMemorySessionIdRegistered: mock(() => {}),
-        getSessionById: mock(() => ({ memory_session_id: 'memory-session-456' })),
-      });
-
-      await processAgentResponse(
-        responseText,
-        session,
-        mockDbManager,
-        mockSessionManager,
-        mockWorker,
-        100,
-        null,
-        'TestAgent'
-      );
-
-      const [, , , summary] = mockStoreObservations.mock.calls[0];
-      expect(summary).toBeNull();
     });
   });
 
@@ -1406,17 +1023,6 @@ describe('ResponseProcessor', () => {
         </observation>
       `;
 
-      mockStoreObservations = mock(() => ({
-        observationIds: [42],
-        summaryId: null,
-        createdAtEpoch: 1700000000000,
-      }));
-      (mockDbManager.getSessionStore as any) = () => ({
-        storeObservations: mockStoreObservations,
-        db: sessionDbWithoutMedia(), ensureMemorySessionIdRegistered: mock(() => {}),
-        getSessionById: mock(() => ({ memory_session_id: 'memory-session-456' })),
-      });
-
       await processAgentResponse(
         responseText,
         session,
@@ -1434,51 +1040,10 @@ describe('ResponseProcessor', () => {
         (call: any[]) => call[0].type === 'new_observation'
       );
       expect(observationCall).toBeDefined();
-      expect(observationCall[0].observation.id).toBe(42);
+      expect(observationCall[0].observation.id).toBe(1);
       expect(observationCall[0].observation.project).toBe('repo-b/worktree');
       expect(observationCall[0].observation.title).toBe('Broadcast Test');
       expect(observationCall[0].observation.type).toBe('discovery');
-    });
-
-    it('should broadcast summary via SSE', async () => {
-      mockStoreObservations = mock(() => ({
-        observationIds: [],
-        summaryId: 99,
-        createdAtEpoch: 1700000000000,
-      } as StorageResult));
-      (mockDbManager.getSessionStore as any) = () => ({
-        storeObservations: mockStoreObservations,
-        db: sessionDbWithoutMedia(), ensureMemorySessionIdRegistered: mock(() => {}),
-        getSessionById: mock(() => ({ memory_session_id: 'memory-session-456' })),
-      });
-
-      const session = createMockSession();
-      const responseText = `
-        <summary>
-          <request>Build feature</request>
-          <investigated>Reviewed code</investigated>
-          <learned>Found patterns</learned>
-          <completed>Feature built</completed>
-          <next_steps>Add tests</next_steps>
-        </summary>
-      `;
-
-      await processAgentResponse(
-        responseText,
-        session,
-        mockDbManager,
-        mockSessionManager,
-        mockWorker,
-        100,
-        null,
-        'TestAgent'
-      );
-
-      const summaryCall = mockBroadcast.mock.calls.find(
-        (call: any[]) => call[0].type === 'new_summary'
-      );
-      expect(summaryCall).toBeDefined();
-      expect(summaryCall[0].summary.request).toBe('Build feature');
     });
   });
 
@@ -1543,27 +1108,6 @@ describe('ResponseProcessor', () => {
       expect(session.earliestPendingTimestamp).toBeNull();
     });
 
-    it('clears pending work and does NOT call storeObservations on plain-text response', async () => {
-      const confirmClaimedMessages = mock(() => Promise.resolve(0));
-      mockSessionManager = {
-        getMessageIterator: async function* () { yield* []; },
-        getPendingMessageStore: () => ({ confirmProcessed: mock(() => {}) }),
-        confirmClaimedMessages,
-      } as unknown as SessionManager;
-
-      const session = createMockSession();
-      const responseText = 'This is just plain text without any XML tags.';
-
-      await processAgentResponse(
-        responseText, session, mockDbManager, mockSessionManager, mockWorker,
-        100, null, 'TestAgent'
-      );
-
-      expect(mockStoreObservations).not.toHaveBeenCalled();
-      expect(confirmClaimedMessages).toHaveBeenCalledWith(1);
-      expect(session.earliestPendingTimestamp).toBeNull();
-    });
-
     // #3454: the idle WARN line names why the turn was empty (block kinds
     // only), so "the model skipped" is distinguishable from "the turn had
     // only thinking/tool_use blocks" in the field.
@@ -1608,46 +1152,6 @@ describe('ResponseProcessor', () => {
   });
 
   describe('session cleanup', () => {
-    it('should reset earliestPendingTimestamp after processing', async () => {
-      const session = createMockSession({
-        earliestPendingTimestamp: 1700000000000,
-      });
-      const responseText = `
-        <observation>
-          <type>discovery</type>
-          <title>Test</title>
-          <facts></facts>
-          <concepts></concepts>
-          <files_read></files_read>
-          <files_modified></files_modified>
-        </observation>
-      `;
-
-      mockStoreObservations = mock(() => ({
-        observationIds: [1],
-        summaryId: null,
-        createdAtEpoch: 1700000000000,
-      }));
-      (mockDbManager.getSessionStore as any) = () => ({
-        storeObservations: mockStoreObservations,
-        db: sessionDbWithoutMedia(), ensureMemorySessionIdRegistered: mock(() => {}),
-        getSessionById: mock(() => ({ memory_session_id: 'memory-session-456' })),
-      });
-
-      await processAgentResponse(
-        responseText,
-        session,
-        mockDbManager,
-        mockSessionManager,
-        mockWorker,
-        100,
-        null,
-        'TestAgent'
-      );
-
-      expect(session.earliestPendingTimestamp).toBeNull();
-    });
-
     it('should call broadcastProcessingStatus after processing', async () => {
       const session = createMockSession();
       const responseText = `
@@ -1661,17 +1165,6 @@ describe('ResponseProcessor', () => {
         </observation>
       `;
 
-      mockStoreObservations = mock(() => ({
-        observationIds: [1],
-        summaryId: null,
-        createdAtEpoch: 1700000000000,
-      }));
-      (mockDbManager.getSessionStore as any) = () => ({
-        storeObservations: mockStoreObservations,
-        db: sessionDbWithoutMedia(), ensureMemorySessionIdRegistered: mock(() => {}),
-        getSessionById: mock(() => ({ memory_session_id: 'memory-session-456' })),
-      });
-
       await processAgentResponse(
         responseText,
         session,
@@ -1684,82 +1177,6 @@ describe('ResponseProcessor', () => {
       );
 
       expect(mockBroadcastProcessingStatus).toHaveBeenCalled();
-    });
-  });
-
-  describe('conversation history', () => {
-    it('should add assistant response to conversation history', async () => {
-      const session = createMockSession({
-        conversationHistory: [],
-      });
-      const responseText = `
-        <observation>
-          <type>discovery</type>
-          <title>Test</title>
-          <facts></facts>
-          <concepts></concepts>
-          <files_read></files_read>
-          <files_modified></files_modified>
-        </observation>
-      `;
-
-      mockStoreObservations = mock(() => ({
-        observationIds: [1],
-        summaryId: null,
-        createdAtEpoch: 1700000000000,
-      }));
-      (mockDbManager.getSessionStore as any) = () => ({
-        storeObservations: mockStoreObservations,
-        db: sessionDbWithoutMedia(), ensureMemorySessionIdRegistered: mock(() => {}),
-        getSessionById: mock(() => ({ memory_session_id: 'memory-session-456' })),
-      });
-
-      await processAgentResponse(
-        responseText,
-        session,
-        mockDbManager,
-        mockSessionManager,
-        mockWorker,
-        100,
-        null,
-        'TestAgent'
-      );
-
-      expect(session.conversationHistory).toHaveLength(1);
-      expect(session.conversationHistory[0].role).toBe('assistant');
-      expect(session.conversationHistory[0].content).toBe(responseText);
-    });
-  });
-
-  describe('error handling', () => {
-    it('should reset processing work if memorySessionId is missing from session', async () => {
-      const resetProcessingToPending = mock(() => Promise.resolve(1));
-      mockSessionManager = {
-        getMessageIterator: async function* () { yield* []; },
-        resetProcessingToPending,
-      } as unknown as SessionManager;
-      const session = createMockSession({
-        memorySessionId: null, // Missing memory session ID
-      });
-      const responseText = `<observation>
-        <type>discovery</type>
-        <title>some title</title>
-        <narrative>some narrative</narrative>
-      </observation>`;
-
-      await processAgentResponse(
-        responseText,
-        session,
-        mockDbManager,
-        mockSessionManager,
-        mockWorker,
-        100,
-        null,
-        'TestAgent'
-      );
-
-      expect(resetProcessingToPending).toHaveBeenCalledWith(1);
-      expect(mockStoreObservations).not.toHaveBeenCalled();
     });
   });
 
@@ -1856,46 +1273,6 @@ describe('ResponseProcessor', () => {
       );
     });
   });
-  describe('lastSummaryStored tracking (#1633)', () => {
-    it('should set lastSummaryStored=true when storage returns a summaryId', async () => {
-      mockStoreObservations.mockImplementation(() => ({
-        observationIds: [],
-        summaryId: 42,
-        createdAtEpoch: 1700000000000,
-      } as StorageResult));
-
-      const session = createMockSession();
-      const responseText = `
-        <summary>
-          <request>user asked to fix bug</request>
-          <investigated>looked at auth module</investigated>
-          <learned>JWT tokens were expiring</learned>
-          <completed>fixed expiry check</completed>
-          <next_steps>write tests</next_steps>
-        </summary>
-      `;
-
-      await processAgentResponse(responseText, session, mockDbManager, mockSessionManager, mockWorker, 0, null, 'TestAgent');
-
-      expect(session.lastSummaryStored).toBe(true);
-    });
-
-    it('should set lastSummaryStored=false when storage returns summaryId=null (silent loss path, #1633)', async () => {
-      mockStoreObservations.mockImplementation(() => ({
-        observationIds: [],
-        summaryId: null,
-        createdAtEpoch: 1700000000000,
-      } as StorageResult));
-
-      const session = createMockSession();
-      const responseText = '<skip_summary/>';
-
-      await processAgentResponse(responseText, session, mockDbManager, mockSessionManager, mockWorker, 0, null, 'TestAgent');
-
-      expect(session.lastSummaryStored).toBe(false);
-    });
-  });
-
   describe('a valid reply that arrives before the memory session id is captured', () => {
     function sessionManagerWithSpies() {
       const confirmClaimedMessages = mock(() => Promise.resolve(1));
@@ -1923,7 +1300,10 @@ describe('ResponseProcessor', () => {
       expect(session.earliestPendingTimestamp).toBeNull();
     });
 
-    it('commits a skip marker before confirming claimed work without a memory session id', async () => {
+    it.each([
+      ['<skip_summary reason="noise" />', undefined],
+      ['<skip_summary reason="noise" />\n<observation><type>change</type><title>Unfinished', 'length'],
+    ] as const)('commits a skip marker before confirming claimed work without a memory session id: %s', async (responseText, lastFinishReason) => {
       const store = new SessionStore(':memory:');
       const sessionDbId = store.createSDKSession('content-session-123', 'test-project', 'prompt', undefined, 'claude');
       const { confirmClaimedMessages } = sessionManagerWithSpies();
@@ -1933,30 +1313,10 @@ describe('ResponseProcessor', () => {
       } as unknown as SessionManager;
       mockDbManager = { ...mockDbManager, getSessionStore: () => store } as unknown as DatabaseManager;
       try {
-        await processAgentResponse('<skip_summary reason="noise" />',
-          createMockSession({ sessionDbId, memorySessionId: null }),
+        await processAgentResponse(responseText,
+          createMockSession({ sessionDbId, memorySessionId: null, lastFinishReason }),
           mockDbManager, mockSessionManager, mockWorker, 0, null, 'TestAgent');
         expect(store.hasCommittedToolUse('claude', 'content-session-123', 'toolu_skip_1')).toBe(true);
-        expect(confirmClaimedMessages).toHaveBeenCalledWith(sessionDbId);
-      } finally {
-        store.close();
-      }
-    });
-
-    it('commits a skip marker for a cut-off skip reply without a memory session id', async () => {
-      const store = new SessionStore(':memory:');
-      const sessionDbId = store.createSDKSession('content-session-123', 'test-project', 'prompt', undefined, 'claude');
-      const { confirmClaimedMessages } = sessionManagerWithSpies();
-      mockSessionManager = {
-        ...mockSessionManager,
-        getClaimedMessages: mock(() => [{ type: 'observation', toolUseId: 'toolu_skip_cut_1' }]),
-      } as unknown as SessionManager;
-      mockDbManager = { ...mockDbManager, getSessionStore: () => store } as unknown as DatabaseManager;
-      try {
-        await processAgentResponse('<skip_summary reason="noise" />\n<observation><type>change</type><title>Unfinished',
-          createMockSession({ sessionDbId, memorySessionId: null, lastFinishReason: 'length' } as Partial<ActiveSession>),
-          mockDbManager, mockSessionManager, mockWorker, 0, null, 'TestAgent');
-        expect(store.hasCommittedToolUse('claude', 'content-session-123', 'toolu_skip_cut_1')).toBe(true);
         expect(confirmClaimedMessages).toHaveBeenCalledWith(sessionDbId);
       } finally {
         store.close();

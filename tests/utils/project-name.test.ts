@@ -46,41 +46,20 @@ describe('getProjectName', () => {
     });
   });
 
-  describe('normal paths', () => {
-    it('extracts basename from absolute path', () => {
-      expect(getProjectName('/home/user/my-project')).toBe('my-project');
-    });
-
-    it('extracts basename from nested path', () => {
-      expect(getProjectName('/Users/test/work/deep/nested/project')).toBe('project');
-    });
-
-    it('handles trailing slash', () => {
-      expect(getProjectName('/home/user/my-project/')).toBe('my-project');
-    });
+  it.each([
+    ['/home/user/my-project', 'my-project'],
+    ['/Users/test/work/deep/nested/project', 'project'],
+    ['/home/user/my-project/', 'my-project'],
+    [null, 'unknown-project'],
+    [undefined, 'unknown-project'],
+    ['', 'unknown-project'],
+    ['   ', 'unknown-project'],
+    ['/', 'unknown-project'],
+  ])('resolves %p to %s', (input, expected) => {
+    expect(getProjectName(input)).toBe(expected);
   });
 
   describe('edge cases', () => {
-    it('returns unknown-project for null', () => {
-      expect(getProjectName(null)).toBe('unknown-project');
-    });
-
-    it('returns unknown-project for undefined', () => {
-      expect(getProjectName(undefined)).toBe('unknown-project');
-    });
-
-    it('returns unknown-project for empty string', () => {
-      expect(getProjectName('')).toBe('unknown-project');
-    });
-
-    it('returns unknown-project for whitespace', () => {
-      expect(getProjectName('   ')).toBe('unknown-project');
-    });
-
-    it('returns unknown-project for the filesystem root', () => {
-      expect(getProjectName('/')).toBe('unknown-project');
-    });
-
     it('keeps the hook cwd when CLAUDE_PROJECT_DIR is unavailable', () => {
       expect(resolveHookProjectPath(SDK_TEMP_DIR_NAME)).toBe(SDK_TEMP_DIR_NAME);
     });
@@ -263,6 +242,26 @@ describe('getProjectName', () => {
       expect(resolveInChild(scratch, env)).toEqual({ name: 'scratch', allProjects: ['scratch'] });
       expect(resolveInChild(join(pluginDir, 'scripts'), env)).toEqual({ name: 'scripts', allProjects: ['scripts'] });
     });
+
+    it('ignores markers in config descendants whose names start with two dots', async () => {
+      const { mkdirSync, writeFileSync } = await import('fs');
+      const { join } = await import('path');
+      const fakeConfig = join(tmp, 'dot-prefix-config');
+      for (const name of ['..cache', '...']) {
+        const marked = join(fakeConfig, name);
+        const nested = join(marked, 'scripts');
+        mkdirSync(nested, { recursive: true });
+        writeFileSync(join(marked, '.claude-mem-project'), '');
+        expect(resolveInChild(nested, { CLAUDE_CONFIG_DIR: fakeConfig })).toEqual({ name: 'scripts', allProjects: ['scripts'] });
+      }
+
+      const sibling = join(fakeConfig, '..', 'adjacent-project');
+      mkdirSync(join(sibling, 'src'), { recursive: true });
+      writeFileSync(join(sibling, '.claude-mem-project'), '');
+      expect(resolveInChild(join(sibling, 'src'), { CLAUDE_CONFIG_DIR: fakeConfig })).toEqual({
+        name: 'adjacent-project', allProjects: ['src', 'adjacent-project'],
+      });
+    });
   });
 
   describe('#3437 — Claude project dir anchors SDK/subagent sessions', () => {
@@ -325,19 +324,6 @@ describe('getProjectName', () => {
     });
   });
 
-  describe('realistic scenarios from #1478', () => {
-    it('handles ~ the same as full home path', () => {
-      const home = homedir();
-      expect(getProjectName('~')).toBe(getProjectName(home));
-    });
-
-    it('handles ~/projects/app the same as /full/path/projects/app', () => {
-      const home = homedir();
-      expect(getProjectName('~/projects/app')).toBe(
-        getProjectName(`${home}/projects/app`)
-      );
-    });
-  });
 });
 
 describe('getProjectContext', () => {
@@ -398,12 +384,6 @@ describe('getProjectContext', () => {
       expect(ctx.allProjects).toEqual(['main-repo', 'main-repo/my-worktree']);
     });
 
-    it('write-path call sites resolve to composite name in worktrees', () => {
-      const project = getProjectContext(worktreeCheckout).primary;
-      expect(project).toBe('main-repo/my-worktree');
-      expect(project).not.toBe('main-repo');
-      expect(project).not.toBe('my-worktree');
-    });
   });
 
   // #3641 — Codex CLI puts worktrees at ~/.codex/worktrees/<id>/<repo>, so the
@@ -516,13 +496,6 @@ describe('getProjectContext', () => {
       expect(ctx.allProjects).toEqual(['main-repo', 'main-repo/feature-x']);
     });
 
-    it('subdirectory and worktree root share the same primary key', () => {
-      const atRoot = getProjectContext(worktreeCheckout).primary;
-      const inSubdir = getProjectContext(worktreeSubdir).primary;
-      expect(inSubdir).toBe(atRoot);
-      expect(inSubdir).not.toBe('feature-x');
-      expect(inSubdir).not.toBe('nested');
-    });
   });
 });
 

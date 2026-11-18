@@ -1,10 +1,13 @@
+import { formatDeepSearch } from '../shared/deep-search-format.js';
+import type { DeepSearchResult } from '../services/sqlite/tool-use-search.js';
 import { logger } from '../utils/logger.js';
 import { projectMemoryContent } from '../shared/progressive-search.js';
 import { retainTextHeadTail } from '../shared/text-truncation.js';
+import { isMemorySaveRefusalReason, type MemorySaveRefusalReason } from '../shared/memory-save-refusal.js';
 
 export type McpTextPurpose = 'save' | 'observation-add' | 'event' | 'search' | 'server-search' | 'server-timeline' | 'context' | 'job'
   | 'observations' | 'tool-uses' | 'corpus-list' | 'corpus-build' | 'corpus-prime' | 'corpus-query';
-export type McpTextResult = { content: Array<{ type: 'text'; text: string }>; isError?: boolean };
+export type McpTextResult = { content: Array<{ type: 'text'; text: string }>; isError?: boolean; _meta?: Record<string, unknown> };
 const MAX_TEXT_BYTES = 32 * 1024;
 // get_observations is step 3 of the mem-search workflow: the caller already
 // filtered the IDs, so every requested record is returned.
@@ -15,9 +18,8 @@ const line = (value: unknown, fallback = '', maximum = 240): string => {
   const text = typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean' ? String(value) : fallback;
   return retainTextHeadTail(text.replace(/[\r\n\u0000-\u001f\u007f]/g, ' '), maximum, 0).head;
 };
-function bounded(text: string, maximum = MAX_TEXT_BYTES): string {
+function bounded(text: string, maximum = MAX_TEXT_BYTES, suffix = '\n[Response shortened; request fewer selected records for more detail.]'): string {
   if (Buffer.byteLength(text, 'utf8') <= maximum) return text;
-  const suffix = '\n[Response shortened; request fewer selected records for more detail.]';
   let result = '', bytes = 0;
   for (const char of text) {
     const size = Buffer.byteLength(char, 'utf8');
@@ -29,6 +31,14 @@ function bounded(text: string, maximum = MAX_TEXT_BYTES): string {
 export function mcpTextResult(text: string, isError = false, maximumBytes = MAX_TEXT_BYTES): McpTextResult {
   return { content: [{ type: 'text', text: bounded(text, maximumBytes) }], ...(isError ? { isError: true } : {}) };
 }
+
+export function formatWorkStateMcpResponse(text: string): McpTextResult {
+  return {
+    content: [{ type: 'text', text: bounded(text, MAX_TEXT_BYTES,
+      '\n[Work state shortened. Export the complete ordered history with GET /api/work-state/export on the worker port (CLAUDE_MEM_WORKER_PORT in ~/.claude-mem/settings.json), using the same cwd and optional list; closed items are included.]') }],
+    _meta: { 'claude-mem/truncated': Buffer.byteLength(text, 'utf8') > MAX_TEXT_BYTES },
+  };
+}
 function parseStored(value: unknown): unknown {
   if (typeof value !== 'string' || !/^[\s]*[\[{]/.test(value)) return value;
   try { return JSON.parse(value); } catch { return value; }
@@ -39,11 +49,19 @@ function rows(payload: unknown, key: string): unknown[] {
   return Array.isArray(value) ? value : [];
 }
 function identity(row: Record<string, unknown>): string {
+  // Provenance: which agent made this record. Server rows are camelCase, local
+  // rows snake_case; rows from before provenance carry neither and get no tag.
+  const platform = row.platformSource ?? row.platform_source;
+  const via = typeof platform === 'string' && platform.trim() ? ` [via ${line(platform.trim(), '', 100)}]` : '';
   return `#${line(row.id, '?', 100)} — ${line(row.title ?? record(row.metadata).title, 'Memory', 180)}`
-    + (row.project || row.projectId ? ` (${line(row.project ?? row.projectId, '', 100)})` : '');
+    + (row.project || row.projectId ? ` (${line(row.project ?? row.projectId, '', 100)})` : '')
+    + via;
 }
 function recordedAt(row: Record<string, unknown>): string {
-  const epoch = typeof row.created_at_epoch === 'number' ? row.created_at_epoch : typeof row.createdAtEpoch === 'number' ? row.createdAtEpoch : null;
+  // Older SQLite rows use seconds. Server createdAtEpoch is already in milliseconds.
+  const stored = row.created_at_epoch;
+  const epoch = typeof stored === 'number' ? (stored < 1e12 ? stored * 1000 : stored)
+    : typeof row.createdAtEpoch === 'number' ? row.createdAtEpoch : null;
   const date = epoch === null ? null : new Date(epoch);
   return date && Number.isFinite(date.getTime()) ? date.toISOString().slice(0, 16).replace('T', ' ') + ' UTC' : '';
 }
@@ -104,12 +122,28 @@ function corpusSummary(value: unknown): string {
     + (corpus.description ? `\n${line(corpus.description, '', 300)}` : '');
 }
 
+/** Words for each reason the worker refuses a save_memory write (src/shared/memory-save-refusal.ts). */
+const SAVE_REFUSAL_TEXT: Record<MemorySaveRefusalReason, string> = {
+  project_excluded: 'Not saved: this checkout is excluded by CLAUDE_MEM_EXCLUDED_PROJECTS.',
+};
+
 /** Select model-visible information explicitly. Unknown backend fields are never dumped into the prompt. */
 export function formatMcpPayload(purpose: McpTextPurpose, payload: unknown): McpTextResult {
   const data = record(payload);
   let text: string;
+  let isError = false;
   switch (purpose) {
     case 'save':
+      if (data.success === false || data.skipped === true) {
+        // The worker refused the write (for example project_excluded). Saying
+        // "Saved memory #?" here told the caller a note it never stored (#6098).
+        const reason = typeof data.reason === 'string' ? data.reason : '';
+        isError = true;
+        text = isMemorySaveRefusalReason(reason)
+          ? SAVE_REFUSAL_TEXT[reason]
+          : `Not saved${reason ? `: ${line(reason)}.` : '.'}`;
+        break;
+      }
       text = data.duplicate ? `Memory already saved as #${line(data.id, '?')}.`
         : `Saved memory #${line(data.id, '?')}: ${line(data.title, 'Untitled')}.`;
       if (data.project) text += ` Project: ${line(data.project)}.`;
@@ -135,6 +169,8 @@ export function formatMcpPayload(purpose: McpTextPurpose, payload: unknown): Mcp
     case 'server-search':
     case 'server-timeline': {
       const server = purpose === 'server-search' || purpose === 'server-timeline';
+      const deepText = !server && data.deep && Array.isArray(data.toolUses)
+        ? formatDeepSearch(data as unknown as DeepSearchResult) : '';
       const results = [
         ...rows(payload, 'observations').map(value => ({ value, prefix: '' })),
         ...rows(payload, 'sessions').map(value => ({ value, prefix: server ? '' : 'S' })),
@@ -163,7 +199,7 @@ export function formatMcpPayload(purpose: McpTextPurpose, payload: unknown): Mcp
         return `- ${identity({ ...row, id, title: title ?? 'Untitled memory' })}${context ? `\n  ${context}` : ''}`;
       });
       const included: string[] = [];
-      let bytes = Buffer.byteLength(next, 'utf8') + 300;
+      let bytes = Buffer.byteLength(next + deepText, 'utf8') + 302;
       for (const entry of entries) {
         const size = Buffer.byteLength(entry + '\n', 'utf8');
         if (bytes + size > MAX_TEXT_BYTES) break;
@@ -173,6 +209,7 @@ export function formatMcpPayload(purpose: McpTextPurpose, payload: unknown): Mcp
         + included.join('\n')
         + (included.length < results.length ? `\n${results.length - included.length} results omitted to fit the response budget; narrow the query or page the search.` : '')
         + `\n${next}` : 'No matching memories found.';
+      if (deepText) text += '\n\n' + deepText;
       break;
     }
     case 'context':
@@ -197,9 +234,34 @@ export function formatMcpPayload(purpose: McpTextPurpose, payload: unknown): Mcp
     }
     case 'corpus-build': text = `Corpus ready.\n${corpusSummary(data)}\nUse prime_corpus before querying.`; break;
     case 'corpus-prime': text = `Corpus ${line(data.name, 'requested corpus')} primed. Use query_corpus to ask a question.`; break;
-    case 'corpus-query': text = `Corpus answer:\n\n${typeof data.answer === 'string' ? data.answer : 'No answer returned.'}`; break;
+    case 'corpus-query': {
+      const answer = typeof data.answer === 'string' ? data.answer : 'No answer returned.';
+      // The API corpus agent answers from an excerpt; say so when matches were left out.
+      // The notices go before the answer: mcpTextResult keeps only the first 32 KiB,
+      // so a long answer would cut off notices placed after it.
+      // A count is a number or it is absent: Number(null) would read as a count of 0.
+      const count = (value: unknown): number => (typeof value === 'number' && Number.isFinite(value) ? value : NaN);
+      const sent = count(data.observations_sent);
+      const matching = count(data.observations_matching);
+      const inCorpus = count(data.observations_in_corpus);
+      const truncated = count(data.observations_truncated);
+      const notices = [
+        Number.isFinite(sent) && Number.isFinite(matching) && sent < matching
+          ? `Partial excerpt: the answer saw ${sent} of the ${matching} observations that match the question.`
+          : '',
+        // Nothing matched: the excerpt is the most recent observations, not a selection.
+        Number.isFinite(sent) && matching === 0 && Number.isFinite(inCorpus) && sent < inCorpus
+          ? `Partial excerpt: no observation matches the question, so the answer saw only the ${sent} most recent of the ${inCorpus} in the corpus.`
+          : '',
+        Number.isFinite(truncated) && truncated > 0
+          ? `Cut: the text of ${truncated} ${truncated === 1 ? 'observation' : 'observations'} the answer saw was shortened to fit the excerpt budget.`
+          : '',
+      ].filter(Boolean);
+      text = `Corpus answer:\n\n${notices.length ? `${notices.join('\n')}\n\n` : ''}${answer}`;
+      break;
+    }
   }
-  return mcpTextResult(text);
+  return mcpTextResult(text, isError);
 }
 
 /** Existing Markdown endpoints stay readable; accidental JSON text is converted by its declared purpose. */
@@ -211,6 +273,14 @@ export function formatWorkerMcpResponse(purpose: McpTextPurpose, payload: unknow
       const parsed = parseStored(text);
       return typeof parsed === 'string' ? parsed : formatMcpPayload(purpose, parsed).content[0].text;
     });
+    if (purpose === 'search' && data.deep && Array.isArray(data.toolUses)) {
+      const rawText = formatDeepSearch(data as unknown as DeepSearchResult);
+      // SearchManager appends this block after ordinary memory text. Budget the
+      // latter separately so long summaries cannot consume the raw tier's space.
+      const ordinary = (readable.at(-1) === rawText ? readable.slice(0, -1) : readable).join('\n\n');
+      const budget = MAX_TEXT_BYTES - Buffer.byteLength(rawText, 'utf8') - 2;
+      return mcpTextResult(`${bounded(ordinary, budget)}\n\n${rawText}`, data.isError === true);
+    }
     if (readable.length) return mcpTextResult(readable.join('\n\n'), data.isError === true, purpose === 'observations' ? MAX_OBSERVATION_TEXT_BYTES : MAX_TEXT_BYTES);
     logger.debug('SYSTEM', 'Omitted unsupported MCP response content', { purpose });
     return mcpTextResult('The tool returned no readable text.', data.isError === true);

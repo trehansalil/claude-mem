@@ -7,13 +7,15 @@ failOnCiWithoutChrome('CI requires Chrome for stale remote refresh ownership.');
 (chromeExecutablePath ? it : it.skip)('a held remote refresh cannot restore the previous project or its error', async () => {
   const bundle=compileBrowserFixture(`
     import React from 'react';import{createRoot}from'react-dom/client';import{App}from'./src/ui/viewer/App';
-    localStorage.setItem('claude-mem-welcome-dismissed','true');
+    import { setStoredWelcomeDismissed } from './src/ui/viewer/components/WelcomeCard';
+    setStoredWelcomeDismissed(true);
     let aLoaded=0;const original=window.fetch.bind(window);
     window.fetch=async(...args)=>{const response=await original(...args);if(String(args[0]).includes('/api/observations?')&&String(args[0]).includes('project=A')){const json=response.json.bind(response);response.json=async()=>{const data=await json();aLoaded++;return data;};}return response;};
     createRoot(document.getElementById('root')).render(<App/>);
     const has=text=>document.body.textContent.includes(text);
     async function until(check,label){const end=Date.now()+10000;while(!check()){if(Date.now()>end)throw Error(label);await new Promise(r=>setTimeout(r,10));}}
-    function project(value){const select=document.querySelector('select[aria-label="Filter memories by project"]');select.value=value;select.dispatchEvent(new Event('change',{bubbles:true}));}
+    // The header's searchable Project filter: open it and choose the option.
+    function project(value){const option=document.querySelector('.project-picker [role="option"][data-value="'+CSS.escape(value)+'"]');document.querySelector('.project-picker-trigger').click();option.click();}
     (async()=>{try{
       await original('/ready');await until(()=>has('A_1_END'),'initial');project('A');await until(()=>aLoaded>0&&!has('Loading more...'),'A baseline');
       await original('/begin',{method:'POST'});await original('/held');project('B');

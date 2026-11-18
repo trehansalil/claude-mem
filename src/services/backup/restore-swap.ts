@@ -5,7 +5,9 @@ import { Database } from 'bun:sqlite';
 import { logger } from '../../utils/logger.js';
 import { renameWithWindowsRetry } from '../../shared/atomic-json.js';
 import { runSqliteFileJob } from './sqlite-file-job.js';
+import { LATEST_SCHEMA_VERSION } from '../sqlite/connection.js';
 import { ChromaSyncState } from '../sync/ChromaSyncState.js';
+import { contextCacheDir, listContextCacheFiles } from '../../shared/context-cache.js';
 import {
   clearPendingRestore,
   readPendingRestore,
@@ -162,12 +164,16 @@ export async function swapDatabaseFromSnapshot(
   const ts = new Date().toISOString().replace(/[:.]/g, '-');
   const stagedDb = `${dbPath}.restore-staging-${ts}`;
   let preRestoreCopy: string | null = null;
+  let retainedRawCopy: string | null = null;
   const movedSidecars: string[] = [];
 
   try {
     await copyFile(snapshotPath, stagedDb);
     if (existsSync(`${snapshotPath}-wal`)) await copyFile(`${snapshotPath}-wal`, `${stagedDb}-wal`);
-    await runSqliteFileJob({ kind: 'standalone', target: stagedDb });
+    // Refuse snapshots this binary cannot open before checkpointing or
+    // replacing the healthy live database. The startup writer guard would
+    // otherwise discover the incompatibility only after the swap committed.
+    await runSqliteFileJob({ kind: 'standalone', target: stagedDb, maxSchemaVersion: LATEST_SCHEMA_VERSION });
 
     if (existsSync(dbPath)) {
       // Keep a byte-for-byte copy of the live db and its -wal before anything
@@ -201,9 +207,15 @@ export async function swapDatabaseFromSnapshot(
         carryAutoincrementCounters(stagedDb, readAutoincrementCounters(dbPath));
       } else {
         // Too damaged to open, so nothing else can be using it either: the
-        // raw pair is the best copy there is.
-        renameWithWindowsRetry(rawCopy, copyPath);
-        if (existsSync(`${rawCopy}-wal`)) renameWithWindowsRetry(`${rawCopy}-wal`, `${copyPath}-wal`);
+        // raw pair is the best copy there is. Backups may be on another
+        // filesystem, so copy both files before discarding either original.
+        // If that transfer fails, keep the pair: SQLite may already have
+        // discarded the live WAL while trying to open the damaged database.
+        retainedRawCopy = rawCopy;
+        await copyFile(rawCopy, copyPath);
+        if (existsSync(`${rawCopy}-wal`)) await copyFile(`${rawCopy}-wal`, `${copyPath}-wal`);
+        retainedRawCopy = null;
+        dropRawCopy();
         logger.warn('BACKUP', 'Restoring over a database that could not be read; new ids may repeat ids it used', { dbPath });
       }
       preRestoreCopy = copyPath;
@@ -228,18 +240,31 @@ export async function swapDatabaseFromSnapshot(
       }
     }
     const rawCopy = `${dbPath}.restore-raw-${ts}`;
-    for (const leftover of [stagedDb, ...SIDECAR_EXTS.map(ext => `${stagedDb}${ext}`), rawCopy, `${rawCopy}-wal`]) {
+    const disposableRaw = retainedRawCopy ? [] : [rawCopy, `${rawCopy}-wal`];
+    for (const leftover of [stagedDb, ...SIDECAR_EXTS.map(ext => `${stagedDb}${ext}`), ...disposableRaw]) {
       try {
         removeIfPresent(leftover);
       } catch (cleanupError) {
         logger.warn('BACKUP', 'Could not remove restore staging file', { leftover }, cleanupError instanceof Error ? cleanupError : new Error(String(cleanupError)));
       }
     }
+    if (retainedRawCopy) {
+      logger.error('BACKUP', 'Recovery copy transfer failed; raw database and WAL retained', { rawCopy: retainedRawCopy });
+    }
     throw error instanceof Error ? error : new Error(String(error));
   }
 
-  // The swap is done; the old sidecars belong to the replaced database.
-  for (const ext of movedSidecars) removeIfPresent(`${stagedDb}.live${ext}`);
+  // The swap has committed. A cleanup failure must not report that the old
+  // database is still live or prevent the semantic index from being rebuilt.
+  // The parked sidecars cannot be mistaken for the new database's sidecars.
+  for (const ext of movedSidecars) {
+    const leftover = `${stagedDb}.live${ext}`;
+    try {
+      removeIfPresent(leftover);
+    } catch (error) {
+      logger.warn('BACKUP', 'Database restored; could not remove a parked old sidecar', { leftover }, error instanceof Error ? error : new Error(String(error)));
+    }
+  }
   logger.info('BACKUP', 'Database swapped from snapshot', { snapshot: snapshotPath, preRestoreCopy });
   return { preRestoreCopy };
 }
@@ -257,6 +282,26 @@ function queueSemanticIndexRebuild(): void {
   } catch (error) {
     logger.error('BACKUP', 'Could not flag the semantic index for a rebuild after the restore; semantic search may miss restored rows', {}, error instanceof Error ? error : new Error(String(error)));
   }
+}
+
+/** The cache service has not started yet; remove pre-restore bodies directly. */
+function invalidateSessionStartCache(): void {
+  try {
+    for (const fileName of listContextCacheFiles()) {
+      try {
+        unlinkSync(join(contextCacheDir(), fileName));
+      } catch (error) {
+        logger.warn('BACKUP', 'Database restored; could not remove a stale SessionStart block', { fileName },
+          error instanceof Error ? error : new Error(String(error)));
+      }
+    }
+  } catch (error) {
+    logger.warn('BACKUP', 'Database restored; could not list stale SessionStart blocks', {},
+      error instanceof Error ? error : new Error(String(error)));
+  }
+  // Keep variants.json: the new cache service uses it to render these variants
+  // from the restored database. Successfully removed blocks take the live path
+  // during that startup gap; cleanup failures above are reported separately.
 }
 
 /**
@@ -288,6 +333,7 @@ export async function applyPendingRestore(
     });
     result = { snapshot, at: Date.now(), ok: true, preRestoreCopy, error: null };
     logger.info('BACKUP', 'Pending restore applied', { snapshot, preRestoreCopy });
+    invalidateSessionStartCache();
     queueSemanticIndexRebuild();
   } catch (error) {
     const normalized = error instanceof Error ? error : new Error(String(error));

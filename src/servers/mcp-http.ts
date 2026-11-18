@@ -22,6 +22,11 @@
 // directory it could not already read. The header must be an absolute path
 // to an existing directory, and an unusable one is refused (400) rather than
 // silently replaced by the session or process cwd.
+//
+// Several OS users on one host: a loopback peer is then any of them. With an local API token
+// set (CLAUDE_MEM_LOCAL_API_TOKEN, StartMcpHttpOptions.localApiToken) every /mcp request must
+// carry it, so the working-directory header above is only ever honored on a request that
+// does. Unset, nothing changes.
 import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { randomUUID } from 'node:crypto';
@@ -32,8 +37,10 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { isInitializeRequest, RootsListChangedNotificationSchema } from '@modelcontextprotocol/sdk/types.js';
 import { isLocalhost } from '../server/middleware/request-auth-helpers.js';
 import { isOwnPageOrigin, type WorkerOriginPolicy } from '../services/worker/http/origin-policy.js';
+import { extractLocalApiToken, safeEqualSecret } from '../shared/local-api-token.js';
 import { logger } from '../utils/logger.js';
 import { MAX_MCP_ROOTS_ATTEMPTS, MCP_ROOTS_TIMEOUT_MS, normalizeCwd, resolveMcpProjectCwd } from './mcp-project-cwd.js';
+import { WORKER_JSON_BODY_LIMIT_BYTES } from '../shared/worker-http-limits.js';
 export { cwdFromRoots, normalizeCwd } from './mcp-project-cwd.js';
 
 export const CWD_HEADER = 'x-claude-mem-cwd';
@@ -41,10 +48,10 @@ export const MCP_HTTP_PATH = '/mcp';
 export const DEFAULT_HTTP_HOST = '127.0.0.1';
 export const DEFAULT_HTTP_PORT = 37790;
 
-// The same cap as the worker's JSON body limit (express.json({ limit: '5mb' }) in
-// src/services/worker/http/middleware.ts): tool arguments are forwarded to the worker,
-// so a larger request could never succeed there anyway.
-const MAX_BODY_BYTES = 5 * 1024 * 1024;
+// The worker's own JSON body limit (WORKER_JSON_BODY_LIMIT_BYTES, which
+// src/services/worker/http/middleware.ts passes to express.json): tool arguments are
+// forwarded to the worker, so a larger request could never succeed there anyway.
+const MAX_BODY_BYTES = WORKER_JSON_BODY_LIMIT_BYTES;
 // Reaps sessions whose client went away without a DELETE (abandoned-session memory
 // protection). Reaping a live but idle session is cheap: the MCP Streamable HTTP spec
 // requires a client that gets 404 for its session id to initialize a new one.
@@ -98,7 +105,7 @@ function loopbackHostOrThrow(raw: string): string {
 export function parseHttpArgs(argv: readonly string[], env: NodeJS.ProcessEnv): McpHttpOptions | null {
   const flag = (name: string): string | undefined => {
     for (let i = 0; i < argv.length; i++) {
-      if (argv[i] === `--${name}`) return argv[i + 1];
+      if (argv[i] === `--${name}`) return argv[i + 1] ?? '';
       if (argv[i].startsWith(`--${name}=`)) return argv[i].slice(name.length + 3);
     }
     return undefined;
@@ -109,7 +116,7 @@ export function parseHttpArgs(argv: readonly string[], env: NodeJS.ProcessEnv): 
   const host = loopbackHostOrThrow(flag('host') ?? env.CLAUDE_MEM_MCP_HTTP_HOST ?? DEFAULT_HTTP_HOST);
   const portText = flag('port') ?? env.CLAUDE_MEM_MCP_HTTP_PORT ?? String(DEFAULT_HTTP_PORT);
   const port = Number(portText);
-  if (!Number.isInteger(port) || port < 0 || port > 65535) {
+  if (!portText.trim() || !Number.isInteger(port) || port < 0 || port > 65535) {
     throw new Error(`Invalid MCP HTTP port: ${portText}`);
   }
   return { host, port };
@@ -141,13 +148,24 @@ interface Session {
   rootsAttempts: number;
   /** The client said its roots changed: ask again before the next request. */
   rootsStale: boolean;
+  rootsRevision: number;
   rootsInFlight?: Promise<void>;
+  rootsInFlightRevision?: number;
 }
 
 export interface McpHttpHandle {
   port: number;
   sessionCount(): number;
   close(): Promise<void>;
+}
+
+/** The request path without its query string, for logs: a query can carry a secret. */
+function requestPathname(req: IncomingMessage): string {
+  try {
+    return new URL(req.url ?? '/', 'http://localhost').pathname;
+  } catch {
+    return '/';
+  }
 }
 
 export interface StartMcpHttpOptions extends McpHttpOptions {
@@ -159,6 +177,12 @@ export interface StartMcpHttpOptions extends McpHttpOptions {
    * governs this server. Local MCP clients send no Origin.
    */
   originPolicy: WorkerOriginPolicy;
+  /**
+   * The local API token (CLAUDE_MEM_LOCAL_API_TOKEN). When non-empty, every /mcp request must
+   * carry it as `X-Claude-Mem-Token` or `Authorization: Bearer`, or it is refused with
+   * 401. `/health` stays open. Empty or absent: no check.
+   */
+  localApiToken?: string;
   /** Defaults to MAX_SESSIONS; tests lower it. */
   maxSessions?: number;
 }
@@ -238,12 +262,13 @@ export async function startMcpHttpServer(options: StartMcpHttpOptions): Promise<
     }
   };
 
-  const refreshRoots = async (session: Session): Promise<void> => {
+  const refreshRoots = async (session: Session, revision: number): Promise<void> => {
     if (session.cwdSource === 'header') return;
     if (!session.server.getClientCapabilities()?.roots) return;
     session.rootsAttempts++;
     try {
       const { roots } = await session.server.listRoots(undefined, { timeout: MCP_ROOTS_TIMEOUT_MS });
+      if (revision !== session.rootsRevision) return;
       const resolution = resolveMcpProjectCwd({
         roots,
         fallbackCwd: session.cwd,
@@ -258,6 +283,7 @@ export async function startMcpHttpServer(options: StartMcpHttpOptions): Promise<
         logger.info('SYSTEM', `MCP HTTP working directory resolved from ${resolution.source}`);
       }
     } catch (error) {
+      if (revision !== session.rootsRevision) return;
       const givingUp = session.rootsAttempts >= MAX_MCP_ROOTS_ATTEMPTS;
       logger.warn('SYSTEM', givingUp
         ? `MCP HTTP: roots/list failed ${MAX_MCP_ROOTS_ATTEMPTS} times, this session stays on ${session.cwd}`
@@ -273,13 +299,21 @@ export async function startMcpHttpServer(options: StartMcpHttpOptions): Promise<
     if (typeof method !== 'string' || method === 'initialize' || method.startsWith('notifications/')) return;
     // Roots decide the directory only while no header ever did. They are asked again when the
     // client reports a change (notifications/roots/list_changed), before the next request runs.
-    if (session.cwdSource === 'header') return;
-    if (session.cwdSource === 'roots' && !session.rootsStale) return;
-    if (session.rootsAttempts >= MAX_MCP_ROOTS_ATTEMPTS) return;
-    session.rootsInFlight ??= refreshRoots(session).finally(() => {
-      session.rootsInFlight = undefined;
-    });
-    await session.rootsInFlight;
+    while (session.cwdSource !== 'header') {
+      if (session.cwdSource === 'roots' && !session.rootsStale) return;
+      if (session.rootsAttempts >= MAX_MCP_ROOTS_ATTEMPTS) return;
+      if (!session.rootsInFlight) {
+        const revision = session.rootsRevision;
+        session.rootsInFlightRevision = revision;
+        session.rootsInFlight = refreshRoots(session, revision).finally(() => {
+          session.rootsInFlight = undefined;
+          session.rootsInFlightRevision = undefined;
+        });
+      }
+      const revision = session.rootsInFlightRevision;
+      await session.rootsInFlight;
+      if (revision === session.rootsRevision) return;
+    }
   };
 
   const createSession = (req: IncomingMessage): Session => {
@@ -289,6 +323,7 @@ export async function startMcpHttpServer(options: StartMcpHttpOptions): Promise<
       lastSeen: Date.now(),
       rootsAttempts: 0,
       rootsStale: false,
+      rootsRevision: 0,
     } as Session;
     applyHeaderCwd(session, req);
     session.transport = new StreamableHTTPServerTransport({
@@ -306,6 +341,7 @@ export async function startMcpHttpServer(options: StartMcpHttpOptions): Promise<
     // (last header, else roots) only serves requests that carry no header.
     session.server = options.createServer((extra) => headerCwd(extra?.requestInfo?.headers) ?? session.cwd);
     session.server.setNotificationHandler(RootsListChangedNotificationSchema, async () => {
+      session.rootsRevision++;
       session.rootsStale = true;
       session.rootsAttempts = 0;
     });
@@ -317,7 +353,7 @@ export async function startMcpHttpServer(options: StartMcpHttpOptions): Promise<
   };
 
   const refuse = (req: IncomingMessage, res: ServerResponse, status: number, message: string, context: Record<string, unknown>): void => {
-    logger.warn('SECURITY', `MCP HTTP: ${message}`, { ...context, method: req.method, path: req.url });
+    logger.warn('SECURITY', `MCP HTTP: ${message}`, { ...context, method: req.method, path: requestPathname(req) });
     sendJsonRpcError(res, status, -32000, message);
   };
 
@@ -350,6 +386,16 @@ export async function startMcpHttpServer(options: StartMcpHttpOptions): Promise<
     if (url.pathname !== MCP_HTTP_PATH) {
       res.writeHead(404).end();
       return;
+    }
+
+    // Before anything reads the request: the working-directory header below, a session id
+    // and the body are all attacker-controlled until the token has been checked.
+    if (options.localApiToken) {
+      const presented = extractLocalApiToken(req.headers);
+      if (!presented || !safeEqualSecret(presented, options.localApiToken)) {
+        refuse(req, res, 401, 'Unauthorized: missing or invalid local API token', {});
+        return;
+      }
     }
 
     const cwdHeader = firstHeader(req.headers[CWD_HEADER]);
@@ -406,7 +452,7 @@ export async function startMcpHttpServer(options: StartMcpHttpOptions): Promise<
   const httpServer = createHttpServer((req, res) => {
     handle(req, res).catch((error: unknown) => {
       if (error instanceof RequestBodyError) {
-        logger.warn('SYSTEM', `MCP HTTP: ${error.message}`, { method: req.method, path: req.url });
+        logger.warn('SYSTEM', `MCP HTTP: ${error.message}`, { method: req.method, path: requestPathname(req) });
         sendJsonRpcError(res, error.httpStatus, error.jsonRpcCode, error.message);
         return;
       }

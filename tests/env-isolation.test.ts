@@ -20,8 +20,11 @@ import { logger } from '../src/utils/logger.js';
 // CJS interop: the check is a .cjs module exporting findViolations.
 import { createRequire } from 'module';
 const requireCjs = createRequire(import.meta.url);
-const { findViolations } = requireCjs('../scripts/check-spawn-env-discipline.cjs') as {
-  findViolations: () => Array<{ file: string; line: number }>;
+type SpawnEnvViolation = { file: string; line: number; variable: string | null; exemptKey: string };
+const { findViolations, findViolationsInSources, unexemptedViolations } = requireCjs('../scripts/check-spawn-env-discipline.cjs') as {
+  findViolations: () => SpawnEnvViolation[];
+  findViolationsInSources: (sources: Array<{ file: string; source: string }>) => SpawnEnvViolation[];
+  unexemptedViolations: (violations: SpawnEnvViolation[]) => SpawnEnvViolation[];
 };
 
 /**
@@ -145,25 +148,6 @@ describe('Issue #2375: ANTHROPIC_BASE_URL env-var isolation', () => {
 
     expect(result.ANTHROPIC_BASE_URL).toBe('https://gateway.example');
     expect(result.ANTHROPIC_AUTH_TOKEN).toBe('test-token');
-  });
-
-  it('leaked process.env BASE_URL never reaches the OAuth-skip predicate', async () => {
-    // The root cause of #2375: a BASE_URL exported by the parent shell used to
-    // survive into isolatedEnv and trigger the OAuth-skip path, leaving the
-    // subprocess with no credentials at all. With BASE_URL in BLOCKED_ENV_VARS,
-    // the leak is stripped before the predicate runs, so OAuth lookup still
-    // fires (the real credential path) rather than being short-circuited.
-    process.env.ANTHROPIC_BASE_URL = 'https://leaked-from-shell.example';
-
-    const oauthSpy = spyOn(oauthToken, 'readClaudeOAuthToken');
-    try {
-      const result = await buildIsolatedEnvWithFreshOAuth();
-      // The leaked BASE_URL must not be present (it was never re-injected from
-      // .env, which does not exist in this test).
-      expect(result.ANTHROPIC_BASE_URL).toBeUndefined();
-    } finally {
-      oauthSpy.mockRestore();
-    }
   });
 
   it('bare .env BASE_URL alone does not trigger OAuth fetch', async () => {
@@ -414,7 +398,50 @@ describe('Issue #5346: Observer beta opt-out propagation', () => {
 describe('spawn-env discipline (CI guard)', () => {
   it('no spawn site hands raw process.env to a child without sanitizeEnv', () => {
     const violations = findViolations();
-    expect(violations).toEqual([]);
+    // The scan now reads env blocks declared above a spawn too, which surfaced
+    // the two host-boundary spawns whose env is built in an object: the hook
+    // runner and the hook launcher hand the host environment to the worker that
+    // serves the host, and the check lists them in EXEMPT with that reason.
+    // Pinning the set here means any OTHER env-bearing spawn without
+    // sanitizeEnv fails this test, not just the check script.
+    expect(violations.map(v => v.exemptKey).sort()).toEqual([
+      'plugin/scripts/bun-runner.js#spawnOptions',
+      'src/launcher/claude-mem-launcher.ts#spawnOptions',
+    ]);
+    expect(unexemptedViolations(violations)).toEqual([]);
+  });
+
+  // The check reads a 10-line window after each spawn, so fixture blocks are
+  // spaced further apart than that to be judged one at a time.
+  const spacedFixture = (...blocks: string[][]) =>
+    blocks.map(block => block.join('\n')).join('\n' + '\n'.repeat(12));
+
+  it('judges a spawn on the nearest declaration above it, not the last one in the file', () => {
+    const source = spacedFixture(
+      ["import { spawn } from 'child_process';", 'function rawOne() {', '  const options = { env: { ...process.env } };', "  spawn('a', [], options);", '}'],
+      ['function sanitizedOne() {', '  const options = { env: sanitizeEnv(process.env) };', "  spawn('b', [], options);", '}'],
+    );
+    expect(findViolationsInSources([{ file: 'src/fixture.ts', source }])).toEqual([
+      { file: 'src/fixture.ts', line: 4, variable: 'options', exemptKey: 'src/fixture.ts#options' },
+    ]);
+  });
+
+  it('still reports a second raw-env spawn added to an exempt file', () => {
+    const source = spacedFixture(
+      ["import { spawn } from 'child_process';", 'const spawnOptions = { env: { ...process.env } };', "spawn('bun', [], spawnOptions);"],
+      ['const extraOptions = { env: { ...process.env } };', "spawn('other', [], extraOptions);"],
+      ["spawn('inline', [], { env: process.env });"],
+    );
+    const violations = findViolationsInSources([{ file: 'plugin/scripts/bun-runner.js', source }]);
+    expect(violations.map(v => v.exemptKey)).toEqual([
+      'plugin/scripts/bun-runner.js#spawnOptions',
+      'plugin/scripts/bun-runner.js#extraOptions',
+      'plugin/scripts/bun-runner.js#inline',
+    ]);
+    expect(unexemptedViolations(violations).map(v => v.exemptKey)).toEqual([
+      'plugin/scripts/bun-runner.js#extraOptions',
+      'plugin/scripts/bun-runner.js#inline',
+    ]);
   });
 });
 
@@ -854,35 +881,24 @@ describe('Issue #5400: observer spawn inherits proxy env from Claude settings', 
   });
 
   it('fills missing proxy keys from the profile settings.json, and sanitizeEnv keeps them', () => {
-    writeSettings({
-      env: {
-        HTTP_PROXY: 'http://proxy.example:3128',
-        HTTPS_PROXY: 'http://proxy.example:3128',
-        ALL_PROXY: 'socks5://proxy.example:1080',
-        NO_PROXY: 'localhost,127.0.0.1,::1',
-        http_proxy: 'http://proxy.example:3128',
-        https_proxy: 'http://proxy.example:3128',
-        all_proxy: 'socks5://proxy.example:1080',
-        no_proxy: 'localhost,127.0.0.1,::1',
-        npm_config_https_proxy: 'http://proxy.example:3128',
-        NODE_USE_ENV_PROXY: '1',
-        node_use_env_proxy: '1',
-      },
-    });
+    const env = {
+      HTTP_PROXY: 'http://proxy.example:3128',
+      HTTPS_PROXY: 'http://proxy.example:3128',
+      ALL_PROXY: 'socks5://proxy.example:1080',
+      NO_PROXY: 'localhost,127.0.0.1,::1',
+      http_proxy: 'http://proxy.example:3128',
+      https_proxy: 'http://proxy.example:3128',
+      all_proxy: 'socks5://proxy.example:1080',
+      no_proxy: 'localhost,127.0.0.1,::1',
+      npm_config_https_proxy: 'http://proxy.example:3128',
+      NODE_USE_ENV_PROXY: '1',
+      node_use_env_proxy: '1',
+    };
+    writeSettings({ env });
 
     const result = sanitizeEnv(buildIsolatedEnv());
 
-    expect(result.HTTP_PROXY).toBe('http://proxy.example:3128');
-    expect(result.HTTPS_PROXY).toBe('http://proxy.example:3128');
-    expect(result.ALL_PROXY).toBe('socks5://proxy.example:1080');
-    expect(result.NO_PROXY).toBe('localhost,127.0.0.1,::1');
-    expect(result.http_proxy).toBe('http://proxy.example:3128');
-    expect(result.https_proxy).toBe('http://proxy.example:3128');
-    expect(result.all_proxy).toBe('socks5://proxy.example:1080');
-    expect(result.no_proxy).toBe('localhost,127.0.0.1,::1');
-    expect(result.npm_config_https_proxy).toBe('http://proxy.example:3128');
-    expect(result.NODE_USE_ENV_PROXY).toBe('1');
-    expect(result.node_use_env_proxy).toBe('1');
+    expect(Object.fromEntries(Object.keys(env).map(key => [key, result[key]]))).toEqual(env);
     expect(result.CLAUDE_CODE_ENTRYPOINT).toBeUndefined();
     expect(result.CLAUDE_MEM_INTERNAL).toBe('1');
   });

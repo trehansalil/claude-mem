@@ -1,15 +1,13 @@
 // My Work's port of PR #265's observation gallery (src/ui/my-work/src/components/observation-media):
 // the worker URLs it builds, the readiness polling (including PR #265's "status failures never retry"
 // review thread), the status batching, and server-rendered markup for cards, drawers and image-free rows.
-import { describe, expect, it } from 'bun:test';
+import { describe, expect, it, jest } from 'bun:test';
 import { buildSync } from 'esbuild';
-import { readdirSync, readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { join, resolve } from 'node:path';
 import { MEDIA_LIMITS } from '../../../src/shared/media-contract.js';
 
 const MY_WORK = resolve(import.meta.dir, '../../../src/ui/my-work');
-const GALLERY_DIR = join(MY_WORK, 'src/components/observation-media');
 
 // Compile the real components with the app's own React, as hosted-setup.test.ts does.
 const compiled = buildSync({
@@ -17,17 +15,13 @@ const compiled = buildSync({
     resolveDir: MY_WORK, loader: 'tsx', contents: `
       import React from 'react';
       import { renderToStaticMarkup } from 'react-dom/server';
-      import { MediaCountBadge, ObsMediaStrip, MediaSourceContext, watchMediaStatus } from './src/components/observation-media/ObsMedia';
-      import { SAMPLE_MEDIA_SOURCE } from './src/components/observation-media/sample-media';
+      import { MediaCountBadge, ObsMediaStrip, watchMediaStatus } from './src/components/observation-media/ObsMedia';
       import { requestImages } from './src/components/observation-media/request-images';
       export * from './src/components/observation-media/media';
       export { createWorkerMediaSource, statusChunks } from './src/components/observation-media/worker-media-source';
-      export { SAMPLE_MEDIA_REFS } from './src/components/observation-media/sample-media';
-      export { SAMPLE_REQUESTS } from './src/data';
       export { watchMediaStatus, requestImages };
       export const renderStrip = (props) => renderToStaticMarkup(<ObsMediaStrip {...props} />);
       export const renderBadge = (props) => renderToStaticMarkup(<MediaCountBadge {...props} />);
-      export const renderWithSample = (props) => renderToStaticMarkup(<MediaSourceContext.Provider value={SAMPLE_MEDIA_SOURCE}><ObsMediaStrip {...props} /></MediaSourceContext.Provider>);
     `,
   },
   tsconfig: join(MY_WORK, 'tsconfig.app.json'),
@@ -61,14 +55,6 @@ describe('worker media URLs', () => {
     expect(gallery.MEDIA_STATUS_MAX_IDS).toBe(MEDIA_LIMITS.maxObservationRefs);
     expect(() => gallery.mediaStatusUrl(refs(MEDIA_LIMITS.maxObservationRefs + 1).map(ref => ref.id))).toThrow();
   });
-
-  it('no gallery file names a Pro media route or the owner details route', () => {
-    for (const name of readdirSync(GALLERY_DIR)) {
-      const source = readFileSync(join(GALLERY_DIR, name), 'utf8').split('\n').filter(line => !line.trim().startsWith('//')).join('\n');
-      expect(source).not.toContain('/api/observation-media');
-      expect(source).not.toContain('/details');
-    }
-  });
 });
 
 describe('route answers', () => {
@@ -87,6 +73,21 @@ describe('route answers', () => {
     });
     expect(details).toEqual({ recipe: 'screenshot-v1', encoder: 'sharp-0.34/vips-8.17', viewer: { width: 1280, height: 720, byteLength: 204800 }, llm: null });
     expect(gallery.provenanceDetails({ recipe: 'screenshot-v1' })).toBeNull();
+  });
+
+  it('the image viewer’s first line follows the image’s state, in the state’s own word, and says "Saved." only for a saved image', () => {
+    expect(gallery.inspectionLead('ready', 'uninspected')).toBe('Saved. The agent has not read this image.');
+    expect(gallery.inspectionLead('ready', 'inspected')).toBe('Saved. The agent has read this image.');
+    expect(gallery.inspectionLead('deleted', 'uninspected')).toBe('Deleted. The agent has not read this image.');
+    expect(gallery.inspectionLead('failed', 'inspected')).toBe('Could not load. The agent has read this image.');
+    // A state word that ends in "…" ends the sentence with a full stop instead.
+    expect(gallery.inspectionLead('pending', 'uninspected')).toBe('Processing. The agent has not read this image.');
+    for (const state of Object.keys(gallery.STATE_WORDS)) {
+      const lead: string = gallery.inspectionLead(state, 'uninspected');
+      // The one word table for states (STATE_WORDS) says which state; nothing that is not saved leads with "Saved.".
+      expect(lead.startsWith(gallery.STATE_COPY[state].replace(/…$/, ''))).toBe(true);
+      if (state !== 'ready') expect(lead.startsWith('Saved.')).toBe(false);
+    }
   });
 
   it('keeps PR #265 keyboard rules: Esc closes, arrows wrap, Home/End jump, Tab is trapped', () => {
@@ -137,6 +138,36 @@ describe('readiness polling', () => {
     expect(calls).toBe(21);
   });
 
+  it('a hidden cloud tab rechecks a pending image only once it is shown again', async () => {
+    class FakePage extends EventTarget {
+      visibilityState = 'hidden';
+      show(state: 'visible' | 'hidden') { this.visibilityState = state; this.dispatchEvent(new Event('visibilitychange')); }
+    }
+    const page = new FakePage();
+    const browser = globalThis as { location?: unknown; document?: unknown };
+    const saved = { location: browser.location, document: browser.document };
+    browser.location = { hostname: 'work.cmem.ai' };
+    browser.document = page;
+    jest.useFakeTimers();
+    const flush = async () => { for (let turn = 0; turn < 5; turn++) await Promise.resolve(); };
+    let calls = 0;
+    // No `schedule`: the strip's own timer, as useMediaStates runs it.
+    const stop = gallery.watchMediaStatus([uuid(1)], async () => { calls += 1; return new Map([[uuid(1), 'pending']]); }, () => {});
+    try {
+      await flush();
+      for (let minute = 0; minute < 10; minute++) { jest.advanceTimersByTime(60_000); await flush(); }
+      expect(calls).toBe(1);
+      page.show('visible');
+      await flush();
+      expect(calls).toBe(2);
+    } finally {
+      stop();
+      jest.useRealTimers();
+      browser.location = saved.location;
+      browser.document = saved.document;
+    }
+  });
+
   it('reports nothing after the strip unmounts', async () => {
     const { schedule } = scheduler();
     const results: unknown[] = [];
@@ -177,38 +208,37 @@ describe('server-rendered gallery', () => {
     expect(gallery.renderBadge({})).toBe('');
   });
 
-  it('shows four thumbnails, then "+N", with every image labelled and checking until status answers', () => {
+  it('shows four thumbnails, then "+N more", with every image labelled and checking until status answers', () => {
     const html = gallery.renderStrip({ media: { version: 1, attachments: refs(6, 'uninspected') }, title: 'Fix the parser' });
-    expect(html.match(/class="obs-media-thumb"/g)).toHaveLength(4);
-    expect(html).toContain('>+2</button>');
+    // The thumbnails are the app's Button (G14), so their class list starts with the Button's own classes.
+    expect(html.match(/class="[^"]*\bobs-media-thumb\b[^"]*"/g)).toHaveLength(4);
+    expect(html).toContain('>+2 more</button>');
     expect(html).toContain('6 images');
-    expect(html).toContain('6 not inspected');
-    expect(html).toContain('Open image 1 of 6 (event1_image1): Checking…');
+    // How many the agent has not read, in words, and what the corner ring means (c-obs-media).
+    expect(html).toContain('6 not read by the agent');
+    expect(html).toContain('A ring in the corner marks an image the agent has not read.');
+    expect(html).toContain('Open image 1 of 6 (event1_image1): Checking…, not read by the agent');
     // No pixels before readiness is known, and never a storage or file path.
     expect(html).not.toContain('<img');
-    for (const forbidden of ['/Users/', 'file://', 'http://', 'https://', 'source_pointer']) expect(html).not.toContain(forbidden);
+    // The eye mark is an inline SVG, whose namespace is the one http:// address the markup may hold.
+    const withoutSvgNamespace = html.replaceAll('xmlns="http://www.w3.org/2000/svg"', '');
+    for (const forbidden of ['/Users/', 'file://', 'http://', 'https://', 'source_pointer']) expect(withoutSvgNamespace).not.toContain(forbidden);
   });
 
   it('a card preview counts the request’s images and sends "+N" to the drawer', () => {
     const preview = { version: 1, attachments: refs(4) };
     const card = gallery.renderStrip({ media: preview, total: 9, title: 'Card', onMore: () => {} });
     expect(card).toContain('9 images');
-    expect(card).toContain('>+5</button>');
+    expect(card).toContain('>+5 more</button>');
     expect(card).toContain('Open image 1 of 9');
     // A preview does not claim how many of the request's images were inspected.
     expect(gallery.renderStrip({ media: { version: 1, attachments: refs(4, 'uninspected') }, total: 9, title: 'Card', onMore: () => {} })).not.toContain('obs-media-tag');
     // Without somewhere to send it, "+N" is not offered.
-    expect(gallery.renderStrip({ media: preview, total: 9, title: 'Card' })).not.toContain('>+5<');
+    expect(gallery.renderStrip({ media: preview, total: 9, title: 'Card' })).not.toContain('+5 more');
     expect(gallery.renderBadge({ media: preview, count: 9 })).toContain('aria-label="9 images"');
     expect(gallery.renderBadge({ media: { version: 1, attachments: refs(1), overflow: true } })).toContain('1 image (more on the source event)');
   });
 
-  it('sample mode fixtures cover every display state and render without a worker', () => {
-    expect(gallery.SAMPLE_MEDIA_REFS).toHaveLength(6);
-    const sample = gallery.SAMPLE_REQUESTS.find((request: any) => request.id === 'r1');
-    expect(sample.media).toEqual({ count: 6, preview: gallery.SAMPLE_MEDIA_REFS.slice(0, 4) });
-    expect(gallery.renderWithSample({ media: { version: 1, attachments: gallery.SAMPLE_MEDIA_REFS }, title: 'Sample' })).toContain('6 images');
-  });
 
   it('the drawer strip holds each linked image once, newest record first', () => {
     const shared = refs(2);

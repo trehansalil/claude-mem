@@ -14,7 +14,6 @@ import { SettingsDefaultsManager } from '../../../../shared/SettingsDefaultsMana
 import { clearPortCache } from '../../../../shared/worker-utils.js';
 import { snapshotDependencyHealth } from '../../../../shared/dependency-health.js';
 import { ensureSettingsDocument, updateSettingsDocument } from '../../../../shared/settings-document.js';
-import { isHttpUrl } from '../../../../shared/openrouter-base-url.js';
 import { parseContextCountValue } from '../../../../shared/context-count.js';
 import { OPENROUTER_REASONING_EFFORTS, parseOpenRouterReasoningEffort } from '../../OpenRouterProvider.js';
 import { parseOpenAICompatReasoning } from '../../reasoning-budget.js';
@@ -22,6 +21,7 @@ import { parseProviderBySource } from '../../../../shared/provider-by-source.js'
 import { CODEX_REASONING_EFFORTS, isCodexReasoningEffort } from '../../CodexProvider.js';
 import { emitContextInvalidation, noteUserSettingsSaved } from '../../../../shared/context-invalidation.js';
 import { WORK_VIEW_AGENT_CHOICES } from '../../../work-view/refresh-task.js';
+import { CORPUS_AGENT_CHOICES } from '../../knowledge/CorpusAgent.js';
 
 const toggleMcpSchema = z.object({
   enabled: z.boolean(),
@@ -49,7 +49,7 @@ const SECRET_SETTING_KEYS = new Set([
   'CLAUDE_MEM_TELEGRAM_WRAPUP_ROUTES',
   'CLAUDE_MEM_SERVER_API_KEY',
   'CLAUDE_MEM_SERVER_BETA_API_KEY',
-  'CLAUDE_MEM_TV_TOKEN',
+  'CLAUDE_MEM_LOCAL_API_TOKEN',
   'CLAUDE_MEM_WORKER_INGEST_TOKEN',
   'CLAUDE_MEM_PRO_MEMORY_KEY',
   'CLAUDE_MEM_REDIS_URL',
@@ -131,14 +131,19 @@ function withoutEnvironmentEchoes(posted: Record<string, unknown>, settingsPath:
 // every secret live — an HTTP-writable redirect hands them to any caller that
 // reaches the API. CLAUDE_MEM_WORKER_HOST decides the bind interface; changing
 // it remotely could re-expose the worker on a non-loopback address without
-// the Observation TV guard's token ever being written. The auto-update pair
+// the local API token ever being written. The auto-update pair
 // decides what the installer runs on this machine:
 // CLAUDE_MEM_AUTO_UPDATE_PROMOTED_RELEASE_URL names the file that picks the
 // version `npx claude-mem@<version> update` installs (the updater reads it
 // from the file alone, never the environment: auto-update-check.ts
 // readAutoUpdateSettings), and CLAUDE_MEM_AUTO_UPDATE decides whether that
-// runs at all.
-const FILE_ONLY_SETTING_KEYS = new Set([
+// runs at all. Provider endpoints also choose where stored credentials and
+// prompt content go; the compatible preset supplies that destination when
+// its explicit base URL is empty, so it has the same boundary.
+// CLAUDE_MEM_LOCAL_API_TOKEN is the credential the local-api-token mode checks; a
+// caller that could rewrite or clear it over HTTP would hold the key to the
+// door it is meant to guard.
+export const FILE_ONLY_SETTING_KEYS = new Set([
   'CLAUDE_CODE_PATH',
   'CLAUDE_MEM_CODEX_PATH',
   'CLAUDE_MEM_CHROMA_UVX_PATH',
@@ -146,6 +151,10 @@ const FILE_ONLY_SETTING_KEYS = new Set([
   'CLAUDE_MEM_WORKER_HOST',
   'CLAUDE_MEM_AUTO_UPDATE',
   'CLAUDE_MEM_AUTO_UPDATE_PROMOTED_RELEASE_URL',
+  'CLAUDE_MEM_OPENROUTER_BASE_URL',
+  'CLAUDE_MEM_OPENAI_COMPAT_BASE_URL',
+  'CLAUDE_MEM_OPENAI_COMPAT_PRESET',
+  'CLAUDE_MEM_LOCAL_API_TOKEN',
 ]);
 
 const LOOPBACK_HOSTNAMES = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
@@ -190,6 +199,38 @@ export function isForeignLoopbackBrowserWrite(req: Pick<Request, 'headers'>): bo
 
   const originPort = originUrl.port || '80';
   return originPort !== port;
+}
+
+/**
+ * True when a GET comes from a browser page other than the worker's own. A
+ * read that runs something for the caller (resolving a project from `cwd` runs
+ * `git` there) needs more than the write guard: a `no-cors` fetch or an
+ * `<img src>` sends no Origin, so this also refuses a foreign Referer and a
+ * `same-site`/`cross-site` fetch with neither header (another localhost port is
+ * same-site). Requests with no Origin, Referer or Sec-Fetch-Site (hooks, the
+ * CLI, the MCP server) and `same-origin`/`none` fetches pass. Exported for tests.
+ */
+export function isForeignBrowserRead(req: Pick<Request, 'headers'>): boolean {
+  if (isForeignLoopbackBrowserWrite(req)) return true;
+  const rawReferer = req.headers?.referer;
+  if (Array.isArray(rawReferer)) return true;
+  const hasReferer = typeof rawReferer === 'string' && rawReferer.length > 0;
+  if (hasReferer) {
+    let refererOrigin: string;
+    try {
+      refererOrigin = new URL(rawReferer).origin;
+    } catch {
+      return true;
+    }
+    // Same test as the Origin above: only this worker's own loopback host:port.
+    if (isForeignLoopbackBrowserWrite({ headers: { origin: refererOrigin, host: req.headers.host } })) return true;
+  }
+  const site = req.headers?.['sec-fetch-site'];
+  if (site === 'same-site' || site === 'cross-site') {
+    const hasOrigin = typeof req.headers.origin === 'string' && req.headers.origin.length > 0;
+    if (!hasOrigin && !hasReferer) return true;
+  }
+  return false;
 }
 
 export class SettingsRoutes extends BaseRouteHandler {
@@ -255,7 +296,7 @@ export class SettingsRoutes extends BaseRouteHandler {
     // trusts loopback — so any page that can reach this origin could set one
     // of these. Secrets stay off this list except the two provider keys the
     // viewer Settings UI must save (Gemini / OpenRouter); those are masked on
-    // GET and an unchanged mask is skipped on POST. Observation TV / Chroma /
+    // GET and an unchanged mask is skipped on POST. Local API / Chroma /
     // Telegram / CloudSync / Redis tokens remain file/env only.
     //
     // Executable spawn paths (CLAUDE_CODE_PATH, CLAUDE_MEM_CODEX_PATH,
@@ -282,14 +323,11 @@ export class SettingsRoutes extends BaseRouteHandler {
       'CLAUDE_MEM_GEMINI_RATE_LIMITING_ENABLED',
       'CLAUDE_MEM_OPENROUTER_API_KEY',
       'CLAUDE_MEM_OPENROUTER_API_KEYS',
-      'CLAUDE_MEM_OPENROUTER_BASE_URL',
       'CLAUDE_MEM_OPENROUTER_MODEL',
       'CLAUDE_MEM_OPENROUTER_SITE_URL',
       'CLAUDE_MEM_OPENROUTER_APP_NAME',
-      // The openai-compatible endpoint, as the viewer edits it. Its key stays
-      // file/env only (CLAUDE_MEM_OPENAI_COMPAT_API_KEY / OPENAI_COMPAT_API_KEY).
-      'CLAUDE_MEM_OPENAI_COMPAT_PRESET',
-      'CLAUDE_MEM_OPENAI_COMPAT_BASE_URL',
+      // Destination and credentials are file/env only. The viewer may still
+      // choose the model and reasoning policy for the configured endpoint.
       'CLAUDE_MEM_OPENAI_COMPAT_MODEL',
       'CLAUDE_MEM_OPENAI_COMPAT_REASONING',
       'CLAUDE_MEM_OPENROUTER_REASONING_EFFORT',
@@ -304,14 +342,14 @@ export class SettingsRoutes extends BaseRouteHandler {
       'CLAUDE_MEM_WORK_VIEW_CLAUDE_MODEL',
       'CLAUDE_MEM_WORK_VIEW_CODEX_MODEL',
       'CLAUDE_MEM_WORK_VIEW_GEMINI_MODEL',
+      'CLAUDE_MEM_WORK_VIEW_API_MODEL',
+      'CLAUDE_MEM_CORPUS_AGENT',
       'CLAUDE_MEM_LOG_LEVEL',
       'CLAUDE_MEM_PYTHON_VERSION',
       'CLAUDE_MEM_CLAUDE_CONFIG_DIR',
       'CLAUDE_MEM_OBSERVER_CLAUDE_CONFIG_DIR',
       'CLAUDE_MEM_CONTEXT_SHOW_READ_TOKENS',
       'CLAUDE_MEM_CONTEXT_SHOW_WORK_TOKENS',
-      'CLAUDE_MEM_CONTEXT_SHOW_SAVINGS_AMOUNT',
-      'CLAUDE_MEM_CONTEXT_SHOW_SAVINGS_PERCENT',
       'CLAUDE_MEM_CONTEXT_SHOW_TERMINAL_OUTPUT',
       'CLAUDE_MEM_CONTEXT_OBSERVATION_TYPES',
       'CLAUDE_MEM_CONTEXT_OBSERVATION_CONCEPTS',
@@ -493,12 +531,12 @@ export class SettingsRoutes extends BaseRouteHandler {
 
     if (settings.CLAUDE_MEM_WORKER_HOST) {
       const host = settings.CLAUDE_MEM_WORKER_HOST;
-      // Loopback, plus the documented bind-all addresses used by Observation TV
-      // and Docker (docs/public/configuration.mdx). Arbitrary IPv4 used to be
+      // Loopback, plus the documented bind-all addresses used by Docker and
+      // remote capture (docs/public/configuration.mdx). Arbitrary IPv4 used to be
       // accepted and would expose the unauthenticated worker API on that NIC.
       const validHostPattern = /^(127\.0\.0\.1|0\.0\.0\.0|::1|::|localhost)$/;
       if (!validHostPattern.test(host)) {
-        return { valid: false, error: 'CLAUDE_MEM_WORKER_HOST must be a loopback address (127.0.0.1, ::1, localhost) or a bind-all address (0.0.0.0, ::) for Observation TV / Docker' };
+        return { valid: false, error: 'CLAUDE_MEM_WORKER_HOST must be a loopback address (127.0.0.1, ::1, localhost) or a bind-all address (0.0.0.0, ::) for Docker / remote capture' };
       }
     }
 
@@ -546,8 +584,6 @@ export class SettingsRoutes extends BaseRouteHandler {
     const booleanSettings = [
       'CLAUDE_MEM_CONTEXT_SHOW_READ_TOKENS',
       'CLAUDE_MEM_CONTEXT_SHOW_WORK_TOKENS',
-      'CLAUDE_MEM_CONTEXT_SHOW_SAVINGS_AMOUNT',
-      'CLAUDE_MEM_CONTEXT_SHOW_SAVINGS_PERCENT',
       'CLAUDE_MEM_CONTEXT_SHOW_TERMINAL_OUTPUT',
       'CLAUDE_MEM_CONTEXT_SHOW_LAST_SUMMARY',
       'CLAUDE_MEM_CONTEXT_SHOW_LAST_MESSAGE',
@@ -617,7 +653,11 @@ export class SettingsRoutes extends BaseRouteHandler {
 
     if (settings.CLAUDE_MEM_WORK_VIEW_AGENT !== undefined
       && !(WORK_VIEW_AGENT_CHOICES as readonly string[]).includes(settings.CLAUDE_MEM_WORK_VIEW_AGENT)) {
-      return { valid: false, error: 'CLAUDE_MEM_WORK_VIEW_AGENT must be empty (follow CLAUDE_MEM_PROVIDER), "claude-code", "codex", "gemini", "off", or "all"' };
+      return { valid: false, error: 'CLAUDE_MEM_WORK_VIEW_AGENT must be empty (follow CLAUDE_MEM_PROVIDER), "claude-code", "codex", "gemini", "api", "off", or "all"' };
+    }
+    if (settings.CLAUDE_MEM_CORPUS_AGENT !== undefined
+      && !(CORPUS_AGENT_CHOICES as readonly string[]).includes(settings.CLAUDE_MEM_CORPUS_AGENT)) {
+      return { valid: false, error: `CLAUDE_MEM_CORPUS_AGENT must be empty (Claude Agent SDK) or ${CORPUS_AGENT_CHOICES.filter(Boolean).map(choice => JSON.stringify(choice)).join(', ')} (the selected openrouter / openai-compatible provider)` };
     }
     if (settings.CLAUDE_MEM_WORK_VIEW_COPY_PROVIDER !== undefined
       && !['', 'openrouter', 'openai-compatible', 'off'].includes(settings.CLAUDE_MEM_WORK_VIEW_COPY_PROVIDER)) {
@@ -627,7 +667,7 @@ export class SettingsRoutes extends BaseRouteHandler {
       && (typeof settings.CLAUDE_MEM_WORK_VIEW_COPY_MODEL !== 'string' || settings.CLAUDE_MEM_WORK_VIEW_COPY_MODEL.length > 200)) {
       return { valid: false, error: 'CLAUDE_MEM_WORK_VIEW_COPY_MODEL must be a string of at most 200 characters' };
     }
-    for (const key of ['CLAUDE_MEM_WORK_VIEW_CLAUDE_MODEL', 'CLAUDE_MEM_WORK_VIEW_CODEX_MODEL', 'CLAUDE_MEM_WORK_VIEW_GEMINI_MODEL'] as const) {
+    for (const key of ['CLAUDE_MEM_WORK_VIEW_CLAUDE_MODEL', 'CLAUDE_MEM_WORK_VIEW_CODEX_MODEL', 'CLAUDE_MEM_WORK_VIEW_GEMINI_MODEL', 'CLAUDE_MEM_WORK_VIEW_API_MODEL'] as const) {
       if (settings[key] !== undefined && (typeof settings[key] !== 'string' || settings[key].length > 200)) {
         return { valid: false, error: `${key} must be a string of at most 200 characters` };
       }
@@ -640,20 +680,6 @@ export class SettingsRoutes extends BaseRouteHandler {
         logger.debug('SETTINGS', 'Invalid URL format', { url: settings.CLAUDE_MEM_OPENROUTER_SITE_URL, error: error instanceof Error ? error.message : String(error) });
         return { valid: false, error: 'CLAUDE_MEM_OPENROUTER_SITE_URL must be a valid URL' };
       }
-    }
-
-    if (settings.CLAUDE_MEM_OPENROUTER_BASE_URL) {
-      if (!isHttpUrl(settings.CLAUDE_MEM_OPENROUTER_BASE_URL)) {
-        logger.debug('SETTINGS', 'Invalid OpenRouter base URL protocol', { url: settings.CLAUDE_MEM_OPENROUTER_BASE_URL });
-        return { valid: false, error: 'CLAUDE_MEM_OPENROUTER_BASE_URL must be an HTTP(S) URL' };
-      }
-    }
-
-    // No preset-id check: the viewer posts the whole settings object, so a
-    // hand-edited unknown preset would 400 every later save, and the worker
-    // already reads an unknown preset as `custom`.
-    if (settings.CLAUDE_MEM_OPENAI_COMPAT_BASE_URL && !isHttpUrl(settings.CLAUDE_MEM_OPENAI_COMPAT_BASE_URL)) {
-      return { valid: false, error: 'CLAUDE_MEM_OPENAI_COMPAT_BASE_URL must be an HTTP(S) URL' };
     }
 
     if (settings.CLAUDE_MEM_CLOUD_SYNC_CONTENT_BATCH_SIZE) {

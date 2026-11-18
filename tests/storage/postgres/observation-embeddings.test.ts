@@ -152,7 +152,6 @@ describe.skipIf(!vectorAvailable)('hybrid observation search', () => {
   });
 
   it('compares the query only with parts embedded by its own model', async () => {
-    if (!vectorAvailable) return;
     const storage = createPostgresStorageRepositories(pool);
     const content = 'Written before the model changed.';
     const stale = await storage.observations.create({ projectId, teamId, content, metadata: { narrative: content } });
@@ -272,6 +271,28 @@ describe.skipIf(!vectorAvailable)('hybrid observation search', () => {
     const results = await new PostgresObservationRepository(pool)
       .search({ projectId, teamId, query: 'gateway', limit: 150, queryEmbedding: { vector: axis(1), model: 'test' } });
     expect(results.length).toBe(150);
+  });
+
+  it('applies mode filters before the nearest-parts cutoff in hybrid context', async () => {
+    await pool.query(`UPDATE observations SET kind = 'decision',
+      metadata = metadata || '{"concepts":["allowed"]}' WHERE id = $1`, [ids.indexer]);
+    const queryVector = axis(1);
+    queryVector[10] = 0.1;
+    // More excluded, closer parts than the first semantic cutoff: filtering
+    // after that cutoff would lose the eligible older observation entirely.
+    await pool.query(`INSERT INTO observations (id, project_id, team_id, kind, content, metadata)
+      SELECT 'filtered-' || g, $1, $2, 'bugfix', 'unrelated content', '{"concepts":["allowed"]}'
+      FROM generate_series(1, 450) AS g`, [projectId, teamId]);
+    await pool.query(`INSERT INTO observation_embeddings (observation_id, project_id, team_id, part, model, embedding)
+      SELECT 'filtered-' || g, $1, $2, 'narrative', 'test', $3::vector
+      FROM generate_series(1, 450) AS g`, [projectId, teamId, `[${Array.from(queryVector).join(',')}]`]);
+
+    const result = await new PostgresObservationRepository(pool).search({
+      projectId, teamId, query: 'zzqx unmatched', limit: 1,
+      queryEmbedding: { vector: queryVector, model: 'test' },
+      observationTypes: ['decision'], observationConcepts: ['allowed'],
+    });
+    expect(result.map(row => row.id)).toEqual([ids.indexer]);
   });
 
   it('finds an observation by meaning when fact-heavy observations fill the nearest-parts cutoff', async () => {
@@ -593,7 +614,6 @@ describe.skipIf(!vectorAvailable)('hybrid observation search', () => {
   }, 30_000);
 
   it('keeps the vectors when the model\'s width is unchanged, and starts over when it changes', async () => {
-    if (!vectorAvailable) return;
     const stored = async () => {
       const result = await pool.query(
         `SELECT (SELECT atttypmod FROM pg_attribute

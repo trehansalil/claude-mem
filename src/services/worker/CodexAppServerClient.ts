@@ -14,11 +14,11 @@ import {
 } from 'node:fs';
 import { rm } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { executableFingerprint } from '../../shared/executable-fingerprint.js';
 import { killProcessTree } from '../../shared/kill-process-tree.js';
 import { buildSpawnSyncInvocation, lookupWindowsCommand, spawnHidden } from '../../shared/spawn.js';
-import { sanitizeEnv } from '../../supervisor/env-sanitizer.js';
+import { ENV_PROXY_VARS, sanitizeEnv } from '../../supervisor/env-sanitizer.js';
 import { getSupervisor } from '../../supervisor/index.js';
 import { logger } from '../../utils/logger.js';
 
@@ -216,8 +216,10 @@ function codexTurnError(prefix: string, error: unknown): Error {
 }
 
 function resolveNativeCodexHome(explicitHome?: string): string {
-  const configured = explicitHome?.trim() || process.env.CODEX_HOME?.trim();
-  return configured || join(process.env.HOME?.trim() || homedir(), '.codex');
+  const configured = explicitHome || process.env.CODEX_HOME;
+  // The auth symlink lives in a different directory: resolve the selected
+  // profile from the caller's cwd, preserving the path Codex itself uses.
+  return resolve(configured || join(process.env.HOME || homedir(), '.codex'));
 }
 
 /**
@@ -229,6 +231,16 @@ export const CODEX_SETUP_REQUIRED_CODE = 'codex_setup_required';
 
 function codexSetupError(message: string): Error {
   return Object.assign(new Error(message), { code: CODEX_SETUP_REQUIRED_CODE });
+}
+
+/** Codex infers ChatGPT for legacy token files whose optional auth_mode is absent or null. */
+function hasChatGptAuth(auth: unknown): boolean {
+  if (!isObject(auth)) return false;
+  if (auth.auth_mode != null) return auth.auth_mode === 'chatgpt' || auth.auth_mode === 'chatgptAuthTokens';
+  // AuthDotJson.resolved_mode gives these credential fields precedence over
+  // legacy ChatGPT tokens. Even an empty API-key string selects API-key auth.
+  return isObject(auth.tokens) && [auth.OPENAI_API_KEY, auth.personal_access_token,
+    auth.bedrock_api_key, auth.bedrock_access_keys].every(value => value == null);
 }
 
 /**
@@ -373,7 +385,7 @@ function createPrivateRuntime(nativeCodexHome: string): PrivateRuntime {
     } catch (error) {
       throw codexSetupError(`Cannot read Codex ChatGPT auth: ${error instanceof Error ? error.message : String(error)}`);
     }
-    if (!isObject(auth) || (auth.auth_mode !== 'chatgpt' && auth.auth_mode !== 'chatgptAuthTokens')) {
+    if (!hasChatGptAuth(auth)) {
       throw codexSetupError('claude-mem requires Codex CLI to be logged in with ChatGPT, not an API key');
     }
 
@@ -395,19 +407,17 @@ function normalizeUsage(usage: JsonObject | null): Omit<CodexAppServerTurnResult
   if (!usage) return {};
 
   const total = isObject(usage.total) ? usage.total : usage;
+  // Codex's input/output totals already include their cache/reasoning
+  // breakdowns. Adding those details again inflates usage and context size.
   const inputTokens = tokenNumber(total.inputTokens ?? total.input_tokens);
-  const cachedInputTokens = tokenNumber(total.cachedInputTokens ?? total.cached_input_tokens) ?? 0;
   const outputTokens = tokenNumber(total.outputTokens ?? total.output_tokens);
-  const reasoningTokens = tokenNumber(total.reasoningOutputTokens ?? total.reasoning_output_tokens) ?? 0;
-  const normalizedInput = inputTokens === undefined ? undefined : inputTokens + cachedInputTokens;
-  const normalizedOutput = outputTokens === undefined ? undefined : outputTokens + reasoningTokens;
-  const tokensUsed = normalizedInput === undefined && normalizedOutput === undefined
+  const tokensUsed = inputTokens === undefined && outputTokens === undefined
     ? undefined
-    : (normalizedInput ?? 0) + (normalizedOutput ?? 0);
+    : (inputTokens ?? 0) + (outputTokens ?? 0);
 
   return {
-    ...(normalizedInput !== undefined ? { inputTokens: normalizedInput } : {}),
-    ...(normalizedOutput !== undefined ? { outputTokens: normalizedOutput } : {}),
+    ...(inputTokens !== undefined ? { inputTokens } : {}),
+    ...(outputTokens !== undefined ? { outputTokens } : {}),
     ...(tokensUsed !== undefined ? { tokensUsed } : {}),
   };
 }
@@ -418,7 +428,8 @@ export class CodexAppServerClient {
   private startPromise: Promise<void> | null = null;
   private nextRequestId = 1;
   private pending = new Map<number, PendingRequest>();
-  private protocolBuffer = '';
+  private protocolFragments: string[] = [];
+  private protocolLineBytes = 0;
   private stderrTail = '';
   private privateRoot: string | null = null;
   private workspace: string | null = null;
@@ -634,17 +645,23 @@ export class CodexAppServerClient {
   private async waitForTurn(active: ActiveTurn, timeoutMs: number, signal?: AbortSignal): Promise<void> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     let removeAbort: (() => void) | undefined;
+    let stoppedError: Error | undefined;
+    let interrupt: Promise<void> | undefined;
+    const stop = (error: Error, reject: (error: Error) => void) => {
+      if (stoppedError) return;
+      stoppedError = error;
+      interrupt = this.interruptOrInvalidate(active);
+      void interrupt.then(() => reject(error), () => reject(error));
+    };
     const timeout = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
-        const error = new Error(`Codex app-server turn timed out after ${timeoutMs}ms`);
-        void this.interruptOrInvalidate(active).finally(() => reject(error));
+        stop(new Error(`Codex app-server turn timed out after ${timeoutMs}ms`), reject);
       }, timeoutMs);
     });
     const aborted = new Promise<never>((_, reject) => {
       if (!signal) return;
       const onAbort = () => {
-        const error = new Error('Codex app-server turn aborted');
-        void this.interruptOrInvalidate(active).finally(() => reject(error));
+        stop(new Error('Codex app-server turn aborted'), reject);
       };
       if (signal.aborted) onAbort();
       else {
@@ -655,6 +672,13 @@ export class CodexAppServerClient {
 
     try {
       await Promise.race([active.completion, timeout, aborted]);
+      // A completion notification may arrive while turn/interrupt is still
+      // awaiting acknowledgement. Once stopped, that answer cannot turn the
+      // cancelled request back into a successful observation.
+      if (stoppedError) {
+        await interrupt;
+        throw stoppedError;
+      }
     } finally {
       if (timer) clearTimeout(timer);
       removeAbort?.();
@@ -742,7 +766,8 @@ export class CodexAppServerClient {
     this.workspace = runtime.workspace;
     this.codexPath = codexPath;
     this.binaryFingerprint = fingerprint;
-    this.protocolBuffer = '';
+    this.protocolFragments = [];
+    this.protocolLineBytes = 0;
     this.stderrTail = '';
 
     let expectedChild: ChildProcessWithoutNullStreams | undefined;
@@ -758,6 +783,9 @@ export class CodexAppServerClient {
       expectedChild = child;
       this.child = child;
 
+      // Pipe writes can fail asynchronously after writeMessage returns. The
+      // ChildProcess 'error' event does not handle its stdin stream's EPIPE.
+      child.stdin.on('error', error => this.onChildExit(child, error));
       child.stdout.setEncoding('utf8');
       child.stderr.setEncoding('utf8');
       child.stdout.on('data', chunk => this.onStdout(child, String(chunk)));
@@ -811,10 +839,11 @@ export class CodexAppServerClient {
     const id = this.nextRequestId++;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
+        pending.removeAbort?.();
         this.pending.delete(id);
         const error = new Error(`Codex app-server ${method} timed out after ${timeoutMs}ms`);
         reject(error);
-        this.invalidate(error);
+        this.invalidate(error, child);
       }, timeoutMs);
       const pending: PendingRequest = { resolve, reject, timer };
       if (signal) {
@@ -823,7 +852,7 @@ export class CodexAppServerClient {
           clearTimeout(timer);
           const error = new Error(`Codex app-server ${method} aborted`);
           reject(error);
-          this.invalidate(error);
+          this.invalidate(error, child);
         };
         if (signal.aborted) {
           onAbort();
@@ -852,16 +881,25 @@ export class CodexAppServerClient {
 
   private onStdout(child: ChildProcessWithoutNullStreams, chunk: string): void {
     if (this.child !== child) return;
-    this.protocolBuffer += chunk;
-    if (Buffer.byteLength(this.protocolBuffer) > MAX_PROTOCOL_LINE_BYTES) {
-      this.invalidate(new Error('Codex app-server protocol line exceeded safety limit'));
-      return;
-    }
+    let offset = 0;
+    while (offset < chunk.length) {
+      const newline = chunk.indexOf('\n', offset);
+      const fragment = chunk.slice(offset, newline === -1 ? chunk.length : newline);
+      this.protocolLineBytes += Buffer.byteLength(fragment);
+      if (this.protocolLineBytes > MAX_PROTOCOL_LINE_BYTES) {
+        this.invalidate(new Error('Codex app-server protocol line exceeded safety limit'));
+        return;
+      }
+      if (fragment) this.protocolFragments.push(fragment);
+      if (newline === -1) return;
 
-    let newline: number;
-    while ((newline = this.protocolBuffer.indexOf('\n')) !== -1) {
-      const line = this.protocolBuffer.slice(0, newline).trim();
-      this.protocolBuffer = this.protocolBuffer.slice(newline + 1);
+      // The cap belongs to one protocol line, not a stdout chunk containing
+      // several lines. Assemble each line once instead of rescanning its
+      // growing prefix for every bounded pipe read.
+      const line = this.protocolFragments.join('').trim();
+      this.protocolFragments = [];
+      this.protocolLineBytes = 0;
+      offset = newline + 1;
       if (!line) continue;
       let message: unknown;
       try {
@@ -871,6 +909,7 @@ export class CodexAppServerClient {
         return;
       }
       this.handleMessage(message);
+      if (this.child !== child) return;
     }
   }
 
@@ -956,6 +995,9 @@ export class CodexAppServerClient {
     if (Array.isArray(turn.items)) {
       active.terminalItems += turn.items.length;
       for (const raw of turn.items) {
+        if (isObject(raw) && typeof raw.type === 'string' && FORBIDDEN_ITEM_TYPES.has(raw.type)) {
+          active.protocolError = new Error(`Codex app-server attempted forbidden ${raw.type} capability`);
+        }
         if (isObject(raw) && raw.type === 'agentMessage' && typeof raw.text === 'string') {
           active.agentMessages += 1;
           if (raw.phase === 'final_answer' || active.finalText === null) active.finalText = raw.text;
@@ -981,6 +1023,8 @@ export class CodexAppServerClient {
     if (child) logger.debug('SDK', 'Stopping persistent Codex app-server', { pid: child.pid }, error);
     this.child = null;
     this.startPromise = null;
+    this.protocolFragments = [];
+    this.protocolLineBytes = 0;
     let termination = Promise.resolve();
     if (child) {
       if (child.pid) {
@@ -1019,6 +1063,7 @@ export class CodexAppServerClient {
 }
 
 const APP_SERVER_ENV_ALLOWLIST = new Set([
+  ...ENV_PROXY_VARS,
   'APPDATA',
   'CODEX_HOME',
   'HOME',

@@ -158,10 +158,8 @@ describe('ChromaSync sqlite_id-only lookups (#4682)', () => {
       'parent'
     );
 
-    const patchedObs = updateCalls().find(c =>
-      (c.args.metadatas as any[])[0]?.doc_type === 'observation');
-    const patchedSummary = updateCalls().find(c =>
-      (c.args.metadatas as any[])[0]?.doc_type === 'session_summary');
+    const patchedObs = updateCalls().find(c => c.args.ids.includes('obs_5_narrative'));
+    const patchedSummary = updateCalls().find(c => c.args.ids.includes('summary_5_request'));
 
     expect(patchedObs?.args.ids.sort()).toEqual(referenceSelect('observation', [5]).sort());
     expect(patchedSummary?.args.ids.sort()).toEqual(referenceSelect('session_summary', [5]).sort());
@@ -226,5 +224,60 @@ describe('ChromaSync sqlite_id-only lookups (#4682)', () => {
       .rejects.toThrow('Chroma fragment lookup did not return a valid document ID list with metadatas');
 
     expect(deleteCalls()).toHaveLength(0);
+  });
+
+  it('skips the update when every document already names the merged project', async () => {
+    getImpl = () => ({
+      ids: ['obs_9_narrative', 'obs_9_fact_0'],
+      metadatas: [
+        { sqlite_id: 9, doc_type: 'observation', merged_into_project: 'parent' },
+        { sqlite_id: 9, doc_type: 'observation', merged_into_project: 'parent' }
+      ]
+    });
+
+    await new ChromaSync('claude-mem').updateMergedIntoProject(
+      [{ docType: 'observation', sqliteId: 9 }],
+      'parent'
+    );
+
+    expect(getCalls()).toHaveLength(1);
+    expect(updateCalls()).toHaveLength(0);
+  });
+
+  it('updates only the documents whose merged project differs', async () => {
+    getImpl = () => ({
+      ids: ['obs_9_narrative', 'obs_10_narrative', 'obs_11_narrative'],
+      metadatas: [
+        { sqlite_id: 9, doc_type: 'observation', merged_into_project: 'parent' },
+        { sqlite_id: 10, doc_type: 'observation' },
+        { sqlite_id: 11, doc_type: 'observation', merged_into_project: 'previous-parent' }
+      ]
+    });
+
+    await new ChromaSync('claude-mem').updateMergedIntoProject(
+      [9, 10, 11].map(sqliteId => ({ docType: 'observation' as const, sqliteId })),
+      'parent'
+    );
+
+    const updates = updateCalls();
+    expect(updates).toHaveLength(1);
+    expect(updates[0].args.ids).toEqual(['obs_10_narrative', 'obs_11_narrative']);
+    expect(updates[0].args.metadatas).toEqual([
+      { merged_into_project: 'parent' },
+      { merged_into_project: 'parent' }
+    ]);
+  });
+
+  it('throws instead of reporting success when metadatas are shorter than ids', async () => {
+    getImpl = () => ({
+      ids: ['obs_9_narrative', 'obs_9_fact_0'],
+      metadatas: [{ sqlite_id: 9, doc_type: 'observation' }]
+    });
+
+    await expect(new ChromaSync('claude-mem').updateMergedIntoProject(
+      [{ docType: 'observation', sqliteId: 9 }],
+      'parent'
+    )).rejects.toThrow('Chroma merged-project lookup did not return metadatas for every document ID');
+    expect(updateCalls()).toHaveLength(0);
   });
 });

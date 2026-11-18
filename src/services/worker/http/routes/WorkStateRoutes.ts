@@ -1,21 +1,25 @@
 import express, { Request, Response } from 'express';
+import { join } from 'node:path';
 import { z } from 'zod';
 import { DatabaseManager } from '../../DatabaseManager.js';
 import { BaseRouteHandler } from '../BaseRouteHandler.js';
 import { validateBody } from '../middleware/validateBody.js';
 import { isProjectExcluded } from '../../../../utils/project-filter.js';
 import { SettingsDefaultsManager } from '../../../../shared/SettingsDefaultsManager.js';
-import { USER_SETTINGS_PATH } from '../../../../shared/paths.js';
+import { DATA_DIR, USER_SETTINGS_PATH } from '../../../../shared/paths.js';
 import { getProjectContext } from '../../../../utils/project-name.js';
 import { logger } from '../../../../utils/logger.js';
 import type { WorkStateFields } from '../../../sqlite/work-state.js';
 import { isMyRulesList } from '../../../work-view/my-rules.mjs';
-import { isForeignLoopbackBrowserWrite } from './SettingsRoutes.js';
+import { isForeignBrowserRead, isForeignLoopbackBrowserWrite } from './SettingsRoutes.js';
 import { isMyFocusList } from '../../../work-view/my-focus.mjs';
 import { GOAL_KINDS, isOwnerGoalsList } from '../../../work-view/owner-goals.mjs';
 import { MAX_WORK_STATE_FIELDS_JSON_CHARS } from '../../../work-view/work-state-limits.mjs';
 import { isSharedWorkList } from '../../../work-view/shared-records.mjs';
+import { isClosedWorkStateStatus } from '../../../work-view/work-state-status.mjs';
+import { checkWorkStateWrite } from '../work-state-write-guard.js';
 import {
+  foldWorkStateList,
   fitWorkStateLines,
   renderWorkStateLines,
   WORK_STATE_SECTION_CHARACTER_LIMIT,
@@ -37,7 +41,7 @@ const workStateFieldsSchema = z.custom<WorkStateFields>(value =>
 ).transform(fields => ({ ...fields }));
 
 const workStateWriteSchema = z.object({
-  cwd: z.string().trim().min(1),
+  cwd: z.string().refine(cwd => cwd.trim().length > 0, 'cwd is required'),
   list: z.string().trim().min(1).max(200).refine(list => !isSharedWorkList(list), 'This list is reserved for shared My Work records'),
   fields: workStateFieldsSchema
     .refine(fields => Object.keys(fields).length > 0, 'fields must set at least one key')
@@ -47,11 +51,10 @@ const workStateWriteSchema = z.object({
     ),
 });
 
-const CLOSING_STATUSES = ['dropped', 'done'];
 /** Why an owner-goals row cannot be saved, or null. List state rows and a row that only closes an item need no kind. */
 export function ownerGoalsRowRefusal(fields: WorkStateFields): string | null {
   if (fields.task == null || fields.task === '') return null;
-  const onlyCloses = Object.keys(fields).every(key => key === 'task' || key === 'status') && CLOSING_STATUSES.includes(String(fields.status));
+  const onlyCloses = Object.keys(fields).every(key => key === 'task' || key === 'status') && isClosedWorkStateStatus(fields.status);
   if (onlyCloses && !('goal_kind' in fields)) return null;
   if (!(GOAL_KINDS as unknown[]).includes(fields.goal_kind)) {
     return `an owner-goals item needs goal_kind ${GOAL_KINDS.map(kind => `"${kind}"`).join(' or ')}; got ${JSON.stringify(fields.goal_kind ?? null)}.`;
@@ -67,16 +70,20 @@ export function ownerGoalsRowRefusal(fields: WorkStateFields): string | null {
  * scope SessionStart shows. Both answer in plain text for the agent.
  */
 export class WorkStateRoutes extends BaseRouteHandler {
-  constructor(private dbManager: DatabaseManager) {
+  constructor(
+    private dbManager: DatabaseManager,
+    private writeGuardPath = join(DATA_DIR, 'work-state-write-guard.json'),
+  ) {
     super();
   }
 
   setupRoutes(app: express.Application): void {
     app.post('/api/work-state/entries', validateBody(workStateWriteSchema), this.handleWrite.bind(this));
-    app.get('/api/work-state', this.handleRead.bind(this));
+    app.get('/api/work-state', this.handleRead());
+    app.get('/api/work-state/export', this.handleRead(true));
   }
 
-  private handleWrite = this.wrapHandler((req: Request, res: Response): void => {
+  private handleWrite = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
     // These rows are the agent's canonical to-do lists, so other localhost pages
     // may not write them. Origin-less callers (the work_state_write MCP tool,
     // save_goals.py) keep the existing loopback-trust model.
@@ -115,6 +122,44 @@ export class WorkStateRoutes extends BaseRouteHandler {
 
     const checkout = getProjectContext(cwd);
     const store = this.dbManager.getSessionStore();
+    const task = fields.task == null ? '' : String(fields.task);
+    const currentSnapshot = () => {
+      const entries = store.getWorkStateEntries(checkout.allProjects, list)
+        .filter(entry => (entry.scope_project ?? entry.project) === checkout.primary);
+      const select = (folded: ReturnType<typeof foldWorkStateList>): WorkStateFields =>
+        task ? folded.tasks.get(task)?.fields ?? {} : folded.state;
+      let status: WorkStateFields[string] | undefined;
+      const history = entries
+        .filter(entry => (entry.fields.task == null ? '' : String(entry.fields.task)) === task)
+        .map(entry => {
+          if (Object.hasOwn(entry.fields, 'status')) status = entry.fields.status;
+          return { fields: entry.fields, closing: isClosedWorkStateStatus(status) };
+        });
+      return {
+        current: select(foldWorkStateList(entries)),
+        history,
+      };
+    };
+    const scope = { project: checkout.primary, projects: checkout.allProjects, list };
+    let snapshot: ReturnType<typeof currentSnapshot> | undefined;
+    const check = await checkWorkStateWrite(this.writeGuardPath, scope, () => {
+      snapshot = currentSnapshot();
+      const { current, history } = snapshot;
+      const proposed = { ...current, ...fields };
+      return {
+        ...scope, fields, current, proposed, history,
+        closing: isClosedWorkStateStatus(proposed.status),
+        currentClosing: isClosedWorkStateStatus(current.status),
+      };
+    });
+    if (check.refusal) {
+      res.status(409).send(`Not saved: ${check.refusal}`);
+      return;
+    }
+    if (check.checked && (!snapshot || JSON.stringify(currentSnapshot()) !== JSON.stringify(snapshot))) {
+      res.status(409).send('Not saved: the task changed during its write check. Read its current state and retry.');
+      return;
+    }
     store.appendWorkStateEntry({ project: checkout.primary, listName: list, fields });
     logger.debug('WORKER', 'Work state entry saved', { project: checkout.primary, list });
     // The row is a `work_state` sync op: nudge the push drain (null when sync is off).
@@ -128,9 +173,17 @@ export class WorkStateRoutes extends BaseRouteHandler {
       : `${saved} Nothing in it is open now.`);
   });
 
-  private handleRead = this.wrapHandler((req: Request, res: Response): void => {
-    const cwd = typeof req.query.cwd === 'string' ? req.query.cwd.trim() : '';
-    if (!cwd) {
+  private handleRead = (exportHistory = false) => this.wrapHandler((req: Request, res: Response): void => {
+    // The read still resolves the project from `cwd`, and that resolution runs
+    // `git` in it (findGitRepoRoot), so another browser page must not choose
+    // the directory, even with a no-cors fetch that sends no Origin. Hooks, the
+    // CLI and the MCP tool send no browser headers and keep working.
+    if (isForeignBrowserRead(req)) {
+      res.status(403).json({ error: 'Forbidden', message: 'Work-state reads from another browser page are not allowed' });
+      return;
+    }
+    const cwd = typeof req.query.cwd === 'string' ? req.query.cwd : '';
+    if (!cwd.trim()) {
       this.badRequest(res, 'cwd is required');
       return;
     }
@@ -139,6 +192,14 @@ export class WorkStateRoutes extends BaseRouteHandler {
 
     const checkout = getProjectContext(cwd);
     const entries = this.dbManager.getSessionStore().getWorkStateEntries(checkout.allProjects, list);
+    // Export the ordered patches, including closures and cleared fields, rather
+    // than the presentation text that an MCP client may have to shorten.
+    if (exportHistory) {
+      res.setHeader('Cache-Control', 'no-store');
+      res.setHeader('Content-Disposition', 'attachment; filename="work-state.json"');
+      res.json({ version: 1, project: checkout.primary, projects: checkout.allProjects, list: list ?? null, entries });
+      return;
+    }
     const lines = renderWorkStateLines(entries, Date.now(), includeClosed);
 
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');

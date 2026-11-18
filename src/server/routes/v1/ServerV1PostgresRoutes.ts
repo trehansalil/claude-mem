@@ -5,7 +5,7 @@ import { z, type ZodTypeAny } from 'zod';
 import type { RouteHandler } from '../../../services/server/Server.js';
 import { AppError } from '../../../services/server/ErrorHandler.js';
 import { CreateAgentEventSchema } from '../../../core/schemas/agent-event.js';
-import type { PostgresPool } from '../../../storage/postgres/pool.js';
+import { withPostgresTransaction, type PostgresPool } from '../../../storage/postgres/pool.js';
 import {
   PostgresAgentEventsRepository,
   type CreatePostgresAgentEventInput,
@@ -24,6 +24,7 @@ import {
 } from '../../services/ObservationEmbeddingService.js';
 import { PostgresObservationEmbeddingsRepository } from '../../../storage/postgres/observation-embeddings.js';
 import { PostgresProjectsRepository } from '../../../storage/postgres/projects.js';
+import { isValidAdvertisedHost } from '../../middleware/request-auth-helpers.js';
 import { logger } from '../../../utils/logger.js';
 import {
   SEMANTIC_CONTEXT_MAX_LIMIT,
@@ -37,15 +38,16 @@ import type { ActiveServerQueueManager } from '../../runtime/ActiveServerQueueMa
 import type { ServerQueueManager } from '../../runtime/types.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { createRecallMcpServer, type RecallBackend } from '../../mcp/recall-mcp-server.js';
-import { requireRateLimit, requireMonthlyQuota } from '../../middleware/rate-limit.js';
-import { meterRequests } from '../../middleware/usage-metering.js';
+import { serverUsageGuards } from '../../middleware/usage-guards.js';
 import { PostgresUsageRepository } from '../../../storage/postgres/usage.js';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { apiKeyPrefix, hashApiKey } from '../../auth/api-key-hash.js';
-import { PostgresServerSessionsRepository } from '../../../storage/postgres/server-sessions.js';
+import { setTimeout as delay } from 'node:timers/promises';
+import { apiKeyPrefix, hashApiKeyAsync } from '../../auth/api-key-hash.js';
+import { PostgresServerSessionsRepository, type PostgresServerSession } from '../../../storage/postgres/server-sessions.js';
 import { IngestEventsService, type EnqueueOutcome } from '../../services/IngestEventsService.js';
 import { EndSessionService } from '../../services/EndSessionService.js';
 import { normalizePlatformSource, normalizePlatformSourceOrNull } from '../../../shared/platform-source.js';
+import { LISTING_OFFSET_CAP_MESSAGE, MAX_LISTING_OFFSET } from '../../../shared/listing-offset-cap.js';
 import {
   SERVER_CONTEXT_MAX_LIMIT,
   SERVER_CONTEXT_QUERY_DEFAULT_LIMIT,
@@ -54,16 +56,31 @@ import {
 
 const SOURCE_ADAPTER_DEFAULT = 'api';
 
+// The canonical Postgres event carries native receipt identity and metadata
+// in addition to the shared SQLite event shape. Validate both HTTP forms
+// before ingestion so parsing cannot erase the repository's replay key.
+const CreatePostgresAgentEventSchema = CreateAgentEventSchema.extend({
+  sourceEventId: z.string().min(1).nullable().optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
+});
+
 declare const __DEFAULT_PACKAGE_VERSION__: string;
 const MCP_SERVER_VERSION =
   typeof __DEFAULT_PACKAGE_VERSION__ !== 'undefined' ? __DEFAULT_PACKAGE_VERSION__ : '0.0.0-dev';
 
 // The MCP link base: CLAUDE_MEM_PUBLIC_URL in prod (behind a proxy/LB), else
 // derived from the request host so the connect command points at this server.
-function mcpConnectUrl(req: Request): string {
-  const base = (process.env.CLAUDE_MEM_PUBLIC_URL ?? `${req.protocol}://${req.get('host') ?? 'localhost'}`)
-    .replace(/\/+$/, '');
-  return `${base}/v1/mcp`;
+// The Host header is caller-supplied and this string is pasted into a shell,
+// so a Host that is present but unusable is refused instead of being
+// advertised back. A request with no Host header at all (HTTP/1.0) still gets
+// `localhost`, as before.
+export function mcpConnectUrl(req: Pick<Request, 'protocol' | 'get'>): string | null {
+  const configured = (process.env.CLAUDE_MEM_PUBLIC_URL ?? '').trim();
+  if (configured) return `${configured.replace(/\/+$/, '')}/v1/mcp`;
+  const hostHeader = req.get('host');
+  const host = hostHeader === undefined ? 'localhost' : hostHeader.trim();
+  if (!isValidAdvertisedHost(host)) return null;
+  return `${req.protocol}://${host}/v1/mcp`;
 }
 function mcpConnectCommand(mcpUrl: string, key: string): string {
   return `claude mcp add --transport http claude-mem ${mcpUrl} --header "Authorization: Bearer ${key}"`;
@@ -106,16 +123,22 @@ const TERMINAL_JOB_STATUSES: readonly PostgresObservationGenerationJob['status']
 async function waitForTerminalJob(
   jobRepo: PostgresObservationGenerationJobRepository,
   job: PostgresObservationGenerationJob,
-  timeoutMs: number = WAIT_TIMEOUT_MS,
-  intervalMs: number = WAIT_POLL_INTERVAL_MS,
+  options: { timeoutMs?: number; signal?: AbortSignal } = {},
 ): Promise<{ job: PostgresObservationGenerationJob; timedOut: boolean }> {
   if (TERMINAL_JOB_STATUSES.includes(job.status)) {
     return { job, timedOut: false };
   }
-  const deadline = Date.now() + timeoutMs;
+  const deadline = Date.now() + (options.timeoutMs ?? WAIT_TIMEOUT_MS);
+  const { signal } = options;
   let current = job;
-  while (Date.now() < deadline) {
-    await new Promise(resolve => setTimeout(resolve, intervalMs));
+  while (Date.now() < deadline && !signal?.aborted) {
+    try {
+      await delay(WAIT_POLL_INTERVAL_MS, undefined, { signal });
+    } catch (error) {
+      if (signal?.aborted) break;
+      throw error;
+    }
+    if (signal?.aborted) break;
     const refreshed = await jobRepo.getByIdForScope({
       id: job.id,
       projectId: job.projectId,
@@ -129,7 +152,25 @@ async function waitForTerminalJob(
       return { job: refreshed, timedOut: false };
     }
   }
-  return { job: current, timedOut: true };
+  return { job: current, timedOut: !signal?.aborted };
+}
+
+/** Only the HTTP wait ends on disconnect; committed generation keeps its ownership. */
+function responseWaitSignal(res: Response): { signal: AbortSignal; dispose: () => void } {
+  const controller = new AbortController();
+  const socket = res.socket;
+  const onClose = () => controller.abort();
+  res.once('close', onClose);
+  // Bun's streaming HTTP surface can report disconnect on the socket.
+  socket?.once('close', onClose);
+  if (res.destroyed || res.writableEnded || socket?.destroyed) onClose();
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      res.off('close', onClose);
+      socket?.off('close', onClose);
+    },
+  };
 }
 
 export class ServerV1PostgresRoutes implements RouteHandler {
@@ -177,24 +218,19 @@ export class ServerV1PostgresRoutes implements RouteHandler {
       allowLocalDevBypass: this.options.allowLocalDevBypass,
       requiredScopes: ['memories:read'],
     });
+    const baseKeyIssuer = requirePostgresServerAuth(this.options.pool, {
+      authMode: this.options.authMode,
+      allowLocalDevBypass: this.options.allowLocalDevBypass,
+      requiredScopes: ['memories:read', 'memories:write'],
+    });
     // Paid-readiness guards, all opt-in via env so default behavior is unchanged
     // (empty array → readAuth/writeAuth are just the base auth). Express accepts
     // a middleware array wherever a single handler goes, so the per-route
     // registrations below need no changes. Order after auth: rate limit → quota
     // → meter, so the request is counted only once it's admitted.
-    const guards: RequestHandler[] = [];
-    const ratePerMin = Number(process.env.CLAUDE_MEM_RATE_LIMIT_PER_MIN ?? '0');
-    if (ratePerMin > 0) guards.push(requireRateLimit(this.options.pool, { windowSec: 60, max: ratePerMin }));
-    const monthlyCap = Number(process.env.CLAUDE_MEM_MONTHLY_REQUEST_CAP ?? '0');
-    if (monthlyCap > 0) guards.push(requireMonthlyQuota(this.options.pool, { kind: 'request', cap: monthlyCap }));
-    if (process.env.CLAUDE_MEM_USAGE_METERING === '1') guards.push(meterRequests(this.options.pool));
-    // A monthly TOKEN cap gates writes only (ingestion drives generation = token
-    // spend); reads stay available so a team over budget can still recall.
-    const writeGuards: RequestHandler[] = [...guards];
-    const tokenCap = Number(process.env.CLAUDE_MEM_MONTHLY_TOKEN_CAP ?? '0');
-    if (tokenCap > 0) writeGuards.push(requireMonthlyQuota(this.options.pool, { kind: 'tokens', cap: tokenCap }));
-    const writeAuth: RequestHandler[] = [baseWrite, ...writeGuards];
-    const readAuth: RequestHandler[] = [baseRead, ...guards];
+    const writeAuth: RequestHandler[] = [baseWrite, ...serverUsageGuards(this.options.pool, { write: true })];
+    const readAuth: RequestHandler[] = [baseRead, ...serverUsageGuards(this.options.pool)];
+    const keyIssuerAuth: RequestHandler[] = [baseKeyIssuer, ...serverUsageGuards(this.options.pool, { write: true })];
 
     // GET /v1/usage — per-kind usage totals for the caller's team this month.
     app.get('/v1/usage', readAuth, this.asyncHandler(async (req, res) => {
@@ -207,10 +243,10 @@ export class ServerV1PostgresRoutes implements RouteHandler {
 
     // POST /v1/keys — mint a READ-ONLY, optionally-expiring API key for the
     // caller's team and return the ready-to-paste connect command. Gated by
-    // writeAuth: minting a lesser (read) key requires you can already write the
-    // team's memory, which avoids a read key escalating into more keys. The raw
-    // key is shown exactly once.
-    app.post('/v1/keys', writeAuth, this.handleCreate(
+    // both read and write scopes: an issuer must already hold the read access
+    // it delegates, and a read-only key must not mint further keys. The raw key
+    // is shown exactly once.
+    app.post('/v1/keys', keyIssuerAuth, this.handleCreate(
       z.object({
         label: z.string().max(120).optional(),
         expiresInDays: z.number().int().positive().max(365).optional(),
@@ -218,8 +254,16 @@ export class ServerV1PostgresRoutes implements RouteHandler {
       async (req, res, body) => {
         const teamId = this.requireTeamId(req, res);
         if (!teamId) return;
+        const mcpUrl = mcpConnectUrl(req);
+        if (mcpUrl === null) {
+          res.status(400).json({
+            error: 'InvalidHost',
+            message: 'The Host header is not a usable hostname. Set CLAUDE_MEM_PUBLIC_URL or send a valid Host header.',
+          });
+          return;
+        }
         const raw = `cm_${randomBytes(24).toString('hex')}`;
-        const keyHash = hashApiKey(raw);
+        const keyHash = await hashApiKeyAsync(raw);
         const keyPrefix = apiKeyPrefix(raw);
         const expiresAt = body.expiresInDays
           ? new Date(Date.now() + body.expiresInDays * 86_400_000)
@@ -234,7 +278,6 @@ export class ServerV1PostgresRoutes implements RouteHandler {
           expiresAt,
         });
         void body.label; // reserved for when api_keys grows a label column
-        const mcpUrl = mcpConnectUrl(req);
         res.status(201).json({
           id: key.id,
           apiKey: raw, // shown ONCE — store it now
@@ -252,10 +295,17 @@ export class ServerV1PostgresRoutes implements RouteHandler {
       const teamId = this.requireTeamId(req, res);
       if (!teamId) return;
       const mcpUrl = mcpConnectUrl(req);
+      if (mcpUrl === null) {
+        res.status(400).json({
+          error: 'InvalidHost',
+          message: 'The Host header is not a usable hostname. Set CLAUDE_MEM_PUBLIC_URL or send a valid Host header.',
+        });
+        return;
+      }
       res.status(200).json({
         mcpUrl,
         connectCommand: mcpConnectCommand(mcpUrl, '<YOUR_API_KEY>'),
-        hint: 'POST /v1/keys (write scope) to mint a read-only key for this link.',
+        hint: 'POST /v1/keys (read and write scopes) to mint a read-only key for this link.',
       });
     }));
 
@@ -269,7 +319,7 @@ export class ServerV1PostgresRoutes implements RouteHandler {
       const generate = parsedQuery.data.generate !== 'false';
       const wait = parsedQuery.data.wait === 'true';
 
-      const result = CreateAgentEventSchema.safeParse(req.body);
+      const result = CreatePostgresAgentEventSchema.safeParse(req.body);
       if (!result.success) {
         res.status(400).json({ error: 'ValidationError', issues: result.error.issues });
         return;
@@ -313,24 +363,30 @@ export class ServerV1PostgresRoutes implements RouteHandler {
       });
 
       if (wait) {
-        let resolved = outbox;
-        let waitTimedOut = false;
-        if (outbox) {
-          const jobRepo = new PostgresObservationGenerationJobRepository(this.options.pool);
-          const result = await waitForTerminalJob(jobRepo, outbox);
-          resolved = result.job;
-          waitTimedOut = result.timedOut;
+        const waiting = responseWaitSignal(res);
+        try {
+          let resolved = outbox;
+          let waitTimedOut = false;
+          if (outbox) {
+            const jobRepo = new PostgresObservationGenerationJobRepository(this.options.pool);
+            const result = await waitForTerminalJob(jobRepo, outbox, { signal: waiting.signal });
+            resolved = result.job;
+            waitTimedOut = result.timedOut;
+          }
+          if (waiting.signal.aborted) return;
+          res.status(201).json({
+            event: serializeEvent(event, canReadMemories(req)),
+            generationJob: resolved ? serializeJobStatusResponse(resolved, enqueueState) : null,
+            ...(waitTimedOut ? { waitTimedOut: true } : {}),
+          });
+        } finally {
+          waiting.dispose();
         }
-        res.status(201).json({
-          event: serializeEvent(event),
-          generationJob: resolved ? serializeJobStatusResponse(resolved, enqueueState) : null,
-          ...(waitTimedOut ? { waitTimedOut: true } : {}),
-        });
         return;
       }
 
       res.status(201).json({
-        event: serializeEvent(event),
+        event: serializeEvent(event, canReadMemories(req)),
         ...(outbox
           ? { generationJob: serializeGenerationJob(outbox, enqueueState) }
           : {}),
@@ -347,7 +403,7 @@ export class ServerV1PostgresRoutes implements RouteHandler {
       const generate = parsedQuery.data.generate !== 'false';
       const wait = parsedQuery.data.wait === 'true';
 
-      const batchSchema = z.array(CreateAgentEventSchema).min(1).max(500);
+      const batchSchema = z.array(CreatePostgresAgentEventSchema).min(1).max(500);
       const result = batchSchema.safeParse(req.body);
       if (!result.success) {
         res.status(400).json({ error: 'ValidationError', issues: result.error.issues });
@@ -400,35 +456,42 @@ export class ServerV1PostgresRoutes implements RouteHandler {
       });
 
       if (wait) {
-        const jobRepo = new PostgresObservationGenerationJobRepository(this.options.pool);
-        const waitDeadline = Date.now() + WAIT_TIMEOUT_MS;
-        const resolved: { event: PostgresAgentEvent; outbox: PostgresObservationGenerationJob | null; timedOut: boolean }[] = [];
-        for (const item of inserted) {
-          if (!item.outbox) {
-            resolved.push({ event: item.event, outbox: null, timedOut: false });
-            continue;
+        const waiting = responseWaitSignal(res);
+        try {
+          const jobRepo = new PostgresObservationGenerationJobRepository(this.options.pool);
+          const waitDeadline = Date.now() + WAIT_TIMEOUT_MS;
+          const resolved: { event: PostgresAgentEvent; outbox: PostgresObservationGenerationJob | null; timedOut: boolean }[] = [];
+          for (const item of inserted) {
+            if (waiting.signal.aborted) return;
+            if (!item.outbox) {
+              resolved.push({ event: item.event, outbox: null, timedOut: false });
+              continue;
+            }
+            const remaining = Math.max(0, waitDeadline - Date.now());
+            const result = await waitForTerminalJob(jobRepo, item.outbox, { timeoutMs: remaining, signal: waiting.signal });
+            resolved.push({ event: item.event, outbox: result.job, timedOut: result.timedOut });
           }
-          const remaining = Math.max(0, waitDeadline - Date.now());
-          const result = await waitForTerminalJob(jobRepo, item.outbox, remaining);
-          resolved.push({ event: item.event, outbox: result.job, timedOut: result.timedOut });
+          if (waiting.signal.aborted) return;
+          const anyTimedOut = resolved.some(r => r.timedOut);
+          res.status(201).json({
+            events: resolved.map(({ event, outbox, timedOut }, index) => ({
+              event: serializeEvent(event, canReadMemories(req)),
+              generationJob: outbox
+                ? serializeJobStatusResponse(outbox, enqueueResults[index]!)
+                : null,
+              ...(timedOut ? { waitTimedOut: true } : {}),
+            })),
+            ...(anyTimedOut ? { waitTimedOut: true } : {}),
+          });
+        } finally {
+          waiting.dispose();
         }
-        const anyTimedOut = resolved.some(r => r.timedOut);
-        res.status(201).json({
-          events: resolved.map(({ event, outbox, timedOut }, index) => ({
-            event: serializeEvent(event),
-            generationJob: outbox
-              ? serializeJobStatusResponse(outbox, enqueueResults[index]!)
-              : null,
-            ...(timedOut ? { waitTimedOut: true } : {}),
-          })),
-          ...(anyTimedOut ? { waitTimedOut: true } : {}),
-        });
         return;
       }
 
       res.status(201).json({
         events: inserted.map(({ event, outbox }, index) => ({
-          event: serializeEvent(event),
+          event: serializeEvent(event, canReadMemories(req)),
           ...(outbox
             ? { generationJob: serializeGenerationJob(outbox, enqueueResults[index]!) }
             : {}),
@@ -765,7 +828,7 @@ export class ServerV1PostgresRoutes implements RouteHandler {
               platformSource,
             });
             if (existing) {
-              res.status(200).json({ session: serializeSession(existing) });
+              res.status(200).json({ session: serializeSessionWriteReceipt(req, existing) });
               return;
             }
           }
@@ -799,14 +862,14 @@ export class ServerV1PostgresRoutes implements RouteHandler {
                 platformSource,
               });
               if (racedRow) {
-                res.status(200).json({ session: serializeSession(racedRow) });
+                res.status(200).json({ session: serializeSessionWriteReceipt(req, racedRow) });
                 return;
               }
             }
             throw error;
           }
           await this.auditWrite(req, 'session.write', session.id, session.projectId);
-          res.status(201).json({ session: serializeSession(session) });
+          res.status(201).json({ session: serializeSessionWriteReceipt(req, session) });
         } catch (error) {
           this.handleDbError(error, res, 'session.write');
         }
@@ -880,7 +943,7 @@ export class ServerV1PostgresRoutes implements RouteHandler {
       await this.auditWrite(req, 'session.end', endedSession.id, endedSession.projectId);
 
       res.status(200).json({
-        session: serializeSession(endedSession),
+        session: serializeSessionWriteReceipt(req, endedSession),
         ...(summaryOutbox
           ? { generationJob: serializeGenerationJob(summaryOutbox, enqueueState) }
           : {}),
@@ -933,7 +996,14 @@ export class ServerV1PostgresRoutes implements RouteHandler {
           serverSessionId: linkedSessionId,
           kind: body.kind ?? 'manual',
           content: body.content,
-          metadata: body.metadata ?? {},
+          // A manual memory can arrive without any session to carry its
+          // platform. Keep the supplied source on the row for scoped recall.
+          metadata: {
+            ...body.metadata,
+            ...(body.platformSource == null ? {} : {
+              platformSource: normalizePlatformSource(body.platformSource),
+            }),
+          },
         };
         try {
           const repo = new PostgresObservationRepository(this.options.pool);
@@ -963,10 +1033,7 @@ export class ServerV1PostgresRoutes implements RouteHandler {
           await this.auditWrite(req, 'memory.write', observation.id, observation.projectId, {
             outcome: 'existing_generation_key',
           });
-          const scopes = req.authContext?.scopes ?? [];
-          const canRead = req.authContext?.mode === 'local-dev'
-            || scopes.includes('memories:read') || scopes.includes('*');
-          res.status(200).json(canRead
+          res.status(200).json(canReadMemories(req)
             ? { memory: serializeObservation(observation), existing: true }
             : { memory: { id: observation.id, projectId: observation.projectId }, existing: true });
         } catch (error) {
@@ -1083,6 +1150,10 @@ export class ServerV1PostgresRoutes implements RouteHandler {
         // CLAUDE_MEM_CONTEXT_MAIN_AGENT_ONLY: leave out rows generated from
         // subagent hook events.
         excludeSubagents: z.boolean().optional(),
+        // Apply the session-start mode filters before the result limit.
+        // Empty arrays intentionally select no observations, but keep summaries.
+        observationTypes: z.array(z.string().min(1)).optional(),
+        observationConcepts: z.array(z.string().min(1)).optional(),
       }).refine(body => body.summaryLimit === undefined || (
         body.query === undefined
         && body.summaryLimit <= (body.limit ?? SERVER_CONTEXT_RECENT_DEFAULT_LIMIT)
@@ -1107,6 +1178,8 @@ export class ServerV1PostgresRoutes implements RouteHandler {
             platformSource,
             folderProjects: body.folderProjects ?? null,
             excludeSubagents: body.excludeSubagents === true,
+            observationTypes: body.observationTypes,
+            observationConcepts: body.observationConcepts,
             queryEmbedding: await embedSearchQuery(this.options.pool, body.query),
           };
           if (body.summaryLimit === undefined) {
@@ -1142,6 +1215,8 @@ export class ServerV1PostgresRoutes implements RouteHandler {
           platformSource,
           folderProjects: body.folderProjects ?? null,
           excludeSubagents: body.excludeSubagents === true,
+          observationTypes: body.observationTypes ?? null,
+          observationConcepts: body.observationConcepts ?? null,
           resultCount: results.length,
           observationIds: results.map(o => o.id),
         });
@@ -1395,7 +1470,7 @@ export class ServerV1PostgresRoutes implements RouteHandler {
     return null;
   }
 
-  private toAgentEventInput(body: z.infer<typeof CreateAgentEventSchema>, teamId: string): CreatePostgresAgentEventInput {
+  private toAgentEventInput(body: z.infer<typeof CreatePostgresAgentEventSchema>, teamId: string): CreatePostgresAgentEventInput {
     const sourceAdapter = body.sourceType ?? SOURCE_ADAPTER_DEFAULT;
     const occurredAtEpoch = typeof body.occurredAtEpoch === 'number' ? body.occurredAtEpoch : Date.now();
     return {
@@ -1404,16 +1479,11 @@ export class ServerV1PostgresRoutes implements RouteHandler {
       serverSessionId: body.serverSessionId ?? null,
       contentSessionId: body.contentSessionId ?? null,
       sourceAdapter,
-      sourceEventId: typeof (body as Record<string, unknown>).sourceEventId === 'string'
-        ? ((body as Record<string, unknown>).sourceEventId as string)
-        : null,
+      sourceEventId: body.sourceEventId ?? null,
       eventType: body.eventType,
       platformSource: normalizePlatformSourceOrNull(body.platformSource),
       payload: (body.payload ?? {}) as object,
-      metadata: typeof (body as Record<string, unknown>).metadata === 'object'
-        && (body as Record<string, unknown>).metadata !== null
-        ? ((body as Record<string, unknown>).metadata as Record<string, unknown>)
-        : {},
+      metadata: body.metadata ?? {},
       occurredAt: new Date(occurredAtEpoch),
     };
   }
@@ -1721,7 +1791,7 @@ export class ServerV1PostgresRoutes implements RouteHandler {
     }
     // Scope check first — same NotFound disclosure as the rest of the routes.
     const repo = new PostgresObservationGenerationJobRepository(this.options.pool);
-    const current = await this.loadScopedById(req, res, {
+    const visible = await this.loadScopedById(req, res, {
       id,
       teamId,
       table: 'observation_generation_jobs',
@@ -1729,10 +1799,74 @@ export class ServerV1PostgresRoutes implements RouteHandler {
       scopeMismatch: 'not-found',
       load: (projectId) => repo.getByIdForScope({ id, projectId, teamId }),
     });
-    if (!current) return null;
+    if (!visible) return null;
 
-    // Idempotent fast-path: already queued -> emit audit only, no DB writes.
-    if (current.status === 'queued') {
+    // Keep the state check and update under the same row lock used by the
+    // generation commit path. Queue I/O and audit publication happen after
+    // this transaction, never while it holds a generation row.
+    const transition = await withPostgresTransaction(this.options.pool, async client => {
+      const current = await new PostgresObservationGenerationJobRepository(client).getByIdForScope({
+        id, projectId: visible.projectId, teamId, forUpdate: true,
+      });
+      if (!current) return { kind: 'missing' as const };
+      if (current.status === 'queued') return { kind: 'unchanged' as const, current };
+      if (current.status === 'processing' || current.status === 'completed') {
+        return { kind: 'conflict' as const, current };
+      }
+      // Reset to queued, clear lock + lifecycle timestamps, increment
+      // retried_count for audit. Preserve the existing explicit operator retry
+      // policy: an exhausted job receives one additional attempt.
+      //
+      // current.payload is the canonical BullMQ payload persisted at outbox
+      // create time (kind/team_id/project_id/source_type/source_id/
+      // generation_job_id/api_key_id/actor_id/source_adapter/request_id).
+      // The retry adds operator metadata to the persisted row but enqueues
+      // ONLY the BullMQ payload — the worker calls
+      // assertServerGenerationJobPayload(job.data) on receipt and would reject
+      // the metadata-only object the previous implementation handed it.
+      const retriedCount = extractRetriedCount(current.payload) + 1;
+      const persistedBullmqPayload = (current.payload && typeof current.payload === 'object'
+        ? current.payload
+        : {}) as Record<string, unknown>;
+      const newPayload = {
+        ...persistedBullmqPayload,
+        retried_count: retriedCount,
+        last_retried_by_actor: req.authContext?.apiKeyId ?? null,
+        last_retried_request_id: req.requestId ?? null,
+      };
+      // The payload we re-publish to BullMQ on retry: refresh request_id (so
+      // the worker logs/audit attribute this run to the operator's request)
+      // but keep all canonical job context that the worker validates against.
+      const retryBullmqPayload = {
+        ...persistedBullmqPayload,
+        request_id: req.requestId ?? (persistedBullmqPayload as { request_id?: unknown }).request_id ?? null,
+      };
+      const updated = await client.query(
+        `
+          UPDATE observation_generation_jobs
+          SET status = 'queued',
+              locked_at = NULL,
+              locked_by = NULL,
+              failed_at = NULL,
+              cancelled_at = NULL,
+              completed_at = NULL,
+              last_error = NULL,
+              attempts = LEAST(attempts, max_attempts - 1),
+              payload = $4::jsonb,
+              updated_at = now()
+          WHERE id = $1 AND project_id = $2 AND team_id = $3
+          RETURNING *
+        `,
+        [id, current.projectId, teamId, JSON.stringify(newPayload)],
+      );
+      return { kind: 'updated' as const, current, updatedRow: updated.rows[0], retriedCount, retryBullmqPayload };
+    });
+    if (transition.kind === 'missing') {
+      res.status(404).json({ error: 'NotFound', message: 'Generation job not found' });
+      return null;
+    }
+    if (transition.kind === 'unchanged') {
+      const current = transition.current;
       await this.auditWrite(req, 'generation_job.retried_by_operator', current.id, current.projectId, {
         outcome: 'noop_already_queued',
         currentAttempts: current.attempts,
@@ -1740,85 +1874,16 @@ export class ServerV1PostgresRoutes implements RouteHandler {
       });
       return { job: current, retriedCount: extractRetriedCount(current.payload), alreadyQueued: true };
     }
-
-    if (current.status === 'processing') {
-      // Refuse retry on in-flight jobs — the running worker MUST be allowed
-      // to finish or fail through its normal lifecycle. Operator can wait
-      // or cancel, then retry.
+    if (transition.kind === 'conflict') {
       res.status(409).json({
         error: 'Conflict',
-        message: 'Generation job is currently processing; cancel or wait for completion before retrying',
+        message: transition.current.status === 'processing'
+          ? 'Generation job is currently processing; cancel or wait for completion before retrying'
+          : 'Generation job already completed; retrying would duplicate observations',
       });
       return null;
     }
-
-    if (current.status === 'completed') {
-      // Refuse retry on already-completed jobs. The deduplication index on
-      // observations (generation_key = job_id + index + content) does NOT
-      // protect against re-running the provider, because LLM output is
-      // non-deterministic and the second run almost always produces a
-      // different content string. Replaying would persist a parallel set
-      // of observations attributed to the same generation_job_id.
-      // cancelGenerationJob applies the same 409 guard for the same reason.
-      res.status(409).json({
-        error: 'Conflict',
-        message: 'Generation job already completed; retrying would duplicate observations',
-      });
-      return null;
-    }
-
-    // Reset to queued, clear lock + lifecycle timestamps, increment
-    // retried_count for audit. attempts is intentionally preserved so the
-    // BullMQ attempt cap is not bypassed; if the job hit max_attempts the
-    // operator must lift the cap explicitly via a separate flow.
-    //
-    // current.payload is the canonical BullMQ payload persisted at outbox
-    // create time (kind/team_id/project_id/source_type/source_id/
-    // generation_job_id/api_key_id/actor_id/source_adapter/request_id).
-    // The retry adds operator metadata to the persisted row but enqueues
-    // ONLY the BullMQ payload — the worker calls
-    // assertServerGenerationJobPayload(job.data) on receipt and would reject
-    // the metadata-only object the previous implementation handed it.
-    const retriedCount = extractRetriedCount(current.payload) + 1;
-    const persistedBullmqPayload = (current.payload && typeof current.payload === 'object'
-      ? current.payload
-      : {}) as Record<string, unknown>;
-    const newPayload = {
-      ...persistedBullmqPayload,
-      retried_count: retriedCount,
-      last_retried_by_actor: req.authContext?.apiKeyId ?? null,
-      last_retried_request_id: req.requestId ?? null,
-    };
-    // The payload we re-publish to BullMQ on retry: refresh request_id (so
-    // the worker logs/audit attribute this run to the operator's request)
-    // but keep all canonical job context that the worker validates against.
-    const retryBullmqPayload = {
-      ...persistedBullmqPayload,
-      request_id: req.requestId ?? (persistedBullmqPayload as { request_id?: unknown }).request_id ?? null,
-    };
-    const updated = await this.options.pool.query(
-      `
-        UPDATE observation_generation_jobs
-        SET status = 'queued',
-            locked_at = NULL,
-            locked_by = NULL,
-            failed_at = NULL,
-            cancelled_at = NULL,
-            completed_at = NULL,
-            last_error = NULL,
-            attempts = LEAST(attempts, max_attempts - 1),
-            payload = $4::jsonb,
-            updated_at = now()
-        WHERE id = $1 AND project_id = $2 AND team_id = $3
-        RETURNING *
-      `,
-      [id, current.projectId, teamId, JSON.stringify(newPayload)],
-    );
-    const updatedRow = updated.rows[0];
-    if (!updatedRow) {
-      res.status(404).json({ error: 'NotFound', message: 'Generation job not found' });
-      return null;
-    }
+    const { current, updatedRow, retriedCount, retryBullmqPayload } = transition;
 
     // Append lifecycle event so the audit chain mirrors the lifecycle tracker.
     const eventsRepo = new PostgresObservationGenerationJobEventsRepository(this.options.pool);
@@ -1889,7 +1954,7 @@ export class ServerV1PostgresRoutes implements RouteHandler {
       return null;
     }
     const repo = new PostgresObservationGenerationJobRepository(this.options.pool);
-    const current = await this.loadScopedById(req, res, {
+    const visible = await this.loadScopedById(req, res, {
       id,
       teamId,
       table: 'observation_generation_jobs',
@@ -1897,38 +1962,47 @@ export class ServerV1PostgresRoutes implements RouteHandler {
       scopeMismatch: 'not-found',
       load: (projectId) => repo.getByIdForScope({ id, projectId, teamId }),
     });
-    if (!current) return null;
-    if (current.status === 'cancelled') {
+    if (!visible) return null;
+    const transition = await withPostgresTransaction(this.options.pool, async client => {
+      const current = await new PostgresObservationGenerationJobRepository(client).getByIdForScope({
+        id, projectId: visible.projectId, teamId, forUpdate: true,
+      });
+      if (!current) return { kind: 'missing' as const };
+      if (current.status === 'cancelled' || current.status === 'completed') {
+        return { kind: 'unchanged' as const, current };
+      }
+      const updateResult = await client.query(
+        `
+          UPDATE observation_generation_jobs
+          SET status = 'cancelled',
+              cancelled_at = now(),
+              updated_at = now()
+          WHERE id = $1 AND project_id = $2 AND team_id = $3
+          RETURNING *
+        `,
+        [id, current.projectId, teamId],
+      );
+      return { kind: 'updated' as const, current, updatedRow: updateResult.rows[0] };
+    });
+    if (transition.kind === 'missing') {
+      res.status(404).json({ error: 'NotFound', message: 'Generation job not found' });
+      return null;
+    }
+    const { current } = transition;
+    if (transition.kind === 'unchanged') {
+      if (current.status === 'completed') {
+        res.status(409).json({
+          error: 'Conflict', message: 'Generation job already completed; cannot cancel',
+        });
+        return null;
+      }
       await this.auditWrite(req, 'generation_job.cancelled_by_operator', current.id, current.projectId, {
         outcome: 'noop_already_cancelled',
         requestId: req.requestId ?? null,
       });
       return { job: current, alreadyCancelled: true };
     }
-    if (current.status === 'completed') {
-      res.status(409).json({
-        error: 'Conflict',
-        message: 'Generation job already completed; cannot cancel',
-      });
-      return null;
-    }
-
-    const updateResult = await this.options.pool.query(
-      `
-        UPDATE observation_generation_jobs
-        SET status = 'cancelled',
-            cancelled_at = now(),
-            updated_at = now()
-        WHERE id = $1 AND project_id = $2 AND team_id = $3
-        RETURNING *
-      `,
-      [id, current.projectId, teamId],
-    );
-    const updatedRow = updateResult.rows[0];
-    if (!updatedRow) {
-      res.status(404).json({ error: 'NotFound', message: 'Generation job not found' });
-      return null;
-    }
+    const { updatedRow } = transition;
 
     const eventsRepo = new PostgresObservationGenerationJobEventsRepository(this.options.pool);
     await eventsRepo.append({
@@ -2035,14 +2109,15 @@ export const JOB_LIST_DEFAULT_LIMIT = 50;
 export const JOB_LIST_MAX_LIMIT = 200;
 /**
  * Upper bound on the listing `offset`, as abuse protection: it caps how many
- * rows one request can make Postgres read and discard. 10,000 rows is 50 pages
+ * rows one request can make Postgres read and discard. It is the shared
+ * listing cap (src/shared/listing-offset-cap.ts); 10,000 rows is 50 pages
  * at JOB_LIST_MAX_LIMIT. The cost of OFFSET stops at the end of the caller's
  * matching rows, so this is a per-request cap and not a fix for an unbounded
  * scan. A request above it answers 400 rather than a page it did not ask for.
  * Rows past this point are unreachable on these routes unless a filter narrows
  * the listing; reaching them would take a keyset cursor, which does not exist.
  */
-export const JOB_LIST_MAX_OFFSET = 10_000;
+export const JOB_LIST_MAX_OFFSET = MAX_LISTING_OFFSET;
 
 export function parseGenericJobListingQuery(req: Request): {
   status: string | null;
@@ -2091,7 +2166,7 @@ function parseJobListOffset(value: unknown): number {
   const offset = clampInt(value, 0, 0, Number.MAX_SAFE_INTEGER);
   if (offset > JOB_LIST_MAX_OFFSET) {
     throw new AppError(
-      `offset must be at most ${JOB_LIST_MAX_OFFSET}; narrow the listing with filters to reach older rows`,
+      LISTING_OFFSET_CAP_MESSAGE,
       400,
       'INVALID_PAGINATION',
     );
@@ -2235,7 +2310,32 @@ function serializeSession(session: {
   };
 }
 
-function serializeEvent(event: PostgresAgentEvent): Record<string, unknown> {
+function canReadMemories(req: Request): boolean {
+  const scopes = req.authContext?.scopes ?? [];
+  return req.authContext?.mode === 'local-dev' || scopes.includes('memories:read') || scopes.includes('*');
+}
+
+/** Mutation permission returns a receipt, not permission to recall saved prompts. */
+function serializeSessionWriteReceipt(req: Request, session: PostgresServerSession): Record<string, unknown> {
+  if (canReadMemories(req)) {
+    return serializeSession(session);
+  }
+  // Keep the identifiers the hook client uses to attach events and finish
+  // capture, plus the resulting lifecycle state. Metadata can belong to an
+  // earlier writer when start is replayed or another client ends the session.
+  return {
+    id: session.id,
+    projectId: session.projectId,
+    teamId: session.teamId,
+    externalSessionId: session.externalSessionId,
+    contentSessionId: session.contentSessionId,
+    platformSource: session.platformSource,
+    generationStatus: session.generationStatus,
+    endedAtEpoch: session.endedAtEpoch,
+  };
+}
+
+function serializeEvent(event: PostgresAgentEvent, includeContent = true): Record<string, unknown> {
   return {
     id: event.id,
     projectId: event.projectId,
@@ -2245,8 +2345,8 @@ function serializeEvent(event: PostgresAgentEvent): Record<string, unknown> {
     sourceEventId: event.sourceEventId,
     eventType: event.eventType,
     platformSource: event.platformSource,
-    payload: event.payload,
-    metadata: event.metadata,
+    // Replayed native receipts can return another writer's stored event.
+    ...(includeContent ? { payload: event.payload, metadata: event.metadata } : {}),
     occurredAtEpoch: event.occurredAtEpoch,
     receivedAtEpoch: event.receivedAtEpoch,
     createdAtEpoch: event.createdAtEpoch,
@@ -2259,6 +2359,7 @@ function serializeObservation(observation: {
   teamId: string;
   serverSessionId: string | null;
   contentSessionId?: string | null;
+  platformSource?: string | null;
   kind: string;
   content: string;
   metadata: Record<string, unknown>;
@@ -2271,6 +2372,7 @@ function serializeObservation(observation: {
     teamId: observation.teamId,
     serverSessionId: observation.serverSessionId,
     ...(observation.contentSessionId !== undefined ? { contentSessionId: observation.contentSessionId } : {}),
+    ...(observation.platformSource !== undefined ? { platformSource: observation.platformSource } : {}),
     kind: observation.kind,
     content: observation.content,
     metadata: observation.metadata,

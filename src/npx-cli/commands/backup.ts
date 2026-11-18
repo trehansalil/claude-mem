@@ -5,7 +5,7 @@
  */
 
 import { styleText } from 'node:util';
-import { getWorkerBaseUrl } from '../../shared/worker-utils.js';
+import { getWorkerBaseUrl, withWorkerAuth } from '../../shared/worker-utils.js';
 
 function printBackupUsage(): void {
   console.error(`Usage: npx claude-mem backup [run|status|list]`);
@@ -22,7 +22,7 @@ function workerBaseUrl(): string {
  */
 export async function fetchWorkerBackupApi(pathname: string, init?: RequestInit): Promise<Response> {
   try {
-    return await fetch(`${workerBaseUrl()}${pathname}`, init);
+    return await fetch(`${workerBaseUrl()}${pathname}`, withWorkerAuth(init, { readOnly: true }));
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
     const cause = error instanceof Error ? (error as any).cause : undefined;
@@ -108,10 +108,6 @@ async function runBackupRun(): Promise<void> {
   });
   const data = await readJsonOrExit(response, 'Backup run');
 
-  if (response.status === 409) {
-    console.log(styleText('yellow', 'A snapshot is already running.'));
-    return;
-  }
   if (!response.ok) {
     console.error(styleText('red', `Backup run failed: ${data.error ?? `HTTP ${response.status}`}`));
     process.exit(1);
@@ -121,6 +117,9 @@ async function runBackupRun(): Promise<void> {
   console.log(styleText('green', 'Snapshot created.'));
   console.log(`  ${styleText('bold', 'Path:')}  ${snapshot.path}`);
   console.log(`  ${styleText('bold', 'Size:')}  ${typeof snapshot.bytes === 'number' ? formatBytes(snapshot.bytes) : 'n/a'}`);
+  if (typeof snapshot.retentionError === 'string') {
+    console.error(styleText('yellow', `Could not clean up old snapshots: ${snapshot.retentionError}`));
+  }
 }
 
 async function runBackupList(): Promise<void> {

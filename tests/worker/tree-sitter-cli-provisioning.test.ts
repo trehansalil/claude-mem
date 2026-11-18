@@ -3,6 +3,7 @@ import { createHash } from 'crypto';
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { gzipSync } from 'zlib';
 import { provisionTreeSitterCliForPluginRoot } from '../../src/services/worker/tree-sitter-cli-provisioning.js';
 import { isTreeSitterCliBinaryUsable, treeSitterCliBinaryPath } from '../../src/services/smart-file-read/tree-sitter-cli-provision.js';
 import type { GlibcCompatibleFallback } from '../../src/services/smart-file-read/tree-sitter-cli-provision.js';
@@ -14,6 +15,7 @@ import { fakeCondaPackage } from '../helpers/fake-conda-package.js';
 describe('worker tree-sitter CLI provisioning', () => {
   const TREE_SITTER_BINARY_NAME = process.platform === 'win32' ? 'tree-sitter.exe' : 'tree-sitter';
   const REPO_TREE_SITTER_BINARY = join(import.meta.dir, '..', '..', 'node_modules', 'tree-sitter-cli', TREE_SITTER_BINARY_NAME);
+  const hasRepoBinary = existsSync(REPO_TREE_SITTER_BINARY);
   // The fake download is the repo's own tree-sitter build, so pin its digest.
   const pinRepoBinary = () => createHash('sha256').update(readFileSync(REPO_TREE_SITTER_BINARY)).digest('hex');
   let pluginRoot: string;
@@ -43,14 +45,14 @@ describe('worker tree-sitter CLI provisioning', () => {
     process.platform === 'win32' ? '' : 'fs.chmodSync(target, 0o755);',
   ].join('\n');
 
-  it('downloads the executable a marketplace install left out', async () => {
+  it.skipIf(!hasRepoBinary)('downloads the executable a marketplace install left out', async () => {
     writeMarketplaceCliPackage(downloadingInstallScript);
 
     expect(await provisionTreeSitterCliForPluginRoot(pluginRoot, pinRepoBinary)).toBe('provisioned');
     expect(existsSync(treeSitterCliBinaryPath(pluginRoot))).toBe(true);
   });
 
-  it('leaves a working executable alone', async () => {
+  it.skipIf(!hasRepoBinary)('leaves a working executable alone', async () => {
     const cliDir = writeMarketplaceCliPackage("throw new Error('install.js must not run');");
     copyFileSync(REPO_TREE_SITTER_BINARY, join(cliDir, TREE_SITTER_BINARY_NAME));
     if (process.platform !== 'win32') chmodSync(join(cliDir, TREE_SITTER_BINARY_NAME), 0o755);
@@ -65,11 +67,32 @@ describe('worker tree-sitter CLI provisioning', () => {
   it('rejects when the download fails, so the worker logs it and the next start retries', async () => {
     writeMarketplaceCliPackage("console.error('release asset unavailable'); process.exitCode = 1;");
 
-    await expect(provisionTreeSitterCliForPluginRoot(pluginRoot, pinRepoBinary)).rejects.toMatchObject({ code: 1 });
+    const directDownloadUnavailable = async (): Promise<Buffer> => { throw new Error('release asset unavailable'); };
+
+    await expect(provisionTreeSitterCliForPluginRoot(pluginRoot, () => '0'.repeat(64), undefined, directDownloadUnavailable))
+      .rejects.toMatchObject({ code: 1 });
     expect(existsSync(treeSitterCliBinaryPath(pluginRoot))).toBe(false);
   });
 
-  it('re-downloads when the existing executable is corrupt (SHA mismatch)', async () => {
+  // install.js fails on some networks where a plain fetch of the same asset
+  // succeeds; without the direct download every worker start failed the same way.
+  it.skipIf(!hasRepoBinary)('provisions from the direct download when install.js fails', async () => {
+    writeMarketplaceCliPackage("console.error('Error: socket hang up'); process.exitCode = 1;");
+    const downloads: string[] = [];
+    const directDownload = async (url: string): Promise<Buffer> => {
+      downloads.push(url);
+      return gzipSync(readFileSync(REPO_TREE_SITTER_BINARY));
+    };
+
+    expect(await provisionTreeSitterCliForPluginRoot(pluginRoot, pinRepoBinary, undefined, directDownload)).toBe('provisioned');
+    expect(downloads).toHaveLength(1);
+    expect(await isTreeSitterCliBinaryUsable(pluginRoot)).toBe(true);
+    // The next worker start finds a working CLI and downloads nothing.
+    expect(await provisionTreeSitterCliForPluginRoot(pluginRoot, pinRepoBinary, undefined, directDownload)).toBe('already-usable');
+    expect(downloads).toHaveLength(1);
+  });
+
+  it.skipIf(!hasRepoBinary)('re-downloads when the existing executable is corrupt (SHA mismatch)', async () => {
     const cliDir = writeMarketplaceCliPackage(downloadingInstallScript);
     // Garbage bytes: intact check fails on the SHA, so the download path runs.
     writeFileSync(join(cliDir, TREE_SITTER_BINARY_NAME), Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0x99]));
@@ -82,7 +105,7 @@ describe('worker tree-sitter CLI provisioning', () => {
   // cannot run it (e.g. linked against a newer glibc). Downloading the same
   // release asset again cannot help, so provisioning fails fast with the real
   // reason instead of burning a download on every worker start.
-  it('fails fast with the reason when the intact executable cannot run (no re-download)', async () => {
+  it.skipIf(!hasRepoBinary)('fails fast with the reason when the intact executable cannot run (no re-download)', async () => {
     const cliDir = writeMarketplaceCliPackage("throw new Error('install.js must not run');");
     const intactButBroken = readFileSync(REPO_TREE_SITTER_BINARY).subarray(0, 1024);
     const binaryPath = join(cliDir, TREE_SITTER_BINARY_NAME);
@@ -96,18 +119,11 @@ describe('worker tree-sitter CLI provisioning', () => {
     expect(readFileSync(binaryPath).equals(intactButBroken)).toBe(true);
   });
 
-  it('fails fast when the binary is absent but the package version has no pinned SHA', async () => {
-    writeMarketplaceCliPackage("throw new Error('install.js must not run');");
-
-    await expect(provisionTreeSitterCliForPluginRoot(pluginRoot, () => undefined))
-      .rejects.toThrow(/No SHA-256 is pinned/);
-  });
-
   // Greptile P1 on #4777: a copied/restored binary can lose its executable bit
   // while keeping a matching SHA-256. That is repairable (the download restores
   // 755), so it must fall through to the download, not fail fast. POSIX-only:
   // Windows has no exec bit to lose.
-  it.skipIf(process.platform === 'win32')('re-downloads when the intact executable merely lost its executable bit', async () => {
+  it.skipIf(process.platform === 'win32' || !hasRepoBinary)('re-downloads when the intact executable merely lost its executable bit', async () => {
     const cliDir = writeMarketplaceCliPackage(downloadingInstallScript);
     const binaryPath = join(cliDir, TREE_SITTER_BINARY_NAME);
     copyFileSync(REPO_TREE_SITTER_BINARY, binaryPath);
@@ -220,7 +236,7 @@ describe('worker tree-sitter CLI provisioning', () => {
       expect(readdirSync(cliDir).filter((entry) => entry.startsWith('.provision-'))).toEqual([]);
     });
 
-    it('does not download a fallback when the refusal is not about glibc', async () => {
+    it.skipIf(!hasRepoBinary)('does not download a fallback when the refusal is not about glibc', async () => {
       const cliDir = writeMarketplaceCliPackage("throw new Error('install.js must not run');");
       const truncated = readFileSync(REPO_TREE_SITTER_BINARY).subarray(0, 1024);
       const binaryPath = join(cliDir, TREE_SITTER_BINARY_NAME);

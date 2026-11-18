@@ -59,7 +59,7 @@
     <img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License">
   </a>
   <a href="package.json">
-    <img src="https://img.shields.io/badge/version-15.13.0-green.svg" alt="Version">
+    <img src="https://img.shields.io/badge/version-16.0.0-green.svg" alt="Version">
   </a>
   <a href="package.json">
     <img src="https://img.shields.io/badge/node-%5E20.19%20%7C%7C%20%3E%3D22.12-brightgreen.svg" alt="Node">
@@ -127,20 +127,20 @@
 </p>
 
 <p align="center">
-  Claude-Mem runs a second agent beside it that takes notes while it works. The next session starts with a short index of what matters, and pulls in the details only when it needs them. Works with Claude Code, Codex, Cursor, OpenCode and 11 more agents. Copilot CLI, Goose, Roo Code and Warp can search your memory, but their sessions aren't recorded.
+  Claude-Mem runs a second agent beside it that takes notes while it works. The next session starts with a short index of what matters, and pulls in the details only when it needs them. Works with Claude Code, Codex, Cursor, OpenCode and 11 more agents. Copilot CLI, Goose, Roo Code, Warp and Zed can search your memory, but their sessions aren't recorded.
 </p>
 
 ---
 
 ## Quick Start
 
-**Installing for someone as an AI agent?** Run `npx claude-mem install --runtime worker` on their computer in an interactive terminal (enable PTY in your shell tool). It first asks in the terminal which agents to set up and, for Claude Code, whether to disable native auto-memory (and whether to overwrite an existing install). Relay each question to the user and type their answer, or pass `--ide <id>` to skip the first one. Keep the installer running. When it prints **Continue setup in your browser**, open that URL in the user's browser if the installer hasn't already opened it. Let the user go through setup and make their own choices, including the usage-analytics question the installer may ask at the end. If you can't run an interactive terminal on their computer, give them the command to run locally.
+**Installing for someone as an AI agent?** If the user is available, run `npx claude-mem install --setup browser` on their computer and keep it running. It prepares the local runtime, then opens setup in their browser; if the page doesn't open, give them the printed URL. Every choice (agents, integrations, skills, model, usage analytics, the optional email) is made by the user on that page, so there are no terminal questions to relay. If the user is away, run `npx claude-mem install --setup defer`: it prepares the runtime and leaves setup waiting for their first visit, and their next session shows them the link. Don't make their choices for them.
 
 ```bash
 npx claude-mem install
 ```
 
-The installer finds the agents on your machine and asks which ones to set up. Then just start working: observations stream in from your first prompt, and your second session in a project opens with memory from the first. (Copilot CLI, Goose, Roo Code and Warp get memory search only, so their sessions don't add to it.)
+The installer finds the agents on your machine and asks which ones to set up. Then just start working: observations stream in from your first prompt, and your second session in a project opens with memory from the first. (Copilot CLI, Goose, Roo Code, Warp and Zed get memory search only, so their sessions don't add to it.)
 
 The installer sets everything up first, then asks you to sign in to claude-mem in your browser (email magic link, no card required to sign in). Choosing the **claude-mem observer** then starts its **30 Day Free Trial** on a checkout page that asks for a payment method; once it completes, the installer saves your memory key. With the observer, memory runs off-plan, so you get up to 100% more usage from your plan. When the free trial ends, memory automatically falls back to your Anthropic plan unless you subscribe. After sign-in you pick your memory provider: the claude-mem observer, your own OpenRouter or Gemini key, or your Anthropic plan.
 
@@ -311,7 +311,7 @@ Search runs through three MCP tools in a token-efficient three-step workflow. Th
 - Start with `search` to get an index of results
 - Use `timeline` to see what was happening around specific observations
 - Use `get_observations` to fetch full details for relevant IDs
-- **~10x token savings** by filtering before fetching details
+- **Index rows are about a tenth the size of a full record**: ~50-100 tokens versus ~500-1,000. Filtering decides how many records you pay to fetch, not how large each one is; the workflow's total cost also includes the timeline and the selected details. The ratio is not a measured recall or end-to-end saving ([#4138](https://github.com/thedotmack/claude-mem/issues/4138)).
 
 **Available MCP Tools:**
 

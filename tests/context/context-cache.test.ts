@@ -7,7 +7,7 @@
  * - The hook serves a cached block without calling the worker, falls back to
  *   the live path on a miss or a stale (>24h) file, and never leaks placeholders.
  */
-import { afterAll, afterEach, beforeEach, describe, expect, it, mock } from 'bun:test';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, mock } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
@@ -19,8 +19,7 @@ import * as realWorkerUtils from '../../src/shared/worker-utils.js';
 
 import {
   CONTEXT_CACHE_MAX_AGE_MS,
-  CONTEXT_HEADER_TIME_PLACEHOLDER,
-  HEADER_TIME_MAX_FILLED_CHARS,
+  CONTEXT_PLACEHOLDER_NONCE,
   contextCacheDir,
   contextCacheFilePath,
   contextCacheKeys,
@@ -45,13 +44,15 @@ const realProjectNameSnapshot = { ...realProjectName };
 const realWorkerUtilsSnapshot = { ...realWorkerUtils };
 
 const PLACEHOLDER_MARKER = '⟦CMEM_';
+// Blocks cached before the header became the one Rules + Tools line carry this.
+const LEGACY_HEADER_TIME_PLACEHOLDER = `⟦CMEM_NOW_HEADER:${CONTEXT_PLACEHOLDER_NONCE}⟧`;
 
 describe('fillContextPlaceholders', () => {
   const nowEpochMs = 1_790_000_000_000;
 
-  it('fills the header time and every relative duration', () => {
+  it('fills a legacy cached header time and every relative duration', () => {
     const body = [
-      `# [proj] recent context, ${CONTEXT_HEADER_TIME_PLACEHOLDER}`,
+      `# [proj] recent context, ${LEGACY_HEADER_TIME_PLACEHOLDER}`,
       `- release: status=active, updated ${relativeTimePlaceholder(nowEpochMs - 3 * 3_600_000)} ago`,
       `  - [todo] publish, updated ${relativeTimePlaceholder(nowEpochMs - 5 * 60_000)} ago`,
     ].join('\n');
@@ -64,7 +65,7 @@ describe('fillContextPlaceholders', () => {
   });
 
   it('never leaves a placeholder behind', () => {
-    const body = `${CONTEXT_HEADER_TIME_PLACEHOLDER} ${relativeTimePlaceholder(1)} ${relativeTimePlaceholder(nowEpochMs)}`;
+    const body = `${LEGACY_HEADER_TIME_PLACEHOLDER} ${relativeTimePlaceholder(1)} ${relativeTimePlaceholder(nowEpochMs)}`;
     expect(fillContextPlaceholders(body, nowEpochMs)).not.toContain(PLACEHOLDER_MARKER);
   });
 
@@ -73,7 +74,7 @@ describe('fillContextPlaceholders', () => {
     // placeholders carrying the rendering nonce are filled.
     const injected = `⟦CMEM_NOW_HEADER:000000000000⟧ ⟦CMEM_AGO:000000000000:0000000000001⟧ ⟦CMEM_AGO:99999999999999999999⟧`;
     expect(fillContextPlaceholders(injected, nowEpochMs)).toBe(injected);
-    const userCopiedRealPlaceholder = `${CONTEXT_HEADER_TIME_PLACEHOLDER}`;
+    const userCopiedRealPlaceholder = `${LEGACY_HEADER_TIME_PLACEHOLDER} ${relativeTimePlaceholder(1)}`;
     expect(fillContextPlaceholders(userCopiedRealPlaceholder, nowEpochMs, 'abcdefabcdef')).toBe(userCopiedRealPlaceholder);
     expect(() => fillContextPlaceholders('x', nowEpochMs, '../not-a-nonce')).toThrow();
   });
@@ -84,8 +85,6 @@ describe('fillContextPlaceholders', () => {
       expect(relativeTimePlaceholder(nowEpochMs - ageMs).length)
         .toBeGreaterThanOrEqual(describeDuration(ageMs).length);
     }
-    // The header reserve covers the real header time.
-    expect(formatHeaderDateTime(new Date(nowEpochMs)).length).toBeLessThanOrEqual(HEADER_TIME_MAX_FILLED_CHARS);
   });
 });
 
@@ -150,7 +149,7 @@ describe('ContextCacheService invalidation', () => {
         if (renderGate) await renderGate;
         renderCount++;
         renders.push(variantKeys.projects.join(','));
-        return { body: `render #${renderCount} at ${CONTEXT_HEADER_TIME_PLACEHOLDER}`, cacheable: true };
+        return { body: `render #${renderCount} ${relativeTimePlaceholder(Date.now())} ago`, cacheable: true };
       },
       // As projectReadKeys would: a project merged into this one, stored in other casing.
       expandProjectReadKeys: projects => projects.includes(project) ? [...projects, 'Merged-Into-Invalidate-Proj'] : projects,
@@ -209,6 +208,36 @@ describe('ContextCacheService invalidation', () => {
       });
     });
     store.close();
+  });
+
+  it('a local summary replacement stops serving the old next steps immediately', async () => {
+    const store = memoryStore();
+    const summary = {
+      request: 'Publish release', investigated: 'release status', learned: 'ready',
+      completed: 'prepared', next_steps: 'publish the release', notes: null,
+    };
+    try {
+      const initialBody = readContextCache(keys, Date.now())?.body;
+      const first = store.storeObservations('memory-1', project, [], { ...summary }, 1);
+      expect(first.summaryUpdated).toBe(false);
+      // A new summary is still additive; the previous block remains usable.
+      expect(readContextCache(keys, Date.now())?.body).toBe(initialBody);
+      await waitPastDebounce();
+      service.recordLiveRender(keys, { body: summary.next_steps, cacheable: true }, Date.now());
+      const unrelatedBody = readContextCache(otherKeys, Date.now())?.body;
+
+      const revised = store.storeObservations('memory-1', project, [], {
+        ...summary, completed: 'published', next_steps: '',
+      }, 1);
+      expect(revised.summaryUpdated).toBe(true);
+      expect(revised.summaryId).toBe(first.summaryId);
+      expect(store.db.prepare('SELECT completed, next_steps FROM session_summaries WHERE id = ?')
+        .get(first.summaryId)).toEqual({ completed: 'published', next_steps: '' });
+      expect(readContextCache(keys, Date.now())).toBeNull();
+      expect(readContextCache(otherKeys, Date.now())?.body).toBe(unrelatedBody);
+      await waitPastDebounce();
+      expect(readContextCache(keys, Date.now())?.body).toStartWith('render #');
+    } finally { store.close(); }
   });
 
   it('SessionStore.appendWorkStateEntry', async () => {
@@ -351,6 +380,78 @@ describe('ContextCacheService invalidation', () => {
     await waitPastDebounce();
     expect(readContextCache(keys, Date.now())?.body).toStartWith('render #');
     db.close();
+  });
+
+  for (const kind of ['observation', 'summary', 'prompt'] as const) {
+    it(`a pulled ${kind} revision stops serving the replaced context before re-rendering`, async () => {
+      const db = new Database(':memory:');
+      new SessionStore(db);
+      const apply = new SyncApply(db, { deviceId: 'device-self' });
+      const createdAtEpoch = Date.now();
+      const base = { memory_session_id: 'mem-remote', project, created_at_epoch: createdAtEpoch };
+      const body = kind === 'observation' ? { ...base, type: 'discovery', title: 'old text' }
+        : kind === 'summary' ? { ...base, request: 'old text' }
+          : { ...base, content_session_id: 'content-remote', platform_source: 'claude', prompt_number: 1, prompt_text: 'old text' };
+      const field = kind === 'observation' ? 'title' : kind === 'summary' ? 'request' : 'prompt_text';
+      const rowOp: SyncOp = {
+        seq: '1', kind, origin_device: 'device-remote', origin_id: '11', rev: '1',
+        body: JSON.stringify(body), server_ts: createdAtEpoch,
+        entity_id: `entity-${kind}`, entity_rev: '1', operation_sha256: `hash-${kind}-1`,
+      };
+      try {
+        expect(apply.applyOps([rowOp]).applied).toBe(1);
+        await waitPastDebounce();
+        service.recordLiveRender(keys, { body: 'old text', cacheable: true }, Date.now());
+        expect(apply.applyOps([{ ...rowOp, seq: '2', rev: '2', entity_rev: '2', operation_sha256: `hash-${kind}-2`,
+          body: JSON.stringify({ ...body, [field]: 'corrected text' }) }]).applied).toBe(1);
+        const table = kind === 'observation' ? 'observations' : kind === 'summary' ? 'session_summaries' : 'user_prompts';
+        expect(db.prepare(`SELECT ${field} AS text FROM ${table}`).get()).toEqual({ text: 'corrected text' });
+        expect(readContextCache(keys, Date.now())).toBeNull();
+        expect(existsSync(contextCacheFilePath(otherKeys))).toBe(false);
+        await waitPastDebounce();
+        expect(readContextCache(keys, Date.now())?.body).toStartWith('render #');
+      } finally {
+        db.close();
+      }
+    });
+  }
+
+  it('a constraint-blocked revision stops serving old context when a later pull applies it', async () => {
+    const db = new Database(':memory:');
+    new SessionStore(db);
+    const apply = new SyncApply(db, { deviceId: 'device-self' });
+    const createdAtEpoch = Date.now();
+    const rowOp = (seq: string, id: string, rev: string, title: string, hash: string): SyncOp => ({
+      seq, kind: 'observation', origin_device: 'device-remote', origin_id: id, rev,
+      entity_id: `entity-${id}`, entity_rev: rev, operation_sha256: `hash-${id}-${rev}`,
+      body: JSON.stringify({ memory_session_id: 'mem-remote', project, type: 'discovery', title,
+        content_hash: hash, created_at_epoch: createdAtEpoch }), server_ts: createdAtEpoch,
+    });
+    try {
+      apply.applyOps([rowOp('1', 'a', '1', 'old text', 'old-hash')]);
+      // A local row holds the unique hash needed by the incoming revision.
+      const local = db.prepare(`INSERT INTO observations
+        (memory_session_id, project, type, title, content_hash, created_at, created_at_epoch)
+        VALUES ('mem-remote', ?, 'discovery', 'local duplicate', 'new-hash', ?, ?) RETURNING id`)
+        .all(project, new Date(createdAtEpoch).toISOString(), createdAtEpoch)[0] as { id: number };
+      expect(apply.applyOps([rowOp('2', 'a', '2', 'corrected text', 'new-hash')]).quarantined).toBe(1);
+      // The user deletes that local duplicate and a fresh context render can
+      // still contain the old remote revision until the next sync pull.
+      db.prepare('DELETE FROM observations WHERE id = ?').run(local.id);
+      emitContextInvalidation('all', 'delete-observation', 'removal');
+      await waitPastDebounce();
+      service.recordLiveRender(keys, { body: 'old text', cacheable: true }, Date.now());
+      // This page only adds a first revision; the older blocked update is
+      // applied by SyncApply's existing end-of-batch constraint handling.
+      apply.applyOps([rowOp('3', 'c', '1', 'unrelated new row', 'other-hash')]);
+      expect(db.prepare("SELECT title FROM observations WHERE origin_local_id = 'a'").get())
+        .toEqual({ title: 'corrected text' });
+      expect(db.prepare('SELECT COUNT(*) AS n FROM sync_pull_quarantine').get()).toEqual({ n: 0 });
+      expect(readContextCache(keys, Date.now())).toBeNull();
+      await waitPastDebounce();
+    } finally {
+      db.close();
+    }
   });
 
   it('a render in flight when a removal lands is discarded and re-run', async () => {
@@ -563,7 +664,7 @@ afterAll(() => {
 describe('context hook reads the precomputed block', () => {
   const agentKeys = contextCacheKeys(HOOK_PROJECTS, 'claude', false, '/tmp/cache-hook-repo');
   const colorKeys = contextCacheKeys(HOOK_PROJECTS, 'claude', true, '/tmp/cache-hook-repo');
-  const cachedBody = `# [cache-hook-repo] recent context, ${CONTEXT_HEADER_TIME_PLACEHOLDER}\n`
+  const cachedBody = 'Access Claude-Mem Rules + Tools: ~/.claude-mem/RULES-AND-TOOLS.md\n\n'
     + `- release: updated ${relativeTimePlaceholder(Date.now() - 2 * 3_600_000)} ago\n`;
 
   beforeEach(() => {
@@ -595,7 +696,7 @@ describe('context hook reads the precomputed block', () => {
     const result = await runHook();
     expect(workerCalls).toEqual([]);
     const additionalContext = result.hookSpecificOutput?.additionalContext ?? '';
-    expect(additionalContext).toStartWith('# [cache-hook-repo] recent context, ');
+    expect(additionalContext).toStartWith('Access Claude-Mem Rules + Tools: ');
     expect(additionalContext).toContain('- release: updated about 2 hours ago');
     expect(additionalContext).not.toContain(PLACEHOLDER_MARKER);
   });
@@ -625,12 +726,11 @@ describe('context hook reads the precomputed block', () => {
   it('skips the colored fetch too when that variant is cached', async () => {
     showTerminalOutput = true;
     writeContextCache(agentKeys, cachedBody, Date.now());
-    writeContextCache(colorKeys, `COLORED ${CONTEXT_HEADER_TIME_PLACEHOLDER}`, Date.now());
+    writeContextCache(colorKeys, `COLORED ${relativeTimePlaceholder(Date.now() - 60_000)} ago`, Date.now());
     const result = await runHook();
     expect(workerCalls).toEqual([]);
-    // The viewer lines open the banner; the timeline ends it.
-    expect(result.systemMessage).toStartWith('View Observations Live @');
-    expect(result.systemMessage).toMatch(/\n\nCOLORED [^\n]+$/);
+    // The timeline, then a blank line and the closing viewer line.
+    expect(result.systemMessage).toMatch(/COLORED [^\n]+\n\nView Observations Live @ [^\n]+$/);
     expect(result.systemMessage).not.toContain(PLACEHOLDER_MARKER);
   });
 
@@ -656,14 +756,13 @@ describe('context hook reads the precomputed block', () => {
   it('serves the cached model block wherever in the checkout the session starts', async () => {
     showTerminalOutput = true;
     writeContextCache(agentKeys, cachedBody, Date.now());
-    writeContextCache(colorKeys, `COLORED ${CONTEXT_HEADER_TIME_PLACEHOLDER}`, Date.now());
+    writeContextCache(colorKeys, `COLORED ${relativeTimePlaceholder(Date.now() - 60_000)} ago`, Date.now());
     const result = await runHook('/tmp/cache-hook-repo/packages/app');
     // The model's block does not depend on the directory. The colored one shows
     // file headings relative to it, so that one is fetched for the new directory.
     expect(workerCalls).toEqual(['/api/context/inject?projects=cache-hook-parent%2Ccache-hook-repo&platformSource=claude&cwd=%2Ftmp%2Fcache-hook-repo%2Fpackages%2Fapp&colors=true']);
     expect(result.hookSpecificOutput?.additionalContext).toContain('- release: updated about 2 hours ago');
-    expect(result.systemMessage).toStartWith('View Observations Live @');
-    expect(result.systemMessage).toEndWith('\n\nLIVE COLORED');
+    expect(result.systemMessage).toMatch(/LIVE COLORED\n\nView Observations Live @ [^\n]+$/);
   });
 
   it('fetches only the colored render when only the model block is cached', async () => {
@@ -671,8 +770,7 @@ describe('context hook reads the precomputed block', () => {
     writeContextCache(agentKeys, cachedBody, Date.now());
     const result = await runHook();
     expect(workerCalls).toEqual(['/api/context/inject?projects=cache-hook-parent%2Ccache-hook-repo&platformSource=claude&cwd=%2Ftmp%2Fcache-hook-repo&colors=true']);
-    expect(result.systemMessage).toStartWith('View Observations Live @');
-    expect(result.systemMessage).toEndWith('\n\nLIVE COLORED');
+    expect(result.systemMessage).toMatch(/LIVE COLORED\n\nView Observations Live @ [^\n]+$/);
   });
 });
 
@@ -787,12 +885,13 @@ const childScript = `
 `;
 
 describe('precomputed context end to end', () => {
-  it('fits a dynamic notice reserve with whole newest records and leaves the regular cache untouched', async () => {
+  let result: any;
+  beforeAll(async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'cmem-notice-budget-'));
     const hookCwd = mkdtempSync(join(tmpdir(), 'cmem-notice-project-'));
     try {
       writeFileSync(join(dataDir, 'settings.json'), JSON.stringify({
-        CLAUDE_MEM_CONTEXT_SHOW_TERMINAL_OUTPUT: 'false',
+        CLAUDE_MEM_CONTEXT_SHOW_TERMINAL_OUTPUT: 'true',
         CLAUDE_MEM_WORKER_PORT: '1',
         CLAUDE_MEM_PROVIDER: 'codex',
         CLAUDE_MEM_CHROMA_ENABLED: 'false',
@@ -808,89 +907,59 @@ describe('precomputed context end to end', () => {
       expect(await child.exited).toBe(0);
       const line = stdout.trim().split('\n').pop() ?? '';
       if (!line.startsWith('{')) throw new Error(stdout + stderr);
-      const { budgetResult } = JSON.parse(line);
-      expect(budgetResult.normal).toContain('RECORD_79_' + 'x'.repeat(350));
-      expect(budgetResult.reserved).toContain('RECORD_79_' + 'x'.repeat(350));
-      expect(budgetResult.reserved.length + 3000).toBeLessThanOrEqual(10_000);
-      expect(budgetResult.reserved.length).toBeLessThan(budgetResult.normal.length);
-      expect(budgetResult.cachedAfter).toBe(budgetResult.cachedBefore);
-      expect(budgetResult.coldBefore).toBeNull();
-      expect(budgetResult.coldWarmed).toContain('RECORD_79_' + 'x'.repeat(350));
-      expect(budgetResult.coldWarmed.length).toBeGreaterThan(budgetResult.coldReserved.length);
-      expect(budgetResult.coldAfterWrite).toContain('SECOND_OBSERVATION');
-      expect(budgetResult.reserved).not.toContain('Recent context omitted');
+      result = JSON.parse(line);
     } finally {
       rmSync(dataDir, { recursive: true, force: true });
       rmSync(hookCwd, { recursive: true, force: true });
     }
   }, 60_000);
 
-  it('serves exactly what the live route sends, and keeps it fresh', async () => {
-    const dataDir = mkdtempSync(join(tmpdir(), 'claude-mem-context-cache-e2e-'));
-    const hookCwd = mkdtempSync(join(tmpdir(), 'cmem-cache-e2e-project-'));
-    try {
-      writeFileSync(join(dataDir, 'settings.json'), JSON.stringify({
-        CLAUDE_MEM_CONTEXT_SHOW_TERMINAL_OUTPUT: 'true',
-        CLAUDE_MEM_WORKER_PORT: '1',
-        CLAUDE_MEM_PROVIDER: 'codex',
-        CLAUDE_MEM_CHROMA_ENABLED: 'false',
-        CLAUDE_MEM_MEMORY_INSTRUCTIONS_ENABLED: 'true',
-      }));
-      const child = Bun.spawn([process.execPath, '-e', childScript], {
-        cwd: process.cwd(),
-        env: { ...process.env, CLAUDE_MEM_DATA_DIR: dataDir, HOOK_CWD: hookCwd, DO_NOT_TRACK: '1' },
-        stdout: 'pipe',
-        stderr: 'pipe',
-      });
-      const [stdout, stderr] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text()]);
-      await child.exited;
-      const line = stdout.trim().split('\n').pop() ?? '';
-      if (!line.startsWith('{')) throw new Error(`child failed:\n${stdout}\n${stderr}`);
-      const result = JSON.parse(line);
+  it('fits a dynamic notice reserve with whole newest records and leaves the regular cache untouched', () => {
+    const { budgetResult } = result;
+    expect(budgetResult.normal).toContain('RECORD_79_' + 'x'.repeat(350));
+    expect(budgetResult.reserved).toContain('RECORD_79_' + 'x'.repeat(350));
+    expect(budgetResult.reserved.length + 3000).toBeLessThanOrEqual(10_000);
+    expect(budgetResult.reserved.length).toBeLessThan(budgetResult.normal.length);
+    expect(budgetResult.cachedAfter).toBe(budgetResult.cachedBefore);
+    expect(budgetResult.coldBefore).toBeNull();
+    expect(budgetResult.coldWarmed).toContain('RECORD_79_' + 'x'.repeat(350));
+    expect(budgetResult.coldWarmed.length).toBeGreaterThan(budgetResult.coldReserved.length);
+    expect(budgetResult.coldAfterWrite).toContain('SECOND_OBSERVATION');
+    expect(budgetResult.reserved).not.toContain('Recent context omitted');
+  });
 
-      // The live answer contains real content, and no placeholder ever leaves the worker.
-      expect(result.liveAgent).toContain('FIRST_OBSERVATION');
-      expect(result.liveAgent).toContain('updated about 2 hours ago');
-      for (const text of [result.liveAgent, result.liveColors, result.hookContext, result.hookSystemMessage]) {
-        expect(text).not.toContain(PLACEHOLDER_MARKER);
-      }
-      // The cached bodies carry placeholders where (and only where) time is formatted.
-      // (The child has its own placeholder nonce, so match the shape.)
-      expect(result.agentBody).toMatch(/⟦CMEM_NOW_HEADER:[0-9a-f]{12}⟧/);
-      expect(result.agentBody).toMatch(/⟦CMEM_AGO:[0-9a-f]{12}:\d{13}⟧/);
-      expect(result.colorBody).toMatch(/⟦CMEM_NOW_HEADER:[0-9a-f]{12}⟧/);
-      expect(result.agentRenderedAt).toBe(1_790_000_000_000);
-
-      // Byte-identical: cached body + fill == live render, agent and colors variants.
-      expect(result.filledAgent).toBe(result.liveAgent);
-      expect(result.filledColors).toBe(result.liveColors);
-
-      // The hook answered from the cache without any request to the worker.
-      expect(result.fetchCalls).toBe(0);
-      expect(result.hookContext).toBe(result.liveAgent.trim());
-      expect(result.hookContext).not.toContain(MEMORY_PLUGIN_INSTRUCTIONS);
-      expect(result.hookContext).not.toContain('# Work state: your to-do lists');
-      expect(result.hookSystemMessage).toStartWith('View Observations Live @');
-      expect(result.hookSystemMessage).toEndWith(result.liveColors.trim());
-      // The banner ends on its newest timeline row, with no closing lines.
-      expect(result.hookSystemMessage.split('\n').at(-1)).toContain('FIRST_OBSERVATION');
-      expect(result.hookSystemMessage).not.toContain('tokens of past research');
-
-      // The model's block is the timeline: the header says how to read it, the
-      // open work sits under that header, and the newest row ends the block so
-      // later rows can be appended to it.
-      const agent: string = result.liveAgent;
-      expect(agent).toStartWith('# [');
-      expect(agent.indexOf('Fetch details:')).toBeLessThan(agent.indexOf('Work state, still open:\n- release: status=active, updated about 2 hours ago'));
-      expect(agent.indexOf('Work state, still open:')).toBeLessThan(agent.indexOf('\n### '));
-      expect(agent.trimEnd()).toEndWith('FIRST_OBSERVATION');
-      expect(agent).not.toContain('tokens of past work');
-
-      // A store write re-rendered the cached block.
-      expect(result.agentAfterWrite).toContain('SECOND_OBSERVATION');
-    } finally {
-      rmSync(dataDir, { recursive: true, force: true });
-      rmSync(hookCwd, { recursive: true, force: true });
+  it('serves exactly what the live route sends, and keeps it fresh', () => {
+    // The live answer contains real content, and no placeholder ever leaves the worker.
+    expect(result.liveAgent).toContain('FIRST_OBSERVATION');
+    expect(result.liveAgent).toContain('updated about 2 hours ago');
+    for (const text of [result.liveAgent, result.liveColors, result.hookContext, result.hookSystemMessage]) {
+      expect(text).not.toContain(PLACEHOLDER_MARKER);
     }
-  }, 60_000);
+    // The cached bodies carry placeholders where (and only where) time is formatted.
+    // (The child has its own placeholder nonce, so match the shape.)
+    // The header has no time any more, so none carries its placeholder.
+    expect(result.agentBody).not.toContain('⟦CMEM_NOW_HEADER:');
+    expect(result.agentBody).toMatch(/⟦CMEM_AGO:[0-9a-f]{12}:\d{13}⟧/);
+    expect(result.colorBody).not.toContain('⟦CMEM_NOW_HEADER:');
+    expect(result.agentRenderedAt).toBe(1_790_000_000_000);
+
+    // Byte-identical: cached body + fill == live render, agent and colors variants.
+    expect(result.filledAgent).toBe(result.liveAgent);
+    expect(result.filledColors).toBe(result.liveColors);
+
+    // The hook answered from the cache without any request to the worker.
+    expect(result.fetchCalls).toBe(0);
+    expect(result.hookContext).toBe(result.liveAgent.trim());
+    expect(result.hookContext).not.toContain(MEMORY_PLUGIN_INSTRUCTIONS);
+    expect(result.hookContext).not.toContain('# Work state: your to-do lists');
+    // The newest timeline row, a blank line, then the closing viewer line with the row count.
+    const [bannerTimeline, bannerFooter] = result.hookSystemMessage.split(/\n\n(?=View Observations Live @)/);
+    expect(bannerTimeline).toEndWith(result.liveColors.trim());
+    expect(bannerTimeline.split('\n').at(-1)).toContain('FIRST_OBSERVATION');
+    expect(bannerFooter).toMatch(/^View Observations Live @ \S+ · 1 line$/);
+    expect(result.hookSystemMessage).not.toContain('tokens of past research');
+
+    // A store write re-rendered the cached block.
+    expect(result.agentAfterWrite).toContain('SECOND_OBSERVATION');
+  });
 });

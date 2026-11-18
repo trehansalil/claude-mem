@@ -34,6 +34,16 @@ describe('SettingsRoutes settings document writes', () => {
     return { server, url: `http://127.0.0.1:${address.port}/api/settings` };
   }
 
+  it('returns 400 when the request has no body', async () => {
+    const { server, url } = await startServer();
+    try {
+      const response = await fetch(url, { method: 'POST' });
+      expect(response.status).toBe(400);
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+  });
+
   it('updates nested env settings in place and preserves the document shape', async () => {
     writeFileSync(settingsPath, JSON.stringify({
       theme: 'dark',
@@ -96,50 +106,56 @@ describe('SettingsRoutes settings document writes', () => {
     }
   });
 
-  it('refuses and reports a corrupt settings.json without touching its bytes (worker path never quarantines)', async () => {
-    const corrupt = '{"CLAUDE_MEM_MODEL":"keep-me"';
-    writeFileSync(settingsPath, corrupt);
+  it('never sets, replaces or clears the local API token over HTTP, and masks it on GET (#5141)', async () => {
+    const token = 'local-api-token-abcdef123456';
+    writeFileSync(settingsPath, JSON.stringify({ theme: 'dark', CLAUDE_MEM_LOCAL_API_TOKEN: token }));
     const { server, url } = await startServer();
 
     try {
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ CLAUDE_MEM_MODEL: 'new-model' }),
-      });
-      expect(response.status).toBe(500);
-      expect(readFileSync(settingsPath, 'utf-8')).toBe(corrupt);
+      const masked = `${'*'.repeat(token.length - 4)}${token.slice(-4)}`;
+      for (const posted of ['attacker-chosen-token', '', masked]) {
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ CLAUDE_MEM_LOCAL_API_TOKEN: posted, CLAUDE_MEM_MODEL: 'new-model' }),
+        });
+        expect(response.status).toBe(200);
+        const written = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+        expect(written.CLAUDE_MEM_LOCAL_API_TOKEN).toBe(token);
+        expect(written.CLAUDE_MEM_MODEL).toBe('new-model');
+      }
+
+      const read = await fetch(url);
+      expect(read.status).toBe(200);
+      const body = await read.text();
+      expect(body).not.toContain(token);
+      expect(JSON.parse(body).CLAUDE_MEM_LOCAL_API_TOKEN).toBe(masked);
     } finally {
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     }
   });
 
-  it('keeps an object-valued flat env setting at the root', async () => {
-    const envValue = { enabled: true, sources: ['local'] };
-    writeFileSync(settingsPath, JSON.stringify({
-      env: envValue,
-      CLAUDE_MEM_MODEL: 'old-model',
-    }));
+  it('does not create an local API token on a settings file that has none', async () => {
+    writeFileSync(settingsPath, JSON.stringify({ theme: 'dark' }));
     const { server, url } = await startServer();
 
     try {
       const response = await fetch(url, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ CLAUDE_MEM_MODEL: 'new-model' }),
+        body: JSON.stringify({ CLAUDE_MEM_LOCAL_API_TOKEN: 'attacker-chosen-token' }),
       });
-
       expect(response.status).toBe(200);
-      const written = JSON.parse(readFileSync(settingsPath, 'utf-8'));
-      expect(written.env).toEqual(envValue);
-      expect(written.CLAUDE_MEM_MODEL).toBe('new-model');
+      expect(JSON.parse(readFileSync(settingsPath, 'utf-8')).CLAUDE_MEM_LOCAL_API_TOKEN).toBeUndefined();
     } finally {
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     }
   });
 
-  it('refuses a root array without replacing its bytes', async () => {
-    const original = '["sentinel"]';
+  it.each([
+    '{"CLAUDE_MEM_MODEL":"keep-me"',
+    '["sentinel"]',
+  ])('refuses invalid settings %s without touching its bytes (worker path never quarantines)', async (original) => {
     writeFileSync(settingsPath, original);
     const { server, url } = await startServer();
 

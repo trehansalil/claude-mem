@@ -15,44 +15,89 @@ export interface MinedGoalItem {
   quotes: Quote[]
 }
 
-const SORTING_LABEL = 'Sorting…'
+/**
+ * The words for a request that has no live area yet (no placement, or one in an area that is gone, dismissed or caught
+ * in a merge loop), until the next refresh places it: the area chip (components/bits.tsx FocusAreaChip) and every
+ * message that names where a request is (components/focus-change-message.ts) take them from here, in the reader's
+ * language. It read "Sorting…" here while the chip said "Not sorted yet" for the same case (Phase 5 review L7).
+ */
+export const NOT_SORTED_YET_LABEL = 'Not sorted yet'
 const OTHER_LABEL = 'Other'
 
 /** The owner's order first; areas they have not ordered follow by suggested priority, then by name. */
 export const byFocusPriority = (a: FocusArea, b: FocusArea) =>
   (a.ownerRank ?? Infinity) - (b.ownerRank ?? Infinity) || (a.priorityRank ?? Infinity) - (b.priorityRank ?? Infinity) || a.name.localeCompare(b.name)
 
+/**
+ * A suggested area asks the owner to keep or dismiss it, so its header (components/focus-header.tsx) holds the screen's
+ * one solid orange button, Keep (G1: one primary per screen). The one rule: the header draws Keep and Dismiss by it,
+ * and a focus page's summary (pages/my-work.tsx) asks it before giving Reply the orange.
+ */
+export const asksToKeepOrDismiss = (area: Pick<FocusArea, 'status'>) => area.status === 'suggested'
+
 /** An area a request can be moved into (the worker's isPlaceableArea): kept or suggested, not merged. */
 export const isPlaceableFocusArea = (area: FocusArea) => (area.status === 'kept' || area.status === 'suggested') && !area.mergedInto
 
 /**
  * The live area an id lands in, following merges (my-focus.mjs buildFocusAreas `resolve`). 'other' stays Other.
- * Null when the id is unknown, dismissed, or caught in a merge loop: the request then reads "Sorting…" until the
+ * Null when the id is unknown, dismissed, or caught in a merge loop: the request then reads "Not sorted yet" until the
  * next refresh places it, never a guessed area.
  */
-export function resolveFocusAreaId(focusAreaId: string | null | undefined, areas: readonly FocusArea[]): string | null {
-  if (!focusAreaId) return null
-  if (focusAreaId === OTHER_FOCUS_AREA_ID) return OTHER_FOCUS_AREA_ID
+export function createFocusAreaResolver(areas: readonly FocusArea[]): (focusAreaId: string | null | undefined) => string | null {
   const byId = new Map(areas.map((area) => [area.id, area]))
-  const seen = new Set<string>()
-  let area = byId.get(focusAreaId)
-  while (area?.mergedInto && byId.has(area.mergedInto) && !seen.has(area.mergedInto)) {
-    seen.add(area.id)
-    area = byId.get(area.mergedInto)
+  const resolved = new Map<string, string | null>()
+  return (focusAreaId) => {
+    if (!focusAreaId) return null
+    if (focusAreaId === OTHER_FOCUS_AREA_ID) return OTHER_FOCUS_AREA_ID
+    if (resolved.has(focusAreaId)) return resolved.get(focusAreaId)!
+    const seen = new Set<string>()
+    let id = focusAreaId
+    let result: string | null = null
+    while (!seen.has(id)) {
+      if (resolved.has(id)) { result = resolved.get(id)!; break }
+      seen.add(id)
+      const area = byId.get(id)
+      if (!area) break
+      if (!area.mergedInto) { result = area.status !== 'dismissed' ? area.id : null; break }
+      id = area.mergedInto
+    }
+    // Keep one lookup per placement or merge chain within this model, not one area map per request.
+    for (const visited of seen) resolved.set(visited, result)
+    return result
   }
-  return area && !area.mergedInto && area.status !== 'dismissed' ? area.id : null
 }
+
+export function resolveFocusAreaId(focusAreaId: string | null | undefined, areas: readonly FocusArea[]): string | null {
+  return createFocusAreaResolver(areas)(focusAreaId)
+}
+
+/**
+ * What a person decided on a Suggested card: kept it, merged it into another area, or dismissed it. The one definition:
+ * the page's words and looks are Records over it, and tests take the values from this list (in this order).
+ */
+export const SUGGESTION_DECISIONS = ['kept', 'merged', 'dismissed'] as const
+export type SuggestionDecision = (typeof SUGGESTION_DECISIONS)[number]
 
 /** What a Suggested card shows for an edit saved from its Rename / Merge dialog. A merge decides the suggestion: the card
  * says "Merged" and has its own Undo. A rename or a new goal leaves it undecided, so the shared change bar shows it,
  * with Undo back to the old name or goal. */
-export const suggestionEditDecision = (change: FocusChange): 'merged' | null => change.action === 'merge' ? 'merged' : null
+export const suggestionEditDecision = (change: FocusChange): Extract<SuggestionDecision, 'merged'> | null => change.action === 'merge' ? 'merged' : null
 
-/** What an area chip reads: the area's name, "Other", or "Sorting…" when the request has no placement yet. */
+/** What an area chip reads: the area's name, "Other", or "Not sorted yet" when the request has no placement yet. */
 export function focusAreaLabel(focusAreaId: string | undefined, areas: readonly FocusArea[]): string {
   const placed = resolveFocusAreaId(focusAreaId, areas)
   if (placed === OTHER_FOCUS_AREA_ID) return OTHER_LABEL
-  return areas.find((area) => area.id === placed)?.name ?? SORTING_LABEL
+  return areas.find((area) => area.id === placed)?.name ?? NOT_SORTED_YET_LABEL
+}
+
+/**
+ * A request's place as the screens word it (components/bits.tsx FocusAreaChip): its area's own name, or "Other" and
+ * "Not sorted yet" in the reader's language (`t`). A row that may cut the chip gives these whole words as its hover
+ * text (pages/my-work.tsx ListTableRow).
+ */
+export function focusAreaPlaceWords(focusAreaId: string | undefined, areas: readonly FocusArea[], t: (english: string) => string): string {
+  const placed = resolveFocusAreaId(focusAreaId, areas)
+  return placed === null ? t(NOT_SORTED_YET_LABEL) : placed === OTHER_FOCUS_AREA_ID ? t(OTHER_LABEL) : focusAreaLabel(focusAreaId, areas)
 }
 
 const toAsk = (item: MinedGoalItem): FocusAsk => ({ id: item.id, title: item.title, timesAsked: item.timesAsked, latestAt: item.latestAt, quotes: item.quotes })
@@ -67,14 +112,16 @@ const newerStamp = (a: string, b: string) => (a > b ? a : b)
  */
 export function toFocusModel(raw: readonly WorkViewFocusArea[] | undefined, minedAreas: readonly MinedGoalItem[], minedAsks: readonly MinedGoalItem[]): { focusAreas: FocusArea[]; otherAsks: FocusAsk[] } {
   const areas: FocusArea[] = (raw ?? []).map((area) => ({
-    id: area.focusAreaId, name: area.name, goal: area.goal, status: area.status,
+    id: area.focusAreaId, name: area.name, goal: area.goal, about: area.about ?? null, status: area.status,
     ownerRank: area.ownerRank, priorityRank: area.priorityRank, source: area.source,
-    mergedInto: area.mergedInto, evidence: area.evidence,
+    mergedInto: area.mergedInto, evidence: area.evidence, doneAt: area.doneAt ?? null,
     timesAsked: null, latestAt: null, quotes: [], asks: [],
   })).sort(byFocusPriority)
+  const resolveArea = createFocusAreaResolver(areas)
+  const byId = new Map(areas.map((area) => [area.id, area]))
   const liveArea = (focusAreaId: string | null) => {
-    const placed = resolveFocusAreaId(focusAreaId, areas)
-    return placed && placed !== OTHER_FOCUS_AREA_ID ? areas.find((entry) => entry.id === placed) : undefined
+    const placed = resolveArea(focusAreaId)
+    return placed && placed !== OTHER_FOCUS_AREA_ID ? byId.get(placed) : undefined
   }
   for (const item of minedAreas) {
     const area = liveArea(item.focusAreaId)

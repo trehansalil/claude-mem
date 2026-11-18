@@ -1,5 +1,6 @@
-import { existsSync, readdirSync, rmSync, statSync } from 'fs';
-import { basename, isAbsolute, join, relative, sep } from 'path';
+import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, rmSync, statSync } from 'fs';
+import { rm } from 'fs/promises';
+import path, { basename, isAbsolute, join, relative, resolve, sep } from 'path';
 import { installedPluginsPath, pluginCacheRootDirectory } from './paths.js';
 import {
   cacheWorkerScriptCandidates,
@@ -9,7 +10,8 @@ import {
   workerHttpRequest,
   type WorkerScriptCandidate,
 } from '../../shared/worker-utils.js';
-import { readOwnedWorkerPidInfo } from '../../supervisor/process-registry.js';
+import { isPidAlive, readOwnedWorkerPidInfo } from '../../supervisor/process-registry.js';
+import { captureProcessStartToken, isSameProcessStartToken, isUtcPinnedStartToken } from '../../shared/process-identity.js';
 import { readClaudeMemRegistrationEntries, readUserScopeClaudeMemInstallPaths, registeredInstallPathsOf } from '../../shared/claude-code-plugin-paths.js';
 
 /**
@@ -17,13 +19,24 @@ import { readClaudeMemRegistrationEntries, readUserScopeClaudeMemInstallPaths, r
  * previous one (N-1). Everything older is a superseded worker source that
  * nothing resolves to any more, so it only wastes disk and stays a runnable
  * old-version worker (the mechanism behind #3736 and #3446). See #4105.
+ * Claude Code's marketplace update writes the next folder itself and never
+ * runs that copy, so the worker sweeps the same cache (#5681).
  */
 export const DEFAULT_CACHE_RETENTION = 2;
 
-/** A cache directory name is a version when it starts with a digit — the same
- * filter the worker-script resolver uses (cacheWorkerScriptCandidates). */
+/** How long the worker waits after boot before the first cache sweep, and how
+ * often it repeats. A daemon stays up across later marketplace updates. */
+export const PLUGIN_CACHE_PRUNE_FIRST_DELAY_MS = 5 * 60_000;
+export const PLUGIN_CACHE_PRUNE_INTERVAL_MS = 60 * 60 * 1000;
+
+/** A release folder name: 15.15.1 or 15.15.1-beta.1. Same shape as
+ * INSTALLED_VERSION_PATTERN, kept local so this module does not import the
+ * auto-update checker. Anything else under the cache (notes, another tool)
+ * is left alone. */
+const VERSION_DIRECTORY_NAME = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+
 function isVersionDirectoryName(name: string): boolean {
-  return /^\d/.test(name);
+  return VERSION_DIRECTORY_NAME.test(name);
 }
 
 /** True when a cache version directory carries Claude Code's `.orphaned_at`
@@ -123,6 +136,77 @@ function cacheVersionContaining(root: string, filePath: string): string | null {
   return isVersionDirectoryName(versionDirectory) ? versionDirectory : null;
 }
 
+type PathApi = {
+  relative: (from: string, to: string) => string;
+  isAbsolute: (filePath: string) => boolean;
+  sep: string;
+};
+
+/** True when `target` is exactly one path segment inside `root`. */
+export function isDirectChildPath(root: string, target: string, pathApi: PathApi = path): boolean {
+  const rel = pathApi.relative(root, target);
+  if (rel === '' || rel === '.') return false;
+  if (pathApi.isAbsolute(rel)) return false;
+  if (rel === '..' || rel.startsWith(`..${pathApi.sep}`) || rel.startsWith('../')) return false;
+  return !rel.includes(pathApi.sep) && !rel.includes('/');
+}
+
+function canonicalPath(filePath: string): string {
+  const resolved = resolve(filePath);
+  try {
+    return realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
+/**
+ * The cache version `scriptPath` is running from, after resolving symlinks
+ * (macOS /tmp is /private/tmp). Null when the script is not inside this cache.
+ */
+export function cacheVersionOfScript(cacheRoot: string, scriptPath: string): string | null {
+  return cacheVersionContaining(canonicalPath(cacheRoot), canonicalPath(scriptPath));
+}
+
+function pathIsInside(parent: string, child: string): boolean {
+  const rel = relative(canonicalPath(parent), canonicalPath(child));
+  return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !rel.startsWith('../') && !isAbsolute(rel));
+}
+
+/**
+ * Directory we are willing to delete for `version`, or null.
+ * A symlink is the link itself, so unlinking it leaves the target in place.
+ * A real directory is returned only when its resolved path is still that
+ * one child of the cache root.
+ */
+export function versionDirectoryForRemoval(root: string, version: string): string | null {
+  if (!isVersionDirectoryName(version)) return null;
+  let rootReal: string;
+  try {
+    rootReal = realpathSync(resolve(root));
+  } catch {
+    return null;
+  }
+  const candidate = resolve(rootReal, version);
+  if (!isDirectChildPath(rootReal, candidate)) return null;
+  let info;
+  try {
+    info = lstatSync(candidate);
+  } catch {
+    return null;
+  }
+  if (info.isSymbolicLink()) return candidate;
+  if (!info.isDirectory()) return null;
+  let targetReal: string;
+  try {
+    targetReal = realpathSync(candidate);
+  } catch {
+    return null;
+  }
+  if (!isDirectChildPath(rootReal, targetReal)) return null;
+  return candidate;
+}
+
 /**
  * Cache versions a prune must keep so the install still has a worker to run.
  * Retention counts versions, not working ones, and the installer prunes right
@@ -146,9 +230,121 @@ export function workingCacheVersions(
   return [...versions];
 }
 
+/** A process Claude Code recorded as loaded from a cache version folder. */
+export interface HostInUseRecord {
+  pid: number;
+  /** The process start time as Claude Code wrote it, when the record has one. */
+  procStart?: string;
+}
+
+/** How a recorded host process is checked. Injectable so every platform's
+ * branch can be tested on one machine. */
+export interface HostProcessProbe {
+  isAlive: (pid: number) => boolean;
+  /** The process's current start token, or null when it cannot be read. */
+  startToken: (pid: number) => string | null;
+}
+
+const defaultHostProcessProbe: HostProcessProbe = {
+  isAlive: isPidAlive,
+  // The Windows read shells to PowerShell and its token has another shape, so
+  // it could never be compared with a recorded start time anyway.
+  startToken: pid => (process.platform === 'win32' ? null : captureProcessStartToken(pid)),
+};
+
+/** Claude Code's per-version folder of `<pid>` records. */
+const HOST_IN_USE_DIRECTORY = '.in_use';
+
+/** `ps lstart`: `EEE MMM d HH:mm:ss yyyy`, the shape Claude Code records on macOS. */
+const LSTART_SHAPE = /^[A-Za-z]{3}\s+[A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4}$/;
+
+/**
+ * The processes Claude Code recorded under `<versionDirectory>/.in_use`. Each
+ * file is named after a PID and holds `{"pid":…,"procStart":"…"}`. A file that
+ * cannot be parsed still names its process, so the PID in the file name is
+ * used. An entry that names no PID is skipped.
+ */
+export function readHostInUseRecords(versionDirectory: string): HostInUseRecord[] {
+  const inUseDirectory = join(versionDirectory, HOST_IN_USE_DIRECTORY);
+  let entryNames: string[];
+  try {
+    entryNames = readdirSync(inUseDirectory);
+  } catch {
+    return [];
+  }
+  const records: HostInUseRecord[] = [];
+  for (const entryName of entryNames) {
+    let pid = /^\d+$/.test(entryName) ? Number(entryName) : null;
+    let procStart: string | undefined;
+    try {
+      const parsed = JSON.parse(readFileSync(join(inUseDirectory, entryName), 'utf-8')) as { pid?: unknown; procStart?: unknown } | null;
+      if (typeof parsed?.pid === 'number' && Number.isInteger(parsed.pid)) pid = parsed.pid;
+      if (typeof parsed?.procStart === 'string' && parsed.procStart.trim()) procStart = parsed.procStart.trim();
+    } catch {
+      // Unreadable or not JSON: fall back to the PID in the file name.
+    }
+    if (pid !== null && pid > 0) records.push(procStart ? { pid, procStart } : { pid });
+  }
+  return records;
+}
+
+/**
+ * True when the recorded process is still running. A dead PID is not. A live
+ * PID counts unless its start time proves the PID was reused, and that is
+ * provable only where both readings are `ps lstart` (macOS/BSD). Any other
+ * record keeps the folder: deleting it costs a session its hooks, keeping it
+ * costs disk until the next sweep.
+ */
+export function isHostProcessLive(record: HostInUseRecord, probe: HostProcessProbe = defaultHostProcessProbe): boolean {
+  if (!probe.isAlive(record.pid)) return false;
+  if (!record.procStart || !LSTART_SHAPE.test(record.procStart)) return true;
+  const currentToken = probe.startToken(record.pid);
+  if (currentToken === null || !isUtcPinnedStartToken(currentToken)) return true;
+  return isSameProcessStartToken(currentToken, record.procStart);
+}
+
+/** A probe that reads each PID once. One process is recorded under every
+ * version it loaded, and the macOS/BSD start-time read is a blocking `ps`. */
+function readOncePerPid(probe: HostProcessProbe): HostProcessProbe {
+  const alive = new Map<number, boolean>();
+  const startTokens = new Map<number, string | null>();
+  return {
+    isAlive: pid => {
+      if (!alive.has(pid)) alive.set(pid, probe.isAlive(pid));
+      return alive.get(pid)!;
+    },
+    startToken: pid => {
+      if (!startTokens.has(pid)) startTokens.set(pid, probe.startToken(pid));
+      return startTokens.get(pid)!;
+    },
+  };
+}
+
+/**
+ * Cache versions a running host session is still loaded from. Claude Code
+ * keeps a session on the version folder it started with after an update and
+ * refuses to run that session's hooks once the folder is gone ("Plugin
+ * directory does not exist"), so capture stops for the rest of the session
+ * with nothing shown to the user (#5970). A version is kept while any process
+ * recorded in its `.in_use` folder is alive, orphaned or not. Once they have
+ * all exited the next sweep removes it. Each recorded process is read once per
+ * call, however many versions record it.
+ */
+export function hostInUseCacheVersions(
+  root: string,
+  versionDirectoryNames: string[] = readCacheVersionDirectories(root),
+  probe: HostProcessProbe = defaultHostProcessProbe,
+): string[] {
+  const sweepProbe = readOncePerPid(probe);
+  return versionDirectoryNames.filter(name =>
+    isVersionDirectoryName(name)
+    && readHostInUseRecords(join(root, name)).some(record => isHostProcessLive(record, sweepProbe)));
+}
+
 /** Read the version names and their `.orphaned_at` state, then plan the prune.
  * Read-only — use for a dry-run preview that matches what `prunePluginCache`
- * would delete. The working versions (workingCacheVersions) are always kept. */
+ * would delete. The working versions (workingCacheVersions) and the versions a
+ * running host session is loaded from (hostInUseCacheVersions) are always kept. */
 export function planPluginCachePrune(
   root: string,
   keepCount: number,
@@ -157,7 +353,7 @@ export function planPluginCachePrune(
   const names = readCacheVersionDirectories(root);
   const orphanedVersions = names.filter(name => isVersionDirectoryName(name) && isOrphanedVersion(root, name));
   return planCachePrune(names, keepCount, {
-    protectedVersions: [...protectedVersions, ...workingCacheVersions(root)],
+    protectedVersions: [...protectedVersions, ...workingCacheVersions(root), ...hostInUseCacheVersions(root, names)],
     orphanedVersions,
   });
 }
@@ -180,8 +376,72 @@ export function prunePluginCache(options: PrunePluginCacheOptions = {}): CachePr
   const removed: string[] = [];
   const failed: { version: string; reason: string }[] = [];
   for (const version of prune) {
+    const directory = versionDirectoryForRemoval(root, version);
+    if (!directory) {
+      if (existsSync(join(root, version))) {
+        failed.push({ version, reason: 'skipped: not a version directory inside the plugin cache' });
+      }
+      continue;
+    }
     try {
-      rmSync(join(root, version), { recursive: true, force: true });
+      rmSync(directory, { recursive: true, force: true });
+      removed.push(version);
+    } catch (error: unknown) {
+      failed.push({ version, reason: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  return { root, kept: keep, removed, failed, retainedForLiveWorker: false };
+}
+
+export interface PruneSupersededPluginCacheOptions {
+  cacheRoot?: string;
+  keepCount?: number;
+  /** Script or directory this process is running from. That version folder is never deleted. */
+  runningScriptPath?: string;
+  /** Extra version names to keep, such as the worker's own package version. */
+  additionalProtectedVersions?: Iterable<string>;
+  /** installed_plugins.json. Defaults to Claude Code's registry. */
+  registryPath?: string;
+}
+
+/**
+ * Remove superseded plugin cache versions without asking the live worker.
+ * The worker calls this on itself: a health probe against its own port can
+ * time out during boot and then retain every folder (#5681). The running
+ * script's folder is protected instead, along with whatever
+ * installed_plugins.json registers. A corrupt registry throws before any
+ * delete. A missing cache root removes nothing.
+ */
+export async function pruneSupersededPluginCache(
+  options: PruneSupersededPluginCacheOptions = {},
+): Promise<CachePruneResult> {
+  const root = options.cacheRoot ?? pluginCacheRootDirectory();
+  const keepCount = options.keepCount ?? DEFAULT_CACHE_RETENTION;
+  const registered = readRegisteredCacheVersions(options.registryPath);
+  const runningVersion = options.runningScriptPath ? cacheVersionOfScript(root, options.runningScriptPath) : null;
+  const protectedVersions = [
+    ...(runningVersion ? [runningVersion] : []),
+    ...registered,
+    ...(options.additionalProtectedVersions ?? []),
+  ];
+
+  const { keep, prune } = planPluginCachePrune(root, keepCount, protectedVersions);
+  const removed: string[] = [];
+  const failed: { version: string; reason: string }[] = [];
+  for (const version of prune) {
+    const directory = versionDirectoryForRemoval(root, version);
+    if (!directory) {
+      if (existsSync(join(root, version))) {
+        failed.push({ version, reason: 'skipped: not a version directory inside the plugin cache' });
+      }
+      continue;
+    }
+    if (options.runningScriptPath && pathIsInside(directory, options.runningScriptPath)) {
+      failed.push({ version, reason: 'skipped: this is the running worker directory' });
+      continue;
+    }
+    try {
+      await rm(directory, { recursive: true, force: true });
       removed.push(version);
     } catch (error: unknown) {
       failed.push({ version, reason: error instanceof Error ? error.message : String(error) });

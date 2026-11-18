@@ -2,19 +2,22 @@
 // tool call establishes its author, never the assignee or live presence.
 import { buildHumanRequests } from './request-projection.mjs';
 import { goalKindOf, OWNER_GOALS_LIST, isOwnerGoalsList } from './owner-goals.mjs';
-import { buildRules, isMyRulesList } from './my-rules.mjs';
-import { buildFocusAreas, isMyFocusList, placeRequests } from './my-focus.mjs';
+import { buildRules } from './my-rules.mjs';
+import { buildFocusAreas, placeRequests } from './my-focus.mjs';
 import { isWorkProductField, productsFromFields, readProductRecords } from './work-product.mjs';
-import { agentStopFor, isAgentLifecycleList, readAgentStops } from './agent-lifecycle.mjs';
+import { agentStopFor, readAgentStops } from './agent-lifecycle.mjs';
 import { withDerivedProjects } from './session-project.mjs';
 import { observationMediaFromMetadata } from '../media/feed.js';
+import { appliedLabel, workStateItems } from './work-state-labels.mjs';
 const PROJECT_KEY = (value) => String(value ?? '').replace(/[A-Z]/g, (c) => c.toLowerCase());
-const CLOSED = new Set(['done', 'dropped', 'completed', 'failed']);
-const PLATFORMS = { codex: 'Codex', claude: 'Claude Code', 'gemini-cli': 'Gemini CLI', 'antigravity-cli': 'Antigravity CLI', kimi: 'Kimi', 'hermes-cli': 'Hermes', 'pi-agent': 'Pi' };
+// Live Gemini CLI hooks record `gemini`; the Gemini CLI importer records `gemini-cli`. Both are one host.
+const PLATFORMS = { codex: 'Codex', claude: 'Claude Code', gemini: 'Gemini CLI', 'gemini-cli': 'Gemini CLI', 'antigravity-cli': 'Antigravity CLI', kimi: 'Kimi', 'hermes-cli': 'Hermes', 'pi-agent': 'Pi' };
+export const platformLabel = (platform) => PLATFORMS[platform] ?? compactText(platform, 48) ?? 'Unassigned';
 const stamp = (value) => Number.isFinite(Number(value)) && Number(value) > 0 ? new Date(Number(value)).toISOString() : null;
 const fingerprint = (value) => JSON.stringify(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)));
 const callKey = (project, list, fields) => JSON.stringify([PROJECT_KEY(project), list, fingerprint(fields)]);
 const agentKey = (platform, session, agent) => JSON.stringify(['session', platform ?? 'unknown', String(session ?? ''), agent ?? 'unidentified']);
+const lifecycleKey = (platform, session, agent) => JSON.stringify([platform ?? null, session, agent]);
 
 export function compactText(value, max = 260) {
   if (typeof value !== 'string' && typeof value !== 'number' && typeof value !== 'boolean') return null;
@@ -127,7 +130,13 @@ export function readAgentRecords(database, { observationLimit = 300, summaryLimi
   // (and, for a foreground agent, returned when it finished), and the time of
   // each subagent's latest captured tool call.
   // Only conversations whose loaded records include a subagent need it.
-  const contentIds = [...new Set([...observations, ...calls].filter((row) => row.agent_id && row.content_session_id).map((row) => row.content_session_id))];
+  // Current observations link through memory_session_id, not the optional
+  // legacy content_session_id column. Their loaded parent sessions supply it.
+  const subagentMemoryIds = new Set(observations.filter((row) => row.agent_id && row.memory_session_id).map((row) => row.memory_session_id));
+  const contentIds = [...new Set([
+    ...[...observations, ...calls].filter((row) => row.agent_id && row.content_session_id).map((row) => row.content_session_id),
+    ...sessions.filter((session) => subagentMemoryIds.has(session.memory_session_id) && session.content_session_id).map((session) => session.content_session_id),
+  ])];
   const contentArgs = contentIds.map(() => '?').join(', ');
   // Fields are pulled out in SQL: a launch response embeds the whole prompt,
   // so a truncated copy would not parse.
@@ -138,12 +147,12 @@ export function readAgentRecords(database, { observationLimit = 300, summaryLimi
     substr(coalesce(json_extract(tool_input, '$.prompt'), json_extract(tool_response, '$.prompt')), 1, 600) AS prompt
     FROM tool_uses WHERE tool_name IN ('Agent', 'Task') AND json_valid(tool_response) AND json_valid(coalesce(tool_input, '{}'))
     AND content_session_id IN (${contentArgs}) ORDER BY id DESC LIMIT 2000`, contentIds) : [];
-  const agentToolActivity = contentIds.length ? safeRead(database, `SELECT content_session_id, agent_id, MAX(created_at_epoch) AS last_epoch
-    FROM tool_uses WHERE agent_id IS NOT NULL AND content_session_id IN (${contentArgs}) GROUP BY content_session_id, agent_id`, contentIds) : [];
+  const agentToolActivity = contentIds.length ? safeRead(database, `SELECT platform_source, content_session_id, agent_id, MAX(created_at_epoch) AS last_epoch
+    FROM tool_uses WHERE agent_id IS NOT NULL AND content_session_id IN (${contentArgs}) GROUP BY platform_source, content_session_id, agent_id`, contentIds) : [];
   return { calls, observations, summaries, sessions, prompts, productCalls, productObservations, productDeliverables, agentLaunches, agentToolActivity };
 }
 
-// The parent's Agent (formerly Task) calls, by [content session, agent id].
+// The parent's Agent (formerly Task) calls, by [platform, content session, agent id].
 // A foreground call's PostToolUse fires when the subagent returns, so its row
 // is a recorded finish; an async launch only says the subagent started.
 export function readAgentLaunches(rows) {
@@ -151,7 +160,7 @@ export function readAgentLaunches(rows) {
   for (const row of rows) {
     const agentId = typeof row.agent_id === 'string' && row.agent_id ? row.agent_id : null;
     if (!agentId || !row.content_session_id) continue;
-    const key = JSON.stringify([row.content_session_id, agentId]);
+    const key = lifecycleKey(row.platform_source, row.content_session_id, agentId);
     if (launches.has(key)) continue;
     const isAsync = row.is_async === 1 || row.is_async === true || row.status === 'async_launched';
     launches.set(key, {
@@ -170,10 +179,10 @@ function launchRequest(launch) {
   return text ? { text, source: 'agent-launch', sourceId: launch.shared ? null : launch.toolUseId, url: launch.shared ? null : `/api/work-view/evidence/tool-use/${launch.toolUseId}` } : null;
 }
 
-export function buildAgentView(state, records, { now = Date.now(), workLimit = 240, activityLimit = 160, recentMs = 15 * 60 * 1000, titleCache = {}, ledger = null } = {}) {
+export function buildAgentView(state, records, { now = Date.now(), workLimit = 240, activityLimit = 160, recentMs = 15 * 60 * 1000, titleCache = {}, ledger = null, onProductFile = null, workStateLabels = null } = {}) {
   const { calls = [], observations = [], summaries = [], sessions = [], prompts = [], agentLaunches = [], agentToolActivity = [] } = records;
   const launches = readAgentLaunches(agentLaunches);
-  const lastToolEpochs = new Map(agentToolActivity.map((row) => [JSON.stringify([row.content_session_id, row.agent_id]), Number(row.last_epoch) || 0]));
+  const lastToolEpochs = new Map(agentToolActivity.map((row) => [lifecycleKey(row.platform_source, row.content_session_id, row.agent_id), Number(row.last_epoch) || 0]));
   const stops = readAgentStops(state);
   const sessionsById = new Map(sessions.map((session) => [session.id, session]));
   const sessionsByMemory = new Map(sessions.filter((session) => session.memory_session_id).map((session) => [session.memory_session_id, session]));
@@ -254,10 +263,10 @@ export function buildAgentView(state, records, { now = Date.now(), workLimit = 2
     const platform = session?.platform_source ?? null;
     const id = session ? agentKey(platform, session.id, agentId) : JSON.stringify([owner ? 'owner' : 'unassigned', PROJECT_KEY(project), owner, agentId]);
     if (!groups.has(id)) {
-      const platformLabel = PLATFORMS[platform] ?? compactText(platform, 48) ?? 'Unassigned';
+      const label = platformLabel(platform);
       groups.set(id, {
         id, kind: session ? 'session' : owner ? 'recorded-owner' : 'unassigned',
-        label: session ? platformLabel : owner ? compactText(owner, 70) : 'Unassigned work',
+        label: session ? label : owner ? compactText(owner, 70) : 'Unassigned work',
         platformSource: platform, agentId, agentType,
         sessionId: session?.id ?? null, contentSessionId: session?.content_session_id ?? null,
         sessionTitle: compactText(session?.custom_title, 120), recordedSessionStatus: session?.status ?? null,
@@ -269,7 +278,7 @@ export function buildAgentView(state, records, { now = Date.now(), workLimit = 2
         // sets agent_id only inside a subagent; other hosts (Codex) also tag
         // the main thread, so their groups keep the per-prompt layout.
         isSubagent: Boolean(session && agentId && platform === 'claude'),
-        launch: session && agentId ? launches.get(JSON.stringify([session.content_session_id, agentId])) ?? null : null,
+        launch: session && agentId ? launches.get(lifecycleKey(platform, session.content_session_id, agentId)) ?? null : null,
         work: [], activity: [], lastActivityEpoch: 0,
       });
     }
@@ -297,10 +306,7 @@ export function buildAgentView(state, records, { now = Date.now(), workLimit = 2
     activity.push({ ...entry, agentGroupId: group.id });
   }
 
-  const candidates = state.lists.filter((list) => !isOwnerGoalsList(list.name) && !isMyRulesList(list.name) && !isMyFocusList(list.name) && !isAgentLifecycleList(list.name)).flatMap((list) => [
-    ...list.tasks.map((task) => ({ ...task, list, recordKind: 'task' })),
-    ...(Object.keys(list.fields).some((key) => key !== 'task') ? [{ id: list.id, name: list.name, fields: list.fields, status: list.status, isOpen: !CLOSED.has(list.status), updatedAtEpoch: list.stateUpdatedAtEpoch, latestEntryId: state.events.find((event) => event.listId === list.id && event.task === null)?.id ?? 0, list, recordKind: 'list' }] : []),
-  ]).sort((a, b) => b.updatedAtEpoch - a.updatedAtEpoch).slice(0, workLimit);
+  const candidates = workStateItems(state).sort((a, b) => b.updatedAtEpoch - a.updatedAtEpoch).slice(0, workLimit);
 
   function uniqueCall(event) {
     const matches = (callsByKey.get(callKey(event.originProject ?? event.project, event.listName, event.fields)) ?? [])
@@ -332,13 +338,18 @@ export function buildAgentView(state, records, { now = Date.now(), workLimit = 2
     const explicitRequest = fieldText(item.fields, ['request', 'human_request', 'user_request'], 500);
     const requestKey = confirmedRequestKey(session, call?.prompt_number);
     const request = { ...(explicitRequest ?? requestFor(session, call?.prompt_number) ?? { text: compactText(item.name, 500), source: item.recordKind === 'task' ? 'task-label' : 'list-label', sourceId: item.id, url: null }), key: requestKey };
-    const next = fieldText(item.fields, ['next_step', 'nextStep', 'next', 'next_action', 'remaining', 'pending', 'then_run']);
-    const outcome = fieldText(item.fields, ['outcome', 'result', 'completed', 'verified', 'verification']);
+    // Jev's label (work-state-labels.mjs) names the field an agent used when none of the usual names holds it,
+    // and the state its notes describe when the recorded status is a claim a quiet agent left behind.
+    const labeled = appliedLabel(item, workStateLabels?.labels);
+    const jevField = (name) => { const found = name ? fieldText(item.fields, [name]) : null; return found ? { ...found, pickedBy: 'jev' } : null; };
+    const next = fieldText(item.fields, ['next_step', 'nextStep', 'next', 'next_action', 'remaining', 'pending', 'then_run']) ?? jevField(labeled.nextField);
+    const outcome = fieldText(item.fields, ['outcome', 'result', 'completed', 'verified', 'verification']) ?? jevField(labeled.resultField);
     const progress = fieldText(item.fields, ['human_summary', 'summary', 'progress', 'phase', 'stage', 'status_note']);
     const entry = {
       id: item.id, kind: 'work-state', recordKind: item.recordKind, title: compactText(item.name, 160),
       project: item.list.project, listId: item.list.id, listName: item.list.name, taskId: item.recordKind === 'task' ? item.id : null,
       status: item.status, statusExplicit: Object.hasOwn(item.fields, 'status'), isOpen: item.isOpen, request, nextStep: next, outcome, progress, owner,
+      judgedStatus: labeled.judgedStatus, judgment: labeled.label ? { state: labeled.label.state, probability: labeled.label.stateP, model: labeled.label.model, at: labeled.label.at } : null,
       requestId: ['string', 'number'].includes(typeof (item.fields.request_id ?? item.list.fields.request_id)) ? String(item.fields.request_id ?? item.list.fields.request_id).trim() || null : null,
       requestText: fieldText(item.fields, ['human_request', 'request', 'user_request'], 1200)?.text ?? fieldText(item.list.fields, ['human_request', 'request', 'user_request'], 1200)?.text ?? null,
       requestStatus: typeof (item.fields.request_status ?? item.list.fields.request_status) === 'string' ? (item.fields.request_status ?? item.list.fields.request_status) : null,
@@ -413,7 +424,7 @@ export function buildAgentView(state, records, { now = Date.now(), workLimit = 2
   // conversation ended.) Any captured
   // tool call or observation after that evidence means the agent resumed.
   function subagentFinish(group) {
-    const lastToolEpoch = lastToolEpochs.get(JSON.stringify([group.contentSessionId, group.agentId])) ?? 0;
+    const lastToolEpoch = lastToolEpochs.get(lifecycleKey(group.platformSource, group.contentSessionId, group.agentId)) ?? 0;
     const lastActive = Math.max(group.lastActivityEpoch, lastToolEpoch);
     const evidence = [];
     const stop = agentStopFor(stops, group.platformSource, group.contentSessionId, group.agentId);
@@ -440,7 +451,7 @@ export function buildAgentView(state, records, { now = Date.now(), workLimit = 2
     };
   }).sort((a, b) => String(b.presence.lastActivityAt ?? '').localeCompare(String(a.presence.lastActivityAt ?? '')));
   const recentActivity = activity.sort((a, b) => b.atEpoch - a.atEpoch).slice(0, activityLimit);
-  const requestProjection = buildHumanRequests({ agents, recentActivity }, records, { titleCache, ledger });
+  const requestProjection = buildHumanRequests({ agents, recentActivity }, records, { titleCache, ledger, onProductFile });
   const { focusAreas, focusAreaIdByAnchor } = buildFocusAreas(state);
   return {
     version: 1, generatedAt: stamp(now), currentProject: state.currentProject, currentProjectScope: state.currentProjectScope,

@@ -1,7 +1,7 @@
 import type express from 'express';
 import type { Request, Response, NextFunction } from 'express';
-import { createHash, randomBytes } from 'node:crypto';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from 'node:fs';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, extname, join } from 'node:path';
 import { z } from 'zod';
@@ -18,8 +18,10 @@ import type { ViewerSyncStatus } from '../../../../shared/viewer-sync-status.js'
 import { workViewOverview, workViewRequestDetail } from '../../../work-view/overview.js';
 import { FILE_CONTENT_TYPES } from '../../../work-view/work-product.mjs';
 import { isInsideDeliverablesDir } from '../../../../shared/deliverables.js';
-import { contentFingerprint, LocalReviewStore } from '../../../work-view/review-store.js';
+import { contentFingerprint, priorContentFingerprint, LocalReviewStore } from '../../../work-view/review-store.js';
 import { MY_RULES_LIST, renderRulesFile, ruleRowFields, type SavedRule } from '../../../work-view/my-rules.mjs';
+import { claudeCodeImportLine, hasImportLine, homeRelativePath, RULES_AND_TOOLS_FILENAME } from '../../../../shared/claude-code-rules-import.js';
+import { ensureRulesAndToolsFile } from '../../../context/RulesAndToolsFile.js';
 import { focusAreaRowFields, MY_FOCUS_LIST, navWordIn, OTHER_FOCUS_AREA_ID, ownerGoalsAreaRows, placementRowFields, PROPOSAL_KINDS, readFocus, routerFocusRows, seedFocusRows, seedUndoRows, type FocusArea, type RouterFocusBody } from '../../../work-view/my-focus.mjs';
 import { MAX_WORK_STATE_FIELDS_JSON_CHARS } from '../../../work-view/work-state-limits.mjs';
 import { AGENT_LIFECYCLE_LIST, agentStopFields } from '../../../work-view/agent-lifecycle.mjs';
@@ -35,9 +37,13 @@ import { FocusShareError, FocusShares } from '../../../work-view/focus-share.js'
 import { FocusSharePublisher } from '../../../work-view/focus-share-publisher.js';
 import { cmemProOrigin } from '../../../../shared/cmem-gateway.js';
 import { isOpenRouterApiUrl } from '../../../../shared/openrouter-base-url.js';
+import { FOCUS_CHANGED_MESSAGE, focusChangeVersion } from '../../../../shared/focus-change-version.js';
+import { REFRESH_START_REFUSAL } from '../../../../shared/work-view-refresh-reasons.js';
 import { runAgentTask } from '../../../agent-runner/run.js';
 import { ledgerSignature, readLedger } from '../../../work-view/request-groups.mjs';
-import { configuredJudge, decideSuggestion } from '../../../work-view/request-judge.mjs';
+import { configuredJudge, decideSuggestion, jevClientFromSettings } from '../../../work-view/request-judge.mjs';
+import { labelOpenWorkState } from '../../../work-view/work-state-labels.mjs';
+import { normalizeRequestStatus } from '../../../../ui/my-work/src/live/status-normalization.js';
 import { configuredFocusJudge } from '../../../work-view/focus-judge.mjs';
 import { BaseRouteHandler } from '../BaseRouteHandler.js';
 import { captureEvent } from '../../../telemetry/telemetry.js';
@@ -46,7 +52,15 @@ import { validateBody } from '../middleware/validateBody.js';
 import type { SetupScan, SetupScanState } from '../../../prompt-import/setup-scan.js';
 import { readHistoryCounts, type HistoryImport } from '../../../setup/history-import.js';
 import { createSetupTelemetry } from '../../../setup/telemetry.js';
+import { createSetupInstallerResumer } from '../../../setup/resume-installer.js';
 import { hasActiveSetupSession, hasProConfiguration, readSetupState, setupStatePath, writeSetupState, type SetupStateFile, type SetupStateView } from '../../../../shared/setup-state.js';
+import { historyImportRunning, SETUP_BRANCHES, SETUP_INSTALLER_STAGES, SETUP_MEMORY_BILLINGS } from '../../../../shared/setup-funnel.js';
+import { hasPendingInstallSetup, SETUP_DSH_PROFILE_MAX_CHARACTERS, SETUP_INSTALL_NOTE_MAX_CHARACTERS, SETUP_INSTALL_STATUSES } from '../../../../shared/setup-install.js';
+import {
+  CONTINUABLE_PLATFORMS, CONVERSATION_SESSION_UUID_PATTERN, OPEN_IN_APP_CLICK_ID_PATTERN, type ConversationContinuation, type ConversationContinuationNotice,
+  type ConversationOpenedInApp,
+} from '../../../../shared/conversation-continuation.js';
+import type { ConversationContinuationRunner } from '../../../work-view/conversation-continuation-runner.js';
 
 // A request is ready for a human check once its explicit lifecycle reports it complete, shipped, or waiting for review.
 // Statuses are compared lowercased with `_` and spaces read as `-`, matching the viewer's status normalization.
@@ -55,6 +69,7 @@ const READY_FOR_CHECK_LIFECYCLE_STATUSES = [
   'needs-review', 'review', 'in-review', 'awaiting-review', 'ready-for-review',
 ];
 type RecordedLifecycle = { explicit?: boolean; complete?: boolean | null; status?: string | null; atEpoch?: number | null } | null | undefined;
+type ReadyCheckItem = { kind: string; status: string; judgedStatus?: string | null; lastUpdateEpoch?: number };
 
 /** Mirrors the viewer's reviewIsNewerThanLifecycle (src/ui/my-work/src/live/to-work-model.ts). */
 function reviewIsNewerThanLifecycle(review: { checkedAt?: string | null }, lifecycle: RecordedLifecycle): boolean {
@@ -71,9 +86,16 @@ function processIsAlive(pid: number): boolean {
 
 /** Ready for a person's check: the explicit lifecycle says so, or a memory review newer than it reached 100%.
  * The viewer offers "Mark checked" on exactly these requests. */
-export function isReportedReadyForCheck(request: { lifecycle?: RecordedLifecycle; progress?: { percent?: number; checkedAt?: string | null } | null }): boolean {
+export function isReportedReadyForCheck(request: { lifecycle?: RecordedLifecycle; progress?: { percent?: number; checkedAt?: string | null } | null; items?: ReadyCheckItem[] }, now = Date.now()): boolean {
   const { lifecycle, progress } = request;
   if (progress?.percent === 100 && reviewIsNewerThanLifecycle(progress, lifecycle)) return true;
+  // Item statuses, Jev's judged ones included, read with the viewer's own rule: an item an agent marked needs-review,
+  // or one a confident label judged finished, makes the viewer offer "Mark checked", so the check is accepted.
+  if (request.items?.length) {
+    const itemStatus = normalizeRequestStatus({ items: request.items, checked: false,
+      lifecycle: lifecycle?.explicit ? { status: lifecycle.status ?? null, explicit: true, complete: lifecycle.complete } : null }, now);
+    if (itemStatus === 'needs-review' || itemStatus === 'done') return true;
+  }
   if (!lifecycle?.explicit) return false;
   const status = String(lifecycle.status ?? '').trim().toLowerCase().replace(/[_ ]/g, '-');
   return lifecycle.complete === true || READY_FOR_CHECK_LIFECYCLE_STATUSES.includes(status);
@@ -149,12 +171,14 @@ const focusBody = z.object({
   /** reorder: every area in the owner's order, first = highest priority. */
   focusAreaIds: z.array(focusAreaIdField).min(1).optional(),
   requestId: z.string().min(1).max(2000).optional(),
+  expectedVersion: z.string().min(1).optional(),
 }).strict();
 
 // The focus areas owner-goals mined from the owner's prompts (save_goals.py). Same name and goal bounds as
 // focusBody. The evidence is one line pointing at the owner-goals item that holds the quotes; 300 characters
 // keeps the whole area inside one 2000-character work-state row. No count cap: the owner has as many areas as they have.
 const ownerGoalsFocusBody = z.object({
+  save_key: z.string().regex(/^[a-f0-9]{24}:[a-f0-9]{64}$/).optional(),
   areas: z.array(z.object({
     name: z.string().trim().min(1).max(80),
     goal: z.string().trim().min(1).max(300),
@@ -218,6 +242,26 @@ const markAgentFinishedBody = z.object({
   agentGroupId: z.string().min(1).max(2000),
 }).strict();
 
+// Continuing a conversation from My Work. The platforms and the session id pattern are the shared module's.
+const conversationRef = z.object({
+  platform: z.enum(CONTINUABLE_PLATFORMS),
+  conversationSessionId: z.string().regex(CONVERSATION_SESSION_UUID_PATTERN),
+}).strict();
+// No .max() on the message: its bound is the worker's 5 MB JSON body limit (express.json in createMiddleware,
+// middleware.ts), which is under Claude Code's own 10 MB stdin cap (headless docs, "Pipe data through Claude").
+const continueConversationBody = conversationRef.extend({ ownerMessage: z.string().trim().min(1) }).strict();
+// An open in its app and its stop name the click they belong to: the id the page made for it (OPEN_IN_APP_CLICK_ID_PATTERN).
+const openInAppClickBody = conversationRef.extend({ openInAppClickId: z.string().regex(OPEN_IN_APP_CLICK_ID_PATTERN) }).strict();
+// The read's query. Only a tool this cannot continue is refused here. Any other id is answered with its target, whose
+// sentence says why it can't be continued, such as an id that is not a UUID. No .max() on the id: it is only matched
+// against the UUID pattern before any lookup, and the URL carrying it is bounded by the HTTP server's header limit.
+// Not strict, because in local API token mode a read may carry the token as ?token= (createLocalApiTokenGuard).
+const conversationContinuationQuery = z.object({
+  platform: z.enum(CONTINUABLE_PLATFORMS),
+  conversationSessionId: z.string().min(1),
+});
+const CONVERSATION_CONTINUATION_UNAVAILABLE = 'Continuing a conversation is unavailable on this worker.';
+
 // Shared focus pages. cmem.ai checks the page's shape (src/lib/focus-share/snapshot.ts there); here it only has to be an object.
 const focusShareAreaBody = z.object({ focusAreaId: focusAreaIdField }).strict();
 const focusShareCommentBody = z.object({ focusAreaId: focusAreaIdField, body: z.string().trim().min(1).max(4000) }).strict();
@@ -237,13 +281,10 @@ const usageBody = z.discriminatedUnion('event', [
   z.object({ event: z.literal('switched'), view: z.enum(WORK_VIEW_PAGES), previousView: z.enum(WORK_VIEW_PAGES) }).strict(),
 ]);
 
-/** A path as the owner reads it: `~/...` under the home folder, else absolute. */
-const homeRelative = (path: string) => path === homedir() || path.startsWith(`${homedir()}/`) ? `~${path.slice(homedir().length)}` : path;
-
 /** The line that makes Claude Code load the approved rules with the owner's user-level instructions.
  * It names the rules file the worker actually writes, so a custom data folder is still the one loaded. */
 export function myRulesImportLine(rulesFilePath: string): string {
-  return `@${homeRelative(rulesFilePath)}`;
+  return claudeCodeImportLine(rulesFilePath);
 }
 
 interface WorkStateWrite { project: string; listName: string; fields: Record<string, string | number | boolean | null> }
@@ -278,10 +319,12 @@ interface WorkViewOptions {
   setupScan?: SetupScan | null;
   /** The install funnel's per-machine state file (choice, installer stage, completion). */
   setupStatePath?: string;
+  /** Starts the installed setup executor when a person opens deferred onboarding. */
+  resumeSetup?: (retry?: boolean) => Promise<void>;
   setupTelemetry?: ReturnType<typeof createSetupTelemetry>;
   /** Read for `alreadyPro`; defaults to ~/.claude-mem/settings.json. */
   settingsPath?: string;
-  /** Finish Setup's history upload to CMEM Pro. Without it POST /api/setup/import answers 503. */
+  /** Finish Setup's history upload to CMEM Pro. Without it POST /api/setup/import and /api/setup/import/stop answer 503. */
   historyImport?: HistoryImport | null;
   /** Setup extraction only. Ongoing automatic refresh continues to use the local agent runner. */
   hostedIntent?: Pick<HostedIntent, 'run' | 'state'> | null;
@@ -289,6 +332,11 @@ interface WorkViewOptions {
   focusShares?: Pick<FocusShares, 'connected' | 'list' | 'publish' | 'stop' | 'comments' | 'comment'> | null;
   /** How often shared focus pages are republished from this worker; 0 stops the timer (tests). */
   focusSharePublishEveryMs?: number;
+  /**
+   * Sends the owner's message from My Work to a Claude Code or Codex conversation as one turn. Without it the
+   * conversation routes answer 503. Its onChange should be publishConversationContinuation, as the worker's is.
+   */
+  conversationContinuationRunner?: ConversationContinuationRunner;
 }
 
 /** One overall request on the Reveal, read from the request-group ledger so new installs (prompts only) have work too. */
@@ -298,23 +346,68 @@ const SETUP_WORK_SHOWN = 5;
 const setupScanBody = z.object({ improveProduct: z.boolean().optional() }).strict();
 const setupScanConsentBody = z.object({ upload: z.boolean(), agents: z.array(z.enum(['claude-code', 'codex', 'gemini-cli', 'antigravity-cli', 'opencode'])).optional(), improveProduct: z.boolean().optional() }).strict();
 const setupScanPreferencesBody = z.object({ improveProduct: z.boolean() }).strict();
+// Request-size and abuse caps on loopback writes, set about twice what the installer offers today (measured
+// 2026-11-11: 19 agents in ide-detection.ts, 30 bundled skills, the longest id 17 characters). The email cap is RFC 5321's 254-character path
+// limit; the note's is SETUP_INSTALL_NOTE_MAX_CHARACTERS (setup-install.ts, which the setup page's box takes too), the
+// same 2,000 characters as the installer's error reports below.
+const setupInstallId = z.string().min(1).max(80);
+const setupInstallSelectionBody = z.object({
+  agents: z.array(setupInstallId).min(1).max(40),
+  skills: z.array(setupInstallId).max(200),
+  installClaudeCode: z.boolean(),
+  disableAutoMemory: z.boolean(),
+  telemetryEnabled: z.boolean(),
+  email: z.union([z.literal(''), z.email().max(254)]).optional(),
+  note: z.string().max(SETUP_INSTALL_NOTE_MAX_CHARACTERS).optional(),
+  emailProvided: z.boolean().optional(),
+  claudeModel: z.string().trim().min(1).max(200).optional(),
+  dshProfile: z.string().trim().min(1).max(SETUP_DSH_PROFILE_MAX_CHARACTERS).optional(),
+}).strict();
+const setupInstallCatalogBody = z.object({
+  agents: z.array(z.object({ id: setupInstallId, label: z.string().max(200), hint: z.string().max(1000), detected: z.boolean() }).strict()).min(1).max(40),
+  skills: z.array(z.object({ id: setupInstallId, label: z.string().max(200), description: z.string().max(2000), required: z.boolean().optional() }).strict()).max(200),
+  defaults: setupInstallSelectionBody,
+  reinstall: z.boolean(),
+  telemetryLocked: z.boolean().optional(),
+  skillsLocked: z.boolean().optional(),
+  emailEnabled: z.boolean().optional(),
+  signupSaved: z.boolean().optional(),
+}).strict();
+const setupInstallReportBody = z.object({
+  status: z.enum(SETUP_INSTALL_STATUSES),
+  catalog: setupInstallCatalogBody.optional(),
+  error: z.string().max(2000).nullable().optional(),
+}).strict();
+/**
+ * Localhost pages can read the worker's setup state (GET /api/setup/state and the `setup-state` event frame), and
+ * the signup email and note are data no such page may read (SettingsRoutes keeps them out of /api/settings too).
+ * Only the installer reads them, from the state file.
+ */
+function redactSetupInstall(install: SetupStateFile['install']): SetupStateFile['install'] {
+  if (!install?.selection) return install;
+  const { email, note: _note, ...selection } = install.selection;
+  return { ...install, selection: email ? { ...selection, emailProvided: true } : selection };
+}
+
 // On The Go is always CMEM Pro: standalone Cloud Sync on your own tokens has no price yet (gap G1).
 const setupChoiceBody = z.object({
-  branch: z.enum(['home', 'go']),
-  memoryBilling: z.enum(['hosted', 'existing']),
+  branch: z.enum(SETUP_BRANCHES),
+  memoryBilling: z.enum(SETUP_MEMORY_BILLINGS),
 }).strict().refine(choice => choice.branch === 'home' || choice.memoryBilling === 'hosted', {
   message: 'On The Go uses CMEM Pro (memoryBilling "hosted").',
 });
 const setupInstallerBody = z.object({
-  stage: z.enum(['waiting-for-choice', 'home-ready', 'go-kept-existing-pro', 'go-awaiting-checkout', 'failed']),
+  stage: z.enum(SETUP_INSTALLER_STAGES),
   error: z.string().max(2000).nullable().optional(),
   /** The installer mirrors the pairing checkout it is running (funnel Phase 8). */
   checkout: z.enum(['waiting', 'paid', 'failed']).optional(),
 }).strict();
 const setupCheckoutBody = z.object({}).strict();
+const setupResumeBody = z.object({ retry: z.boolean().optional() }).strict();
 const setupCompleteBody = z.object({
   /** Finish Setup's picked tools; the installer sets up the local ones it has not installed. */
-  tools: z.array(z.string().min(1).max(40)).max(20).optional(),
+  // Abuse cap: Finish Setup lists the selected agents (19 offered today) plus 3 cloud readers, so 40 leaves room.
+  tools: z.array(z.string().min(1).max(40)).max(40).optional(),
   // Checked separately so a bad analytics payload cannot block real setup.
   telemetry: z.unknown().optional(),
 }).strict();
@@ -398,7 +491,10 @@ export function defaultAutoRefresh(ledgerDir: string, settingsPath = USER_SETTIN
     return database;
   };
   // Setup's only extraction is hosted. Once setup is complete, ongoing refresh keeps its existing local path.
-  const setupRunning = () => setupActive() || (readSetupState(setupPath).status !== 'complete' && hasActiveSetupSession(setupPath));
+  const setupRunning = () => {
+    const state = readSetupState(setupPath);
+    return setupActive() || hasPendingInstallSetup(state) || (state.status !== 'complete' && hasActiveSetupSession(setupPath));
+  };
   return new AutoRefreshWorker({
     dir: ledgerDir,
     openDatabase,
@@ -411,6 +507,14 @@ export function defaultAutoRefresh(ledgerDir: string, settingsPath = USER_SETTIN
       const task = buildRefreshTask({ needs, reason, dataDir: DATA_DIR, ledgerDir, pluginRoot: getPackageRoot(), openDatabase, localDeviceId, saveFocus,
         judge: configuredJudge(settingsPath), focusJudge: configuredFocusJudge(settingsPath) });
       return { ...(await runAgentTask(task)), steps: task.steps };
+    },
+    // Jev labels open work-state items on every check; read from settings each time, like the judges.
+    labelWorkState: async () => {
+      const client = jevClientFromSettings(SettingsDefaultsManager.loadFromFile(settingsPath, true, { readOnly: true }));
+      if (!client) return null;
+      const database = openDatabase();
+      try { return await labelOpenWorkState({ dir: ledgerDir, database, client, localDeviceId: localDeviceId() }); }
+      finally { database.close(); }
     },
     log: (level, message, data) => (level === 'info' ? logger.info : logger.warn).call(logger, 'WORKER', message, data),
     localDeviceId,
@@ -475,6 +579,8 @@ export class WorkViewRoutes extends BaseRouteHandler {
   private hostedIntent: Pick<HostedIntent, 'run' | 'state'> | null;
   private focusShares: NonNullable<WorkViewOptions['focusShares']> | null;
   private focusSharePublisher: FocusSharePublisher | null;
+  private resumeSetup: (retry?: boolean) => Promise<void>;
+  private readonly conversationContinuationRunner: ConversationContinuationRunner | null;
 
   constructor(options: WorkViewOptions = {}) {
     super();
@@ -485,6 +591,7 @@ export class WorkViewRoutes extends BaseRouteHandler {
     this.getSharedStatus = options.getSharedStatus;
     this.getSyncStatus = options.getSyncStatus;
     this.updateViewerActivity = options.updateViewerActivity;
+    this.conversationContinuationRunner = options.conversationContinuationRunner ?? null;
     this.pollIntervalMs = options.pollIntervalMs ?? 1000;
     this.getLocalDeviceId = options.getLocalDeviceId ?? (() => '');
     const ledgerDir = options.ledgerDir === undefined ? join(DATA_DIR, 'work-view') : options.ledgerDir;
@@ -515,6 +622,9 @@ export class WorkViewRoutes extends BaseRouteHandler {
     this.claudeInstructionsPath = options.claudeInstructionsPath ?? join(CLAUDE_CONFIG_DIR, 'CLAUDE.md');
     this.setupScan = options.setupScan ?? null;
     this.setupStatePath = options.setupStatePath ?? setupStatePath();
+    this.resumeSetup = options.resumeSetup ?? createSetupInstallerResumer(this.setupStatePath, {
+      onStateChange: () => this.broadcast('setup-state', this.setupStateView()),
+    });
     this.setupTelemetry = options.setupTelemetry ?? null;
     this.settingsPath = options.settingsPath ?? USER_SETTINGS_PATH;
     this.historyImport = options.historyImport ?? null;
@@ -571,6 +681,10 @@ export class WorkViewRoutes extends BaseRouteHandler {
         this.scheduleRulesFileRebuild();
       }
     });
+    // A MY-RULES.md written by an older version lacks the RULES-AND-TOOLS.md import; bring it up to date
+    // once. Never creates the file: only someone who loaded My Rules in Claude Code has one. A file that
+    // already has the import costs no read of the saved rules.
+    if (this.rulesFileLacksRulesAndToolsImport()) this.scheduleRulesFileRebuild();
   }
 
   private stopRulesSync: () => void;
@@ -583,7 +697,8 @@ export class WorkViewRoutes extends BaseRouteHandler {
     // Waiting for the upload answer is not active: a closed tab never answers, and that must not hold local work
     // paused. The installer's session below still covers a setup in progress; reopening the page rejoins the question.
     if (!['idle', 'done', 'failed', 'awaiting-consent'].includes(scanPhase)) return true;
-    return readSetupState(statePath).status !== 'complete' && hasActiveSetupSession(statePath);
+    const state = readSetupState(statePath);
+    return hasPendingInstallSetup(state) || (state.status !== 'complete' && hasActiveSetupSession(statePath));
   }
 
   private scheduleRulesFileRebuild(): void {
@@ -608,7 +723,7 @@ export class WorkViewRoutes extends BaseRouteHandler {
     return this.inOwnerEditOrder(async () => {
       const view = await this.sourceReader.readRules(this.getLocalDeviceId());
       if (!view.source.connected) return false;
-      const markdown = renderRulesFile((view.rules ?? []) as SavedRule[]).markdown;
+      const markdown = this.renderRulesMarkdown((view.rules ?? []) as SavedRule[]);
       let current: string | null = null;
       try { current = readFileSync(this.rulesFilePath, 'utf8'); }
       catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
@@ -779,6 +894,16 @@ export class WorkViewRoutes extends BaseRouteHandler {
     app.post('/api/work-view/suggestions', workViewLoopbackOnly, requireWorkViewOrigin, validateBody(suggestionBody), this.wrapHandler(this.ownerEdit(this.answerSuggestion)));
     app.post('/api/work-view/rules/load-in-claude-code', workViewLoopbackOnly, requireWorkViewOrigin, this.wrapHandler(this.ownerEdit(this.loadRulesInClaudeCode)));
     app.post('/api/work-view/refresh', workViewLoopbackOnly, requireWorkViewOrigin, validateBody(z.object({}).strict()), this.wrapHandler(this.startManualRefresh));
+    // Continuing a conversation from My Work. These read, start and stop a real turn in the owner's own conversation,
+    // and on the owner's computer that turn can run with full tool access (their own permission mode). So each keeps
+    // every work-view guard: this computer only and through no proxy, the viewer's own page, and JSON for the writes.
+    // None is in OPEN_ROUTES (shared/local-api-token.ts), so local API token mode (#5141) covers them as well.
+    app.get('/api/work-view/conversations/continuation', workViewLoopbackOnly, requireWorkViewReadOrigin, this.wrapHandler(this.readConversationContinuation));
+    app.post('/api/work-view/conversations/continue', workViewLoopbackOnly, requireWorkViewOrigin, validateBody(continueConversationBody), this.wrapHandler(this.continueConversation));
+    app.post('/api/work-view/conversations/stop', workViewLoopbackOnly, requireWorkViewOrigin, validateBody(conversationRef), this.wrapHandler(this.stopConversationContinuation));
+    // Opens the owner's conversation in its tool's app on this computer's screen. It starts no turn, and keeps the same guards.
+    app.post('/api/work-view/conversations/open-in-app', workViewLoopbackOnly, requireWorkViewOrigin, validateBody(openInAppClickBody), this.wrapHandler(this.openConversationInApp));
+    app.post('/api/work-view/conversations/open-in-app/stop', workViewLoopbackOnly, requireWorkViewOrigin, validateBody(openInAppClickBody), this.wrapHandler(this.stopOpeningConversationInApp));
     app.post('/api/work-view/usage', workViewLoopbackOnly, requireWorkViewOrigin, validateBody(usageBody), this.wrapHandler(this.recordUsage));
     // Shared focus pages: this worker signs the cmem.ai calls, so the sync credential never reaches the page.
     app.get('/api/work-view/focus/shares', workViewLoopbackOnly, requireWorkViewReadOrigin, this.wrapHandler(this.listFocusShares));
@@ -816,16 +941,28 @@ export class WorkViewRoutes extends BaseRouteHandler {
       res.json(this.setupStateView());
     }));
     app.post('/api/setup/choice', workViewLoopbackOnly, requireWorkViewOrigin, validateBody(setupChoiceBody), this.wrapHandler(this.saveSetupChoice));
+    app.post('/api/setup/install', workViewLoopbackOnly, requireWorkViewOrigin, validateBody(setupInstallSelectionBody), this.wrapHandler(this.configureSetupInstall));
+    app.post('/api/setup/install/installer', workViewLoopbackOnly, requireWorkViewOrigin, validateBody(setupInstallReportBody), this.wrapHandler(this.reportSetupInstall));
+    app.post('/api/setup/resume', workViewLoopbackOnly, requireWorkViewOrigin, validateBody(setupResumeBody), this.wrapHandler(async (req, res) => {
+      const state = readSetupState(this.setupStatePath);
+      if (state.status !== 'pending' || !state.install) { res.status(409).json({ error: 'There is no pending installation to resume.' }); return; }
+      try { await this.resumeSetup(req.body.retry); } catch (error) {
+        res.status(503).json({ error: error instanceof Error ? error.message : String(error) }); return;
+      }
+      res.status(202).json(this.setupStateView());
+    }));
     app.post('/api/setup/installer', workViewLoopbackOnly, requireWorkViewOrigin, validateBody(setupInstallerBody), this.wrapHandler(this.saveInstallerStage));
     app.post('/api/setup/checkout', workViewLoopbackOnly, requireWorkViewOrigin, validateBody(setupCheckoutBody), this.wrapHandler(this.requestCheckout));
     app.post('/api/setup/import', workViewLoopbackOnly, requireWorkViewOrigin, validateBody(setupImportBody), this.wrapHandler(this.startHistoryImport));
+    // Finish Setup's "Stop import": the same guards. It only ends a run; the person's own POST above starts one again.
+    app.post('/api/setup/import/stop', workViewLoopbackOnly, requireWorkViewOrigin, validateBody(setupImportBody), this.wrapHandler(this.stopHistoryImport));
     app.post('/api/setup/complete', workViewLoopbackOnly, requireWorkViewOrigin, validateBody(setupCompleteBody), this.wrapHandler(this.completeSetup));
   }
 
   private setupStateView(state: SetupStateFile = readSetupState(this.setupStatePath)): SetupStateView {
     const settings = SettingsDefaultsManager.loadFromFile(this.settingsPath, true, { readOnly: true }) as unknown as Record<string, unknown>;
     const historyImport = this.historyImport?.state() ?? null;
-    return { ...state, alreadyPro: hasProConfiguration(settings), history: this.historyCounts(), historyImport, backgroundWorkRunning: this.backgroundWorkRunning({ countScanWaitingForUploadAnswer: true }) };
+    return { ...state, install: redactSetupInstall(state.install), alreadyPro: hasProConfiguration(settings), history: this.historyCounts(), historyImport, backgroundWorkRunning: this.backgroundWorkRunning({ countScanWaitingForUploadAnswer: true }) };
   }
 
   /**
@@ -849,7 +986,8 @@ export class WorkViewRoutes extends BaseRouteHandler {
     const scanning = !['idle', 'done', 'failed'].includes(scanPhase)
       && (countScanWaitingForUploadAnswer || scanPhase !== 'awaiting-consent');
     if (scanning || (refresh?.state === 'running' && processIsAlive(Number((refresh as { pid?: number }).pid)))) backgroundWorkRunning.push('extraction');
-    if (this.historyImport?.state().state === 'running') backgroundWorkRunning.push('history-import');
+    const importState = this.historyImport?.state().state;
+    if (importState && historyImportRunning(importState)) backgroundWorkRunning.push('history-import');
     return backgroundWorkRunning;
   }
 
@@ -886,6 +1024,19 @@ export class WorkViewRoutes extends BaseRouteHandler {
     }
   };
 
+  /**
+   * Finish Setup's "Stop import" (HistoryImport.stop): the upload ends at once and no request to cmem.ai starts after
+   * this answers. 200 with the stopped run (what was sent, and the batch whose answer never came); 409 with a sentence
+   * when no upload is running. What already reached cmem.ai stays there; nothing is deleted on either side.
+   */
+  private stopHistoryImport = (_req: Request, res: Response): void => {
+    if (!this.historyImport) { res.status(503).json({ error: 'Bringing your memory is unavailable on this worker.' }); return; }
+    const stopped = this.historyImport.stop();
+    if (!stopped) { res.status(409).json({ error: 'No import is running, so there is nothing to stop.' }); return; }
+    res.setHeader('Cache-Control', 'no-store');
+    res.json(stopped);
+  };
+
   private saveSetupState(state: SetupStateFile, res: Response): void {
     writeSetupState(state, this.setupStatePath);
     const view = this.setupStateView(state);
@@ -894,11 +1045,66 @@ export class WorkViewRoutes extends BaseRouteHandler {
     res.json(view);
   }
 
+  /** Only choices from this installer's catalog can become filesystem actions. */
+  private configureSetupInstall = async (req: Request, res: Response): Promise<void> => {
+    const selection = req.body as z.infer<typeof setupInstallSelectionBody>;
+    const state = readSetupState(this.setupStatePath);
+    const install = state.install;
+    if (state.status === 'complete' || !install || (install.status !== 'waiting' && install.status !== 'failed')) {
+      res.status(409).json({ error: 'The installer is not waiting for installation choices.' }); return;
+    }
+    const unique = (values: string[]) => new Set(values).size === values.length;
+    if (!unique(selection.agents) || !unique(selection.skills)
+      || selection.agents.some(id => !install.catalog.agents.some(agent => agent.id === id))
+      || selection.skills.some(id => !install.catalog.skills.some(skill => skill.id === id))
+      || install.catalog.skills.some(skill => skill.required && !selection.skills.includes(skill.id))) {
+      res.status(400).json({ error: 'Choose agents and skills offered by this installer, including required skills.' }); return;
+    }
+    if (install.catalog.telemetryLocked && selection.telemetryEnabled !== install.catalog.defaults.telemetryEnabled) {
+      res.status(400).json({ error: 'Usage sharing is controlled by your existing preference.' }); return;
+    }
+    if (install.catalog.skillsLocked && (selection.skills.length !== install.catalog.defaults.skills.length
+      || selection.skills.some(id => !install.catalog.defaults.skills.includes(id)))) {
+      res.status(400).json({ error: 'Skill selection is controlled by your environment.' }); return;
+    }
+    if (install.catalog.emailEnabled === false && (selection.email || selection.note)) {
+      res.status(400).json({ error: 'Email signup is unavailable for this installation.' }); return;
+    }
+    // Served views drop the email, so a retry that still wants the stored signup says so instead of resending it.
+    const { emailProvided, ...chosen } = selection;
+    const keepStoredEmail = emailProvided === true && !chosen.email && install.status === 'failed' && !!install.selection?.email;
+    const stored = keepStoredEmail ? { ...chosen, email: install.selection!.email, note: chosen.note ?? install.selection!.note } : chosen;
+    writeSetupState({ ...state, install: { ...install, selection: stored, status: 'installing', error: null } }, this.setupStatePath);
+    try { await this.resumeSetup(true); } catch (error) {
+      res.status(503).json({ error: error instanceof Error ? error.message : String(error) }); return;
+    }
+    this.saveSetupState(readSetupState(this.setupStatePath), res);
+  };
+
+  private reportSetupInstall = (req: Request, res: Response): void => {
+    const { status, catalog, error } = req.body as z.infer<typeof setupInstallReportBody>;
+    const state = readSetupState(this.setupStatePath);
+    if (state.status === 'complete') { res.status(409).json({ error: 'Setup is already complete.' }); return; }
+    if (status === 'waiting') {
+      if (!catalog) { res.status(400).json({ error: 'Installation choices require a catalog.' }); return; }
+      this.saveSetupState({ ...state, install: { status, catalog, selection: null, error: null } }, res);
+      return;
+    }
+    if (!state.install?.selection || state.install.status !== 'installing' || status === 'installing') {
+      res.status(409).json({ error: 'Choose installation options before reporting the result.' }); return;
+    }
+    // The signup has been applied once the install is ready; a failed run keeps it on disk for the explicit retry.
+    const { email: _email, note: _note, ...withoutSignup } = state.install.selection;
+    const selection = status === 'ready' ? withoutSignup : state.install.selection;
+    this.saveSetupState({ ...state, install: { ...state.install, selection, status, error: error ?? null } }, res);
+  };
+
   /** The choice can change until the installer acts on it; after that the installer holds the result. */
   private saveSetupChoice = (req: Request, res: Response): void => {
     const { branch, memoryBilling } = req.body as z.infer<typeof setupChoiceBody>;
     const state = readSetupState(this.setupStatePath);
     if (state.status === 'complete') { res.status(409).json({ error: 'Setup is already complete.', state: this.setupStateView(state) }); return; }
+    if (state.install && state.install.status !== 'ready') { res.status(409).json({ error: 'Finish installing your agents before choosing memory storage.' }); return; }
     const applied = state.installer && state.installer.stage !== 'waiting-for-choice' && state.installer.stage !== 'failed';
     if (applied && (state.choice?.branch !== branch || state.choice?.memoryBilling !== memoryBilling)) {
       res.status(409).json({ error: 'The installer already applied the earlier choice.', state: this.setupStateView(state) });
@@ -937,9 +1143,14 @@ export class WorkViewRoutes extends BaseRouteHandler {
     const { tools } = req.body as z.infer<typeof setupCompleteBody>;
     const state = readSetupState(this.setupStatePath);
     if (state.status === 'complete') { res.setHeader('Cache-Control', 'no-store'); res.json(this.setupStateView(state)); return; }
+    if (state.install && state.install.status !== 'ready') { res.status(409).json({ error: 'Finish installing your agents before completing setup.' }); return; }
     if (!state.choice) { res.status(409).json({ error: 'Choose where to keep your memory before finishing setup.', state: this.setupStateView(state) }); return; }
-    if (state.installer?.stage === 'go-awaiting-checkout' && state.checkout?.state !== 'paid') {
-      res.status(409).json({ error: 'Finish checkout before finishing setup.', state: this.setupStateView(state) });
+    const providerReady = state.choice.branch === 'home'
+      ? state.installer?.stage === 'home-ready'
+      : state.installer?.stage === 'go-kept-existing-pro'
+        || (state.installer?.stage === 'go-awaiting-checkout' && state.checkout?.state === 'paid');
+    if (!providerReady) {
+      res.status(409).json({ error: 'Finish setting up your memory provider before finishing setup.', state: this.setupStateView(state) });
       return;
     }
     const captureCompletion = this.setupTelemetry?.prepareCompletion(req.body.telemetry);
@@ -1009,8 +1220,24 @@ export class WorkViewRoutes extends BaseRouteHandler {
       if (sharedEnabled) {
         request.review = shared ?? { checked: false, checkedAtEpoch: null, actor: null, available: false, mode: 'shared' };
       } else {
-        const override = this.reviews.readOverride(request.id, request.contentFingerprint, shared?.hash ?? null);
-        const legacy = this.reviews.read(request.id, legacyFingerprint);
+        let override = this.reviews.readOverride(request.id, request.contentFingerprint, shared?.hash ?? null);
+        let legacy = this.reviews.read(request.id, legacyFingerprint);
+        if (request.sourceProductHash && (!legacy.checked || !override)) {
+          const prior = priorContentFingerprint(request);
+          const priorReview = this.reviews.read(request.id, prior);
+          const priorOverride = this.reviews.readOverride(request.id, prior, shared?.hash ?? null);
+          const productsAt = request.sourceProductRecordedAtEpoch;
+          // Products can arrive after the old check but before the first
+          // upgraded read. Unknown or equal timestamps cannot prove order.
+          const productsPredateChecks = [priorReview, priorOverride].every(review => !review?.checked ||
+            (typeof productsAt === 'number' && Number.isFinite(productsAt) &&
+              typeof review.checkedAtEpoch === 'number' && productsAt < review.checkedAtEpoch));
+          if ((priorReview.checked || priorOverride) && productsPredateChecks) {
+            this.reviews.adoptFingerprint(request.id, prior, legacyFingerprint);
+            legacy = this.reviews.read(request.id, legacyFingerprint);
+            override = this.reviews.readOverride(request.id, request.contentFingerprint, shared?.hash ?? null);
+          }
+        }
         const accepted = override ?? (shared?.matches || shared?.conflict ? shared : legacy);
         request.review = { ...accepted, mode: 'local', legacy: !override && accepted === legacy && legacy.checked };
       }
@@ -1093,19 +1320,53 @@ export class WorkViewRoutes extends BaseRouteHandler {
     try { instructions = readFileSync(this.claudeInstructionsPath, 'utf8'); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
     return {
-      path: homeRelative(this.rulesFilePath),
-      instructionsPath: homeRelative(this.claudeInstructionsPath),
+      path: homeRelativePath(this.rulesFilePath),
+      instructionsPath: homeRelativePath(this.claudeInstructionsPath),
       approvedCount: renderRulesFile(rules).approvedCount,
-      loadedInClaudeCode: instructions.split('\n').some(line => line.trim() === myRulesImportLine(this.rulesFilePath)),
+      // Any spelling Claude Code loads counts (`@~/…` or an absolute `/` path), not only the one this worker writes.
+      loadedInClaudeCode: hasImportLine(instructions, this.rulesFilePath),
     };
+  }
+
+  /** RULES-AND-TOOLS.md sits beside MY-RULES.md; MY-RULES.md imports it so Claude Code loads both through one line. */
+  private get rulesAndToolsPath(): string {
+    return join(dirname(this.rulesFilePath), RULES_AND_TOOLS_FILENAME);
+  }
+
+  private rulesFileLacksRulesAndToolsImport(): boolean {
+    let markdown: string;
+    try { markdown = readFileSync(this.rulesFilePath, 'utf8'); }
+    catch (error) {
+      // An unreadable file must not stop the worker from starting; the next rule change rewrites it.
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        logger.warn('HTTP', 'Could not read MY-RULES.md to check its Rules + Tools import', { error: error instanceof Error ? error.message : String(error) });
+      }
+      return false;
+    }
+    const importLine = claudeCodeImportLine(this.rulesAndToolsPath);
+    return !markdown.split('\n').some(line => line.trim() === importLine);
+  }
+
+  private renderRulesMarkdown(rules: SavedRule[]): string {
+    return renderRulesFile(rules, Date.now(), { importLine: claudeCodeImportLine(this.rulesAndToolsPath) }).markdown;
   }
 
   /** Rewrites MY-RULES.md through a temp file beside it, so a reader never sees half a file. */
   private writeRulesFile(rules: SavedRule[]): void {
     mkdirSync(dirname(this.rulesFilePath), { recursive: true });
-    const temp = join(dirname(this.rulesFilePath), `.MY-RULES.md.${process.pid}.tmp`);
-    writeFileSync(temp, renderRulesFile(rules).markdown, { mode: 0o644 });
-    renameSync(temp, this.rulesFilePath);
+    // The import must never point at a missing file: Claude Code skips it without a word. SessionStart
+    // keeps its text current (mode, runtime, settings), so only a missing file is written here.
+    if (!existsSync(this.rulesAndToolsPath)) ensureRulesAndToolsFile(true, this.rulesAndToolsPath);
+    const temp = join(dirname(this.rulesFilePath), `.MY-RULES.md.${randomUUID()}.tmp`);
+    try {
+      writeFileSync(temp, this.renderRulesMarkdown(rules), { mode: 0o644, flag: 'wx' });
+      renameSync(temp, this.rulesFilePath);
+    } catch (error) {
+      // A failed write or rename (Windows EPERM/EBUSY while the target is held)
+      // would otherwise leave this randomly named temp behind on every attempt.
+      try { unlinkSync(temp); } catch { /* the temp may not exist */ }
+      throw error;
+    }
   }
 
   private saveRule = async (req: Request, res: Response): Promise<void> => {
@@ -1142,7 +1403,7 @@ export class WorkViewRoutes extends BaseRouteHandler {
     else {
       // Back to the learned suggestion: clearing every saved field lets the story's version show again.
       if (!current!.ruleId.startsWith('pref_')) { res.status(409).json({ error: 'Only a learned rule can go back to being a suggestion.', snapshot }); return; }
-      rows.push({ task: `Rule: ${current!.ruleId}`, rule_id: current!.ruleId, scope_tier: null, scope_name: null, when: null, then: null, set_by: null, status: null, source: null, replaced_by: null, replaced_at: null, quotes: null, times_seen: null, latest_at: null });
+      rows.push({ task: `Rule: ${current!.ruleId}`, rule_id: current!.ruleId, scope_tier: null, scope_name: null, when: null, then: null, set_by: null, status: null, source: null, replaced_by: null, replaced_at: null, quotes: null, quotes_total: null, times_seen: null, latest_at: null });
     }
     const project = this.homeProject ?? getProjectContext(homedir()).primary;
     for (const fields of rows) this.appendWorkStateEntry({ project, listName: MY_RULES_LIST, fields });
@@ -1157,12 +1418,16 @@ export class WorkViewRoutes extends BaseRouteHandler {
 
   /** The owner's focus decisions, saved as my-focus rows. Owner rows are never overridden by a refresh. */
   private saveFocus = async (req: Request, res: Response): Promise<void> => {
-    const { action, focusAreaId, name, goal, intoFocusAreaId, focusAreaIds, requestId } = req.body as z.infer<typeof focusBody>;
+    const { action, focusAreaId, name, goal, intoFocusAreaId, focusAreaIds, requestId, expectedVersion } = req.body as z.infer<typeof focusBody>;
     if (!this.appendWorkStateEntry) { res.status(503).json({ error: 'Saving focus areas is unavailable on this worker.' }); return; }
     // Moving a request looks the request up, and a request can be minutes old: that check reads fresh.
     const snapshot = await (action === 'move-request' ? this.snapshot() : this.ownerStateSnapshot());
     if (!snapshot.source.connected) { res.status(503).json({ error: 'Local work is unavailable. Reconnect before changing focus areas.' }); return; }
     const areas = (snapshot.focusAreas ?? []) as FocusArea[];
+    // ownerEdit serializes this fresh read, version check and every row below with other owner writes.
+    if (expectedVersion !== undefined && expectedVersion !== focusChangeVersion(req.body, areas, snapshot.humanRequests)) {
+      res.status(409).json({ error: FOCUS_CHANGED_MESSAGE, snapshot }); return;
+    }
     const areaById = new Map(areas.map(area => [area.focusAreaId, area]));
     const ownRow = (area: FocusArea, change: Partial<FocusArea>) => focusAreaRowFields({ ...area, ...change, decidedBy: 'owner' });
     const rows: Record<string, string | number | boolean | null>[] = [];
@@ -1231,12 +1496,15 @@ export class WorkViewRoutes extends BaseRouteHandler {
 
   /** Owner-goals' mined focus areas, as my-focus suggestions. Answers each mined area's id, in order. */
   private suggestOwnerGoalsAreas = async (req: Request, res: Response): Promise<void> => {
-    const { areas } = req.body as z.infer<typeof ownerGoalsFocusBody>;
+    const { areas, save_key } = req.body as z.infer<typeof ownerGoalsFocusBody>;
     if (!this.appendWorkStateEntry) { res.status(503).json({ error: 'Saving focus areas is unavailable on this worker.' }); return; }
     const snapshot = await this.ownerStateSnapshot();
     if (!snapshot.source.connected) { res.status(503).json({ error: 'Local work is unavailable. Reconnect before saving focus areas.' }); return; }
     let planned: ReturnType<typeof ownerGoalsAreaRows>;
-    try { planned = ownerGoalsAreaRows(areas, (snapshot.focusAreas ?? []) as FocusArea[]); }
+    try {
+      const scope = JSON.stringify([this.homeProject ?? getProjectContext(homedir()).primary, this.getLocalDeviceId()]);
+      planned = ownerGoalsAreaRows(areas, (snapshot.focusAreas ?? []) as FocusArea[], undefined, save_key ? { key: save_key, scope } : undefined);
+    }
     catch (error) { this.badRequest(res, error instanceof Error ? error.message : String(error)); return; }
     const project = this.homeProject ?? getProjectContext(homedir()).primary;
     for (const fields of planned.rows) this.appendWorkStateEntry({ project, listName: MY_FOCUS_LIST, fields });
@@ -1451,7 +1719,7 @@ export class WorkViewRoutes extends BaseRouteHandler {
 
   /** Starts an on-demand refresh and answers before the run ends, which can take many minutes. */
   private startManualRefresh = async (_req: Request, res: Response): Promise<void> => {
-    if (!this.autoRefresh) { res.status(503).json({ error: 'Refresh is unavailable on this worker.' }); return; }
+    if (!this.autoRefresh) { res.status(503).json({ error: REFRESH_START_REFUSAL.unavailable }); return; }
     const started = this.autoRefresh.runNow({ reason: 'manual' });
     // runNow decides before its first await: busy now means a run started, and any other answer is already settled.
     if (this.autoRefresh.busy) {
@@ -1460,9 +1728,90 @@ export class WorkViewRoutes extends BaseRouteHandler {
       return;
     }
     const state = await started;
-    if (state === 'setup-running') { res.status(409).json({ error: 'Refresh is unavailable until setup finishes.' }); return; }
-    if (state === 'closed') { res.status(503).json({ error: 'This worker is shutting down.' }); return; }
+    if (state === 'setup-running') { res.status(409).json({ error: REFRESH_START_REFUSAL.setupRunning }); return; }
+    if (state === 'closed') { res.status(503).json({ error: REFRESH_START_REFUSAL.shuttingDown }); return; }
     res.status(state === 'running' ? 202 : 200).json({ state });
+  };
+
+  /** Whether a conversation can be continued from here and where its turn would run, and what was sent to it from here. */
+  private readConversationContinuation = (req: Request, res: Response): void => {
+    const query = conversationContinuationQuery.safeParse(req.query);
+    if (!query.success) {
+      this.badRequest(res, `Name the conversation with platform (${CONTINUABLE_PLATFORMS.join(' or ')}) and conversationSessionId.`);
+      return;
+    }
+    const runner = this.conversationContinuationRunner;
+    if (!runner) { res.status(503).json({ error: CONVERSATION_CONTINUATION_UNAVAILABLE }); return; }
+    const { platform, conversationSessionId } = query.data;
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ target: runner.target(platform, conversationSessionId), exchanges: runner.exchanges(platform, conversationSessionId) });
+  };
+
+  /**
+   * Sends the owner's message to the conversation as one turn, and answers 202 with the running exchange without waiting
+   * for the turn. Every open window hears that it started and that it ended through a conversation-continuation notice,
+   * and reads how through the guarded read. A refusal starts nothing.
+   */
+  private continueConversation = async (req: Request, res: Response): Promise<void> => {
+    const runner = this.conversationContinuationRunner;
+    if (!runner) { res.status(503).json({ error: CONVERSATION_CONTINUATION_UNAVAILABLE }); return; }
+    const { platform, conversationSessionId, ownerMessage } = req.body as z.infer<typeof continueConversationBody>;
+    const started = await runner.start(platform, conversationSessionId, ownerMessage);
+    if ('refusalText' in started) { res.status(409).json({ error: started.refusalText }); return; }
+    // The runner reports an exchange only when it ends, so its start is pushed here, for every other open window. The
+    // pushed state is the runner's current one, so a turn that has ended already is never pushed as running after it.
+    const { exchangeId } = started.exchange;
+    const exchange = runner.exchanges(platform, conversationSessionId).find(candidate => candidate.exchangeId === exchangeId);
+    // The runner keeps every exchange it starts for the worker's life. Without it there is no current state to push, and
+    // the copy start answered with could be pushed as running after the turn ended, so this is a broken invariant.
+    if (!exchange) throw new Error(`The conversation runner does not hold exchange ${exchangeId}, which it has just started.`);
+    this.publishConversationContinuation(exchange);
+    res.setHeader('Cache-Control', 'no-store');
+    res.status(202).json({ exchange });
+  };
+
+  /** Asks the running turn to end. Its exchange stays running until the CLI has exited, and its end is pushed then. */
+  private stopConversationContinuation = (req: Request, res: Response): void => {
+    const runner = this.conversationContinuationRunner;
+    if (!runner) { res.status(503).json({ error: CONVERSATION_CONTINUATION_UNAVAILABLE }); return; }
+    const { platform, conversationSessionId } = req.body as z.infer<typeof conversationRef>;
+    const stopped = runner.stop(platform, conversationSessionId);
+    if ('refusalText' in stopped) { res.status(409).json({ error: stopped.refusalText }); return; }
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ exchange: stopped.exchange });
+  };
+
+  /**
+   * Opens the conversation in its tool's own app: Claude Code's `claude --desktop --resume <session uuid>`. It starts no
+   * turn. Answers once the command has exited, with no deadline: 200 with what it printed when the app opened it, else
+   * 409 with the sentence saying why, which holds everything the command printed when it ran. While one open of a
+   * conversation runs, another is refused (409), and the stop route below ends it when it names this open's click.
+   */
+  private openConversationInApp = async (req: Request, res: Response): Promise<void> => {
+    const runner = this.conversationContinuationRunner;
+    if (!runner) { res.status(503).json({ error: CONVERSATION_CONTINUATION_UNAVAILABLE }); return; }
+    const { platform, conversationSessionId, openInAppClickId } = req.body as z.infer<typeof openInAppClickBody>;
+    const opened = await runner.openInApp(platform, conversationSessionId, openInAppClickId);
+    if ('refusalText' in opened) { res.status(409).json({ error: opened.refusalText }); return; }
+    const answer: ConversationOpenedInApp = { printedText: opened.printedText };
+    res.setHeader('Cache-Control', 'no-store');
+    res.json(answer);
+  };
+
+  /**
+   * Stops the command opening a conversation in its app for the click the body names. The page asks for it as it is
+   * unloaded while its open still runs (a reload, a closed tab): the worker cannot see that page's request go away
+   * (stopOpeningInApp says why). 200 once the stop is sent, which the open's own answer then reports; 409 with a sentence
+   * when no open of that click is running, or when the stop could not be sent.
+   */
+  private stopOpeningConversationInApp = (req: Request, res: Response): void => {
+    const runner = this.conversationContinuationRunner;
+    if (!runner) { res.status(503).json({ error: CONVERSATION_CONTINUATION_UNAVAILABLE }); return; }
+    const { platform, conversationSessionId, openInAppClickId } = req.body as z.infer<typeof openInAppClickBody>;
+    const stopping = runner.stopOpeningInApp(platform, conversationSessionId, openInAppClickId);
+    if ('refusalText' in stopping) { res.status(409).json({ error: stopping.refusalText }); return; }
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({});
   };
 
   /** Adds the MY-RULES.md import to the user-level CLAUDE.md once. Never touches a project's CLAUDE.md or AGENTS.md. */
@@ -1653,8 +2002,21 @@ export class WorkViewRoutes extends BaseRouteHandler {
     this.broadcast('sync_status', { sync });
   }
 
+  /**
+   * Tells every open window that an exchange sent from My Work started (the continue route) or ended (the runner's
+   * onChange), by its id, its conversation and its state only. The event stream checks no origin and the worker's CORS
+   * lets any localhost page read it, so the message, the reply, the failure text and the folder stay behind the guarded
+   * read, which the page asks when the notice arrives.
+   */
+  publishConversationContinuation({ exchangeId, platform, conversationSessionId, state }: ConversationContinuation): void {
+    const notice: ConversationContinuationNotice = { exchangeId, platform, conversationSessionId, state };
+    this.broadcast('conversation-continuation', notice);
+  }
+
   close(): void {
     this.closed = true;
+    // Stops every turn and open started from My Work, and refuses new ones (ConversationContinuationRunner.close).
+    this.conversationContinuationRunner?.close();
     this.unsubscribeSetupScan?.();
     this.unsubscribeHistoryImport?.();
     this.stopRulesSync();

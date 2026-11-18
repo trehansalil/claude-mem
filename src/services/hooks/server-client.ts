@@ -15,6 +15,7 @@ import { fetchWithTimeout } from '../../shared/worker-utils.js';
 import { HOOK_TIMEOUTS, getTimeout } from '../../shared/hook-constants.js';
 import { normalizePlatformSource } from '../../shared/platform-source.js';
 import { stripMemoryTags, stripMemoryTagsFromJsonStrings } from '../../utils/tag-stripping.js';
+import { redactJsonStrings } from '../../utils/redaction.js';
 import { retainTextHeadTail } from '../../shared/text-truncation.js';
 
 const DEFAULT_TIMEOUT_MS = getTimeout(HOOK_TIMEOUTS.API_REQUEST);
@@ -196,6 +197,10 @@ export interface ServerContextObservationsRequest {
   folderProjects?: string[];
   // Leave out rows generated from subagent events (CLAUDE_MEM_CONTEXT_MAIN_AGENT_ONLY).
   excludeSubagents?: boolean;
+  // Active-mode filters for observations. Empty selects none; summaries keep
+  // their own allowance. Omitted preserves the unfiltered API contract.
+  observationTypes?: string[];
+  observationConcepts?: string[];
 }
 
 export interface ServerContextObservationsResponse {
@@ -341,6 +346,8 @@ export class ServerClient {
       payload.folderProjects = input.folderProjects;
     }
     if (input.excludeSubagents !== undefined) payload.excludeSubagents = input.excludeSubagents;
+    if (input.observationTypes !== undefined) payload.observationTypes = input.observationTypes;
+    if (input.observationConcepts !== undefined) payload.observationConcepts = input.observationConcepts;
     return this.request<ServerContextObservationsResponse>('POST', '/v1/context', payload, options);
   }
 
@@ -429,8 +436,9 @@ export class ServerClient {
       ...(input.agentId !== undefined ? { agentId: input.agentId } : {}),
       ...(input.agentType !== undefined ? { agentType: input.agentType } : {}),
       ...(input.platformSource !== undefined ? { platformSource: normalizePlatformSourceField(input.platformSource) } : {}),
-      // The prompt rides in metadata; <private> sections never leave the hook.
-      ...(input.metadata !== undefined ? { metadata: stripMemoryTagsFromJsonStrings(input.metadata) } : {}),
+      // The prompt rides in metadata. Apply the hook's redaction settings
+      // before transport as well as removing explicitly private sections.
+      ...(input.metadata !== undefined ? { metadata: redactJsonStrings(stripMemoryTagsFromJsonStrings(input.metadata)) } : {}),
     };
   }
 
@@ -447,7 +455,7 @@ export class ServerClient {
       // Every server-bound event (tool use, file edit, assistant message, MCP
       // record_event) passes here: <private> sections never leave the hook,
       // the same rule worker ingest applies before storing tool data.
-      ...(input.payload !== undefined ? { payload: stripMemoryTagsFromJsonStrings(input.payload) } : {}),
+      ...(input.payload !== undefined ? { payload: redactJsonStrings(stripMemoryTagsFromJsonStrings(input.payload)) } : {}),
     };
   }
 

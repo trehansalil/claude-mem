@@ -5,13 +5,14 @@
  *
  * - Claude Code: assistant lines carry `message.usage`. One API message is
  *   written once per content block with the same `message.id`, so each id
- *   counts once. Tokens = input + cache creation + cache read + output.
+ *   counts once, keeping its largest recorded usage as the output completes.
+ *   Tokens = input + cache creation + cache read + output.
  *   claude-mem's own observer sessions (OBSERVER_SESSIONS_DIR) are not the
  *   person's usage and are left out.
- * - Codex: `event_msg` lines with `payload.type: "token_count"` carry the
- *   session's running `info.total_token_usage.total_tokens` (input, which
- *   includes cached input, plus output). The same total is often repeated, so
- *   a session's usage is the sum of its increases.
+ * - Codex: `event_msg` lines with `payload.type: "token_count"` carry running
+ *   `info.total_token_usage` input (including cached input) and output counts.
+ *   `total_tokens` can instead hold a synthetic context-window estimate. The
+ *   same counters are often repeated, so usage is the sum of their increases.
  * - Gemini CLI: `gemini` messages carry `tokens.total` (input incl. cached,
  *   output, thoughts, tool).
  * - OpenCode: assistant messages carry `tokens` {input, output, reasoning,
@@ -33,10 +34,11 @@ import { homedir } from 'os';
 import { basename, dirname, join } from 'path';
 import { OBSERVER_SESSIONS_DIR } from '../../shared/paths.js';
 import { logger } from '../../utils/logger.js';
+import { streamRows } from '../sqlite/stream-rows.js';
 import { calculateTokenEconomics, combineTokenEconomics, type ObservationTokenFields } from '../context/TokenCalculator.js';
 import type { TokenEconomics } from '../context/types.js';
 import { PROMPT_SCAN_WINDOW_DAYS } from './index.js';
-import { claudeConfigDirectory, codexForkThreadId, createPromptReaders, isoToEpochMs, parseLine, readGeminiChat, readLines, type PromptAgentId, type TranscriptSource } from './readers.js';
+import { claudeConfigDirectory, codexForkThreadId, createPromptReaders, isoToEpochMs, openCodeHistoryLayout, parseLine, readGeminiChat, readLines, type PromptAgentId, type TranscriptSource } from './readers.js';
 
 export type UsageCoverage = 'complete' | 'partial' | 'none';
 export type UsagePersona = 'Cracked Dev' | 'Heavy AI User' | 'Medium AI User' | 'Light AI User';
@@ -63,7 +65,7 @@ export interface AgentTokenUsage {
   tokens: number;
   /** The agent's records reach back to the window start (older transcripts exist, or a record at or before it). */
   historyStartsBeforeWindow: boolean;
-  /** The earliest token record read (files changed inside the window). */
+  /** The earliest token record read, including older Gemini snapshots used to resolve copied responses. */
   firstRecordAt: string | null;
   /** The agent deletes transcripts sooner than the window lasts. */
   retentionShorterThanWindow: boolean;
@@ -124,14 +126,12 @@ interface UsageReader {
   retentionDays?(homeDirectory: string): number;
 }
 
-function claudeCodeUsage(excludedFolders: Set<string>): UsageReader {
+function claudeCodeUsage(): UsageReader {
   return {
     retentionDays: claudeRetentionDays,
     async read(sources, sinceEpochMs, usage, skip) {
-      const seenMessages = new Set<string>();
+      const messages = new Map<string, { at: number; tokens: number }>();
       for (const source of sources) {
-        const projectFolder = basename(source.holdsPrompts ? dirname(source.path) : dirname(dirname(dirname(source.path))));
-        if (excludedFolders.has(projectFolder)) continue;
         try {
           for await (const line of readLines(source.path)) {
             if (!line.includes('"usage"') || !/"type"\s*:\s*"assistant"/.test(line)) continue;
@@ -139,15 +139,31 @@ function claudeCodeUsage(excludedFolders: Set<string>): UsageReader {
             const message = record?.message;
             if (record?.type !== 'assistant' || !message?.usage) continue;
             const key = typeof message.id === 'string' && message.id ? message.id : `${record.requestId ?? ''}\u0000${record.uuid ?? ''}`;
-            if (seenMessages.has(key)) continue;
-            seenMessages.add(key);
+            const at = isoToEpochMs(record.timestamp);
+            if (at === null) continue;
             const { input_tokens, cache_creation_input_tokens, cache_read_input_tokens, output_tokens } = message.usage;
-            tally(usage, isoToEpochMs(record.timestamp), count(input_tokens) + count(cache_creation_input_tokens) + count(cache_read_input_tokens) + count(output_tokens), sinceEpochMs);
+            const tokens = count(input_tokens) + count(cache_creation_input_tokens) + count(cache_read_input_tokens) + count(output_tokens);
+            const previous = messages.get(key);
+            // A later content block can carry the completed output count. Keep
+            // one whole usage total, not a sum of repeated blocks or per-field
+            // maxima, and do not let a copied early block lower that count.
+            messages.set(key, { at: Math.min(previous?.at ?? at, at), tokens: Math.max(previous?.tokens ?? 0, tokens) });
           }
         } catch (error) { skip(source, error); }
       }
+      for (const message of messages.values()) tally(usage, message.at, message.tokens, sinceEpochMs);
     },
   };
+}
+
+/** Actual usage fields exclude Codex's synthetic full-window/history estimates. */
+function codexReportedTokens(usage: { input_tokens?: unknown; output_tokens?: unknown; total_tokens?: unknown } | null | undefined): number {
+  if (typeof usage?.input_tokens === 'number' && typeof usage?.output_tokens === 'number') {
+    // Cached input and reasoning output are subsets, not additional usage.
+    return count(usage.input_tokens) + count(usage.output_tokens);
+  }
+  // Preserve older records that carry only total_tokens.
+  return count(usage?.total_tokens);
 }
 
 const codexUsage: UsageReader = {
@@ -184,10 +200,10 @@ const codexUsage: UsageReader = {
             continue;
           }
           const info = record?.payload?.type === 'token_count' ? record.payload.info : null;
-          const total = info?.total_token_usage?.total_tokens;
-          if (record?.type !== 'event_msg' || typeof total !== 'number') continue;
+          if (record?.type !== 'event_msg' || typeof info?.total_token_usage?.total_tokens !== 'number') continue;
+          const total = codexReportedTokens(info.total_token_usage);
           // The first count in a file may continue an earlier session's running total; only its own turn is new.
-          const increase = previousTotal === null ? count(info.last_token_usage?.total_tokens) : Math.max(0, total - previousTotal);
+          const increase = previousTotal === null ? codexReportedTokens(info.last_token_usage) : Math.max(0, total - previousTotal);
           previousTotal = total;
           if (!awaitingForkSettings) tally(usage, isoToEpochMs(record.timestamp), increase, sinceEpochMs);
         }
@@ -198,10 +214,10 @@ const codexUsage: UsageReader = {
 
 const geminiCliUsage: UsageReader = {
   async read(sources, sinceEpochMs, usage, skip) {
-    const seenMessages = new Set<string>();
+    const messagesByIdentity = new Map<string, { at: number; tokens: number }>();
     for (const source of sources) {
       try {
-        const { header, messages } = await readGeminiChat(source.path);
+        const { header, messages } = await readGeminiChat(source.path, { includeDiscardedMessages: true });
         const sessionKey = typeof header.sessionId === 'string' && header.sessionId
           ? header.sessionId : source.path.replace(/\.jsonl?$/, '');
         for (const message of messages) {
@@ -216,13 +232,14 @@ const geminiCliUsage: UsageReader = {
             ? ['native', message.id]
             : ['legacy', sessionKey, at, message.content ?? null, message.toolCalls ?? null];
           const key = createHash('sha256').update(JSON.stringify(identity)).digest('hex');
-          if (seenMessages.has(key)) continue;
-          seenMessages.add(key);
           const { total, input, output, thoughts, tool } = message.tokens;
-          tally(usage, at, typeof total === 'number' ? count(total) : count(input) + count(output) + count(thoughts) + count(tool), sinceEpochMs);
+          const tokens = typeof total === 'number' ? count(total) : count(input) + count(output) + count(thoughts) + count(tool);
+          const previous = messagesByIdentity.get(key);
+          messagesByIdentity.set(key, { at: Math.min(previous?.at ?? at, at), tokens: Math.max(previous?.tokens ?? 0, tokens) });
         }
       } catch (error) { skip(source, error); }
     }
+    for (const message of messagesByIdentity.values()) tally(usage, message.at, message.tokens, sinceEpochMs);
   },
 };
 
@@ -232,8 +249,19 @@ const openCodeUsage: UsageReader = {
       try {
         const database = new Database(source.path, { readonly: true });
         try {
-          const rows = database.prepare(`SELECT time_created AS createdAt, json_extract(data, '$.tokens') AS tokens
-            FROM message WHERE json_extract(data, '$.role') = 'assistant'`).all() as Array<{ createdAt: number; tokens: string | null }>;
+          const layout = openCodeHistoryLayout(database);
+          const queries: string[] = [];
+          if (layout.legacy) queries.push(`SELECT m.time_created AS createdAt, json_extract(m.data, '$.tokens') AS tokens
+            FROM message m WHERE json_extract(m.data, '$.role') = 'assistant'
+            ${layout.current ? 'AND NOT EXISTS (SELECT 1 FROM session_message current WHERE current.id = m.id)' : ''}`);
+          if (layout.current) queries.push(`SELECT m.time_created AS createdAt, json_extract(m.data, '$.tokens') AS tokens
+            FROM session_message m
+            ${layout.forkBoundary ? 'LEFT JOIN session_v2 s ON s.id = m.session_id' : ''}
+            WHERE m.type = 'assistant'
+            ${layout.forkBoundary ? 'AND (s.fork_session_id IS NULL OR m.time_created >= s.time_created)' : ''}`);
+          // The database contains the whole agent history. Consume one row at
+          // a time so counting usage does not retain every token payload.
+          const rows = streamRows(database.prepare(queries.join('\nUNION ALL\n'))) as Iterable<{ createdAt: number; tokens: string | null }>;
           for (const row of rows) {
             const tokens = row.tokens ? parseLine(row.tokens) : null;
             if (!tokens) continue;
@@ -253,21 +281,30 @@ export async function scanTokenUsage(options: TokenUsageScanOptions): Promise<{ 
   const windowDays = options.windowDays ?? PROMPT_SCAN_WINDOW_DAYS;
   const excludedFolders = new Set((options.excludedClaudeCwds ?? [OBSERVER_SESSIONS_DIR]).map(claudeProjectFolder));
   const usageReaders: Partial<Record<PromptAgentId, UsageReader>> = {
-    'claude-code': claudeCodeUsage(excludedFolders), codex: codexUsage, 'gemini-cli': geminiCliUsage, opencode: openCodeUsage,
+    'claude-code': claudeCodeUsage(), codex: codexUsage, 'gemini-cli': geminiCliUsage, opencode: openCodeUsage,
   };
   const agents: AgentTokenUsage[] = [];
   for (const reader of createPromptReaders().filter(entry => !options.agents || options.agents.includes(entry.id))) {
     const { detected, sources } = reader.locate(homeDirectory);
+    // Observer history is neither personal usage nor evidence that the person's
+    // history covers the window, including files too old to read for tokens.
+    const usageSources = reader.id === 'claude-code' ? sources.filter(source => {
+      const projectFolder = basename(source.holdsPrompts ? dirname(source.path) : dirname(dirname(dirname(source.path))));
+      return !excludedFolders.has(projectFolder);
+    }) : sources;
     const usageReader = usageReaders[reader.id];
     const usage: UsageTally = { tokens: 0, firstRecordAt: null };
     let skippedSources = 0;
     if (usageReader) {
-      await usageReader.read(sources.filter(source => source.mtimeMs >= options.sinceEpochMs), options.sinceEpochMs, usage, (source, error) => {
+      // Gemini can copy an old native response into a newly modified transcript
+      // with a later timestamp. Its original snapshot must reach identity resolution.
+      const selectedSources = reader.id === 'gemini-cli' ? usageSources : usageSources.filter(source => source.mtimeMs >= options.sinceEpochMs);
+      await usageReader.read(selectedSources, options.sinceEpochMs, usage, (source, error) => {
         skippedSources++;
         logger.warn('IMPORT', 'Skipped an unreadable transcript while counting tokens', { path: source.path, reason: error instanceof Error ? error.message : String(error) });
       });
     }
-    const olderSources = sources.some(source => source.mtimeMs < options.sinceEpochMs);
+    const olderSources = usageSources.some(source => source.mtimeMs < options.sinceEpochMs);
     agents.push({
       id: reader.id, label: reader.label, detected, recordsTokens: !!usageReader, tokens: usage.tokens,
       historyStartsBeforeWindow: !!usageReader && (olderSources || (usage.firstRecordAt !== null && usage.firstRecordAt <= options.sinceEpochMs)),

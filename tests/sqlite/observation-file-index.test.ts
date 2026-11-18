@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import { SessionStore } from '../../src/services/sqlite/SessionStore.js';
 import { getObservationsByFilePath } from '../../src/services/sqlite/observations/get.js';
 import { SyncApply, type SyncOp } from '../../src/services/sync/SyncApply.js';
+import { removeTempDir } from '../helpers/temp-dir.js';
 
 // file-context's by-file lookup used to json_each every observation's
 // files_read/files_modified on the one shared connection. These tests pin the
@@ -61,33 +62,47 @@ describe('observation file path index', () => {
       title: 'miss', narrative: 'miss', files_read: ['src/other.go'],
     }));
 
-    const plan = store.db.prepare(
-      "EXPLAIN QUERY PLAN SELECT o.id FROM observation_files f JOIN observations o ON o.id = f.observation_id WHERE f.path IN ('src/permission.go')",
-    ).all() as Array<{ detail: string }>;
-    const planned = plan.map(row => row.detail).join('\n');
-    expect(planned).not.toContain('json_each');
-    expect(planned.toLowerCase()).toContain('index');
+    store.db.run("UPDATE observations SET files_read = '[]', files_modified = '[]'");
 
     const found = getObservationsByFilePath(store.db, ['src/permission.go', 'src/permission_test.go']);
     expect(found.map(row => row.id)).toEqual([hit.id]);
   });
 
-  it('backfills the index for rows written before it existed', () => {
+  it('backfills the index for rows written before it existed', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'obs-file-index-'));
     const dbPath = join(dir, 'claude-mem-test.db');
-    const first = new SessionStore(dbPath);
-    makeSession(first);
-    const { id } = first.storeObservation('s1', 'proj', obs({ files_read: ['src/legacy.go'] }));
-    // Put the database back to how it looked before v68: the observation is
-    // there, the index and its bookkeeping are not.
-    first.db.run('DELETE FROM observation_files');
-    first.db.run('DELETE FROM schema_versions WHERE version = 68');
-    first.db.close();
+    try {
+      const firstDb = new Database(dbPath);
+      let id: number;
+      try {
+        const first = new SessionStore(firstDb);
+        makeSession(first);
+        ({ id } = first.storeObservation('s1', 'proj', obs({ files_read: ['src/legacy.go'] })));
+        first.importObservation({
+          memory_session_id: 's1', project: 'proj', text: null, type: 'discovery',
+          title: 'malformed legacy paths', subtitle: null, facts: null, narrative: null, concepts: null,
+          files_read: '[invalid', files_modified: '[invalid', prompt_number: 1, discovery_tokens: 0,
+          created_at: '2026-06-17T00:00:00.000Z', created_at_epoch: 1750000001,
+        });
+        // Put the database back to how it looked before v68: the observations
+        // are there, the index and its bookkeeping are not.
+        first.db.run('DELETE FROM observation_files');
+        first.db.run('DELETE FROM schema_versions WHERE version = 68');
+      } finally {
+        firstDb.close();
+      }
 
-    const reopened = new SessionStore(dbPath);
-    const found = getObservationsByFilePath(reopened.db, 'src/legacy.go');
-    expect(found.map(row => row.id)).toEqual([id]);
-    reopened.db.close();
+      const reopenedDb = new Database(dbPath);
+      try {
+        const reopened = new SessionStore(reopenedDb);
+        const found = getObservationsByFilePath(reopened.db, 'src/legacy.go');
+        expect(found.map(row => row.id)).toEqual([id!]);
+      } finally {
+        reopenedDb.close();
+      }
+    } finally {
+      await removeTempDir(dir);
+    }
   });
 
   it('rolls the observation back when its path mappings cannot be written', () => {

@@ -8,9 +8,12 @@ import type { EventHandler, NormalizedHookInput, HookResult } from '../types.js'
 import {
   executeWithWorkerFallback,
   isWorkerFallback,
+  isWorkerUnavailableError,
+  type WorkerCallResult,
   getWorkerPort,
   getViewerBaseUrl,
   consumeWorkerOutageNotice,
+  recordWorkerUnreachable,
 } from '../../shared/worker-utils.js';
 import { getProjectContext } from '../../utils/project-name.js';
 import { HOOK_EXIT_CODES, HOOK_TIMEOUTS } from '../../shared/hook-constants.js';
@@ -21,6 +24,7 @@ import { isProjectExcluded } from '../../utils/project-filter.js';
 import { readStaleMarker } from '../../shared/oauth-token.js';
 import { clipUtf16 } from '../../shared/relayed-text.js';
 import { normalizePlatformSource } from '../../shared/platform-source.js';
+import { withoutLoadedRulesPointer } from '../../shared/claude-code-rules-import.js';
 import { proTrialLine } from '../../shared/pro-promo.js';
 import { providersMappedBySource } from '../../shared/provider-by-source.js';
 import {
@@ -35,8 +39,12 @@ import type { ContextInput } from '../../services/context/types.js';
 import { serverSessionStartBudgetMs } from '../../shared/host-hook-limits.js';
 import { contextCacheKeys, fillContextPlaceholders, readContextCache } from '../../shared/context-cache.js';
 import { clearTimelinePending } from '../../shared/codex-compaction-gate.js';
+import { readSetupState, type SetupStateFile } from '../../shared/setup-state.js';
+import { hasPendingInstallSetup } from '../../shared/setup-install.js';
 import { projectsQueryString } from '../../shared/project-list.js';
 import { CONTEXT_OUTPUT_LIMIT } from '../../services/context/ContextBudget.js';
+import { consumeTelemetryNotice } from '../../services/telemetry/consent.js';
+import { writeSessionStartCardSlot } from '../session-start-card-slot-writer.js';
 import {
   fetchTeamBrief,
   formatTeamBrief,
@@ -55,6 +63,17 @@ import {
  */
 export const TEAM_BRIEF_TIMEOUT_MS = 2_000;
 
+/** Only an explicitly deferred install asks a first session to return to onboarding. */
+export function pendingSetupNotice(state: Pick<SetupStateFile, 'status' | 'install'>, viewerBaseUrl: string): string | null {
+  if (!hasPendingInstallSetup(state)) return null;
+  const url = new URL(viewerBaseUrl);
+  url.searchParams.set('setup', '1');
+  return `[claude-mem] Setup is waiting for your choices: ${url.href}\n`
+    + 'If a person is available, open that page so they can finish onboarding. '
+    + 'Otherwise leave setup pending and show them this link when they return. '
+    + 'Do not choose agents, integrations, skills, or account options on their behalf.';
+}
+
 /** Below this much room a cut brief says too little to be worth sending. */
 const MIN_CUT_TEAM_BRIEF_CHARS = 300;
 
@@ -66,46 +85,71 @@ export function teamBriefSection(result: TeamBrainResult<TeamBrainBrief>): strin
 }
 
 /**
- * The viewer lines at the top of the SessionStart terminal banner: the live
- * viewer link, the trial line, the trial countdown and the TeamBrain discovery
- * line. They go above the preview, which ends on its newest timeline entry with
- * no closing lines after it. The preview leaves TERMINAL_BANNER_RESERVE_CHARS
- * for them, and composeSessionStartSystemMessage keeps the whole
- * `systemMessage` within Claude Code's 10,000-character field cap (#5079).
+ * The lines at the top of the SessionStart terminal banner: the trial line,
+ * the trial countdown and the TeamBrain discovery line. Empty when none apply.
  */
 export function sessionStartBannerHeader(
-  viewerUrl: string,
   trialDaysLine: string | null,
   teamBrainDiscoveryLine: string | null,
+  plan = '',
 ): string {
-  return `View Observations Live @ ${viewerUrl}\n${proTrialLine('session-start')}${trialDaysLine ? `\n${trialDaysLine}` : ''}${teamBrainDiscoveryLine ? `\n${teamBrainDiscoveryLine}` : ''}`;
+  return [proTrialLine('session-start', plan), trialDaysLine, teamBrainDiscoveryLine]
+    .filter(Boolean).join('\n');
+}
+
+const ANSI_ESCAPE = /\x1b\[[0-9;]*m/g;
+/**
+ * A timeline row, opening with its id (digits, or a server's hex display ref):
+ * the colored preview's `  #<id>  <time> …` or summary `#S<id> …`, or the
+ * plain block's `<id> <time> …`, `S<id> …` or `**<id>** …` (antigravity-cli
+ * shows the model's block). A `### <day>` heading has no id, so it is not one.
+ */
+const TERMINAL_TIMELINE_ROW = /^(?:\s*#|\*\*)?S?[0-9a-f][0-9a-f-]*(?:\*\*)? /;
+
+/** How many timeline rows a terminal preview shows. */
+export function countTerminalTimelineRows(preview: string): number {
+  return preview.split('\n').filter(line => TERMINAL_TIMELINE_ROW.test(line.replace(ANSI_ESCAPE, ''))).length;
 }
 
 /**
- * The user-visible SessionStart `systemMessage`: the once-per-session
- * worker-outage notice, the viewer lines, then the terminal preview, which ends
- * on its newest timeline entry. Claude Code replaces a field over
- * CONTEXT_OUTPUT_LIMIT with a saved-to-disk stub (#5079), and neither the
- * notice nor a server-runtime viewer URL is bounded by
+ * The line that closes the terminal banner, under a blank line after the
+ * newest timeline row: the live viewer link and how many rows are shown.
+ */
+export function sessionStartBannerFooter(viewerUrl: string, timelineRowCount: number): string {
+  const count = timelineRowCount > 0 ? ` · ${timelineRowCount} line${timelineRowCount === 1 ? '' : 's'}` : '';
+  return `View Observations Live @ ${viewerUrl}${count}`;
+}
+
+/**
+ * The user-visible SessionStart `systemMessage`: any worker-outage or first-use
+ * telemetry notice and the header lines, the terminal preview, then a
+ * blank line and the closing viewer line with the count of rows shown. Claude
+ * Code replaces a field over CONTEXT_OUTPUT_LIMIT with a saved-to-disk stub
+ * (#5079), and neither the notice nor a server-runtime viewer URL is bounded by
  * TERMINAL_BANNER_RESERVE_CHARS, so the message is measured whole: when it is
- * over, whole lines are dropped from the preview's oldest end until it fits,
- * so it still ends on its newest entry. The notice and the viewer lines are
- * never cut. With no preview (banner off) the notice is the whole message.
+ * over, whole lines are dropped from the preview's oldest end until it fits, so
+ * the preview still ends on its newest entry. The notice, the header lines and
+ * the closing line are never cut. With no preview (banner off) the notice is
+ * the whole message.
  */
 export function composeSessionStartSystemMessage(
   preview: string | null,
   bannerHeader: string,
-  workerOutageNotice: string | null,
+  viewerUrl: string,
+  userNotice: string | null,
   limit: number = CONTEXT_OUTPUT_LIMIT,
 ): string | undefined {
-  if (preview === null) return workerOutageNotice ?? undefined;
-  const top = `${workerOutageNotice ? `${workerOutageNotice}\n\n` : ''}${bannerHeader}\n\n`;
-  const previewRoom = limit - top.length;
-  let fittedPreview = preview.replace(/^\n+/, '');
+  if (preview === null) return userNotice ?? undefined;
+  const top = [userNotice, bannerHeader].filter(Boolean).map(part => `${part}\n\n`).join('');
+  let fittedPreview = preview.replace(/^\n+/, '').trimEnd();
+  // Measured with every row counted; cutting rows only shortens the count.
+  const longestBottom = `\n\n${sessionStartBannerFooter(viewerUrl, countTerminalTimelineRows(fittedPreview))}`;
+  const previewRoom = limit - top.length - longestBottom.length;
   if (fittedPreview.length > previewRoom) {
-    const previewCutToRoom = previewRoom > 0 ? fittedPreview.slice(fittedPreview.length - previewRoom) : '';
-    const firstLineBreak = previewCutToRoom.indexOf('\n');
-    const keptPreview = firstLineBreak >= 0 ? previewCutToRoom.slice(firstLineBreak + 1) : '';
+    // The kept text starts after the first line break at or after the char just
+    // before the room, so a room that begins exactly on a line keeps that line.
+    const lineBreakBeforeKept = previewRoom > 0 ? fittedPreview.indexOf('\n', fittedPreview.length - previewRoom - 1) : -1;
+    const keptPreview = lineBreakBeforeKept >= 0 ? fittedPreview.slice(lineBreakBeforeKept + 1) : '';
     logger.debug('HOOK', 'SessionStart terminal preview cut at a line boundary, oldest lines first, to keep systemMessage within the field cap', {
       previewChars: fittedPreview.length,
       keptPreviewChars: keptPreview.length,
@@ -114,7 +158,8 @@ export function composeSessionStartSystemMessage(
     });
     fittedPreview = keptPreview;
   }
-  const systemMessage = `${top}${fittedPreview}`.trimEnd();
+  const footer = sessionStartBannerFooter(viewerUrl, countTerminalTimelineRows(fittedPreview));
+  const systemMessage = `${top}${fittedPreview ? `${fittedPreview}\n\n` : ''}${footer}`;
   if (systemMessage.length > limit) {
     logger.warn('HOOK', 'SessionStart systemMessage is over the field cap even with no preview', {
       systemMessageChars: systemMessage.length,
@@ -122,6 +167,34 @@ export function composeSessionStartSystemMessage(
     });
   }
   return systemMessage;
+}
+
+/**
+ * What the session-start card draws (src/shared/session-start-card-slot.ts):
+ * the banner's header lines and the terminal preview. The closing line is not
+ * in it, and neither is a line shown only once: the hook message carries those.
+ */
+export function sessionStartCardText(preview: string, bannerHeader: string): string {
+  return [bannerHeader, preview.replace(/^\n+/, '').trimEnd()].filter(Boolean).join('\n\n');
+}
+
+/**
+ * The SessionStart `systemMessage` when the session-start card draws the
+ * banner: any notice and the TeamBrain discovery line, then the closing line
+ * with the count of rows the card shows. Those first lines are shown only
+ * once, and the card can still fail to draw, so they are not left to it.
+ * With neither it is one line. That is what the card is for: the stream
+ * Claude Code sends to the Claude app repeats the hook's name on every line
+ * of a hook message, and the terminal shows it once.
+ */
+export function composeSessionStartCardSystemMessage(
+  preview: string,
+  viewerUrl: string,
+  userNotice: string | null,
+  teamBrainDiscoveryLine: string | null,
+): string {
+  const footer = sessionStartBannerFooter(viewerUrl, countTerminalTimelineRows(preview));
+  return [userNotice, teamBrainDiscoveryLine, footer].filter(Boolean).join('\n\n');
 }
 
 /**
@@ -153,6 +226,18 @@ export function fitTeamBriefSection(section: string, otherChars: number, limit: 
 }
 
 /**
+ * Room left for the SessionStart body once the notices are counted: the field
+ * limit minus the notices and the blank line joining them to the body. The
+ * one definition both the cached read and the compose step use, so a body
+ * that fits here is never dropped there (#5672: a cached body rendered for
+ * the full budget must not be served when the current notices leave less
+ * room than it needs).
+ */
+export function sessionStartBodyRoom(notices: string, limit: number = CONTEXT_OUTPUT_LIMIT): number {
+  return Math.max(0, limit - notices.length - (notices ? 2 : 0));
+}
+
+/**
  * The model-bound SessionStart field: the notices, the TeamBrain brief, then
  * the memory body last. The body is the timeline and ends on its newest entry,
  * so nothing is added after it: a later update can append timeline rows.
@@ -170,7 +255,7 @@ export function composeSessionStartContext(
   limit: number = CONTEXT_OUTPUT_LIMIT,
 ): string {
   const join = (...parts: string[]) => parts.filter(Boolean).join('\n\n');
-  const room = Math.max(0, limit - notices.length - (notices ? 2 : 0));
+  const room = sessionStartBodyRoom(notices, limit);
   if (body.length > room) {
     // Older workers may ignore reserveChars; irreducible renderer output may
     // also exceed its limit. Never cut a rendered entry, code fence, or newest
@@ -293,7 +378,35 @@ export const contextHandler: EventHandler = {
     // (shared/memory-instructions.ts), not in this block: it is the timeline.
     const settings = loadFromFileOnce();
 
+    // A deferred agent install is explicit. A missing setup file on an older
+    // installation does not interrupt normal sessions or force onboarding.
+    const runtime = resolveRuntimeContext();
+    let onboardingNotice: string | null = null;
+    if (runtime.runtime === 'worker') {
+      try {
+        onboardingNotice = pendingSetupNotice(readSetupState(), getViewerBaseUrl(port));
+      } catch (error) {
+        logger.debug('HOOK', 'Could not read pending onboarding', { error: error instanceof Error ? error.message : String(error) });
+      }
+    }
+
+    // Disclosures belong to the user, including with the timeline banner off.
+    // Consume only when returning a result, so a failed async read cannot mark
+    // an undelivered disclosure as shown. Other hosts use their installer flow.
+    const userNotice = (workerNotice: string | null = null): string | null => [
+      onboardingNotice,
+      workerNotice,
+      input.platform === 'claude-code' ? consumeTelemetryNotice() : null,
+    ].filter(Boolean).join('\n\n') || null;
+    // Without the worker there is no timeline, but a pending onboarding still reaches the agent as context.
+    const noticeOnlyResult = (notice: string | null): HookResult => notice ? {
+      ...emptyResult,
+      ...(onboardingNotice ? { hookSpecificOutput: { hookEventName, additionalContext: onboardingNotice } } : {}),
+      systemMessage: notice,
+    } : emptyResult;
+
     const notices: string[] = [];
+    if (onboardingNotice) notices.push(onboardingNotice);
 
     // Issue #2215: surface stale OAuth token marker as a session-start hint.
     // Marker is written by EnvManager.buildIsolatedEnvWithFreshOAuth() when
@@ -368,7 +481,6 @@ export const contextHandler: EventHandler = {
     // Server runtime reads the shared server (plan-24 step 4). When the server
     // settings are incomplete, resolveRuntimeContext() falls back to the worker,
     // exactly as the write hooks do, so reads and writes stay on one corpus.
-    const runtime = resolveRuntimeContext();
     const serverRuntime = runtime.runtime === 'server' ? runtime : null;
 
     const scopeProjects = await resolveSessionStartProjects(settings, context.allProjects, runtime.runtime);
@@ -421,9 +533,13 @@ export const contextHandler: EventHandler = {
         renderedAgoMs: cacheNowEpochMs - cached.renderedAtEpochMs,
       });
       const filled = fillContextPlaceholders(cached.body, cacheNowEpochMs, cached.placeholderNonce);
-      // A notice or settings change can outgrow the reserve of an older cache.
-      // Re-render whole entries instead of cutting an opaque cached string.
-      if (!colors && [noticeText, filled].filter(Boolean).join('\n\n').length > CONTEXT_OUTPUT_LIMIT) return null;
+      // A cached body was rendered for the full budget, without this session's
+      // notice reserve (#5672). Serve it only when it fits the room the
+      // current notices leave, the same room composeSessionStartContext
+      // enforces below; otherwise fall through to the live fetch, which
+      // re-renders it with the current reserve. Never cut a rendered entry
+      // to fit.
+      if (!colors && filled.length > sessionStartBodyRoom(noticeText)) return null;
       return filled;
     };
     const cachedModelContext = showLastMessage ? null : readCachedRender(false);
@@ -434,9 +550,16 @@ export const contextHandler: EventHandler = {
       ? { workerStartupTimeoutMs: HOOK_TIMEOUTS.POST_SPAWN_WAIT, timeoutMs: 2_000 }
       : undefined;
     let workerOutageNotice: string | null = null;
-    let contextResult = serverRender
-      ? serverRender.model
-      : cachedModelContext ?? await executeWithWorkerFallback<string>(apiPath, 'GET', undefined, workerOptions);
+    let contextResult: WorkerCallResult<string>;
+    try {
+      contextResult = serverRender
+        ? serverRender.model
+        : cachedModelContext ?? await executeWithWorkerFallback<string>(apiPath, 'GET', undefined, workerOptions);
+    } catch (error) {
+      if (input.platform !== 'claude-code' || !isWorkerUnavailableError(error)) throw error;
+      await recordWorkerUnreachable();
+      return noticeOnlyResult(userNotice(await consumeWorkerOutageNotice(input.sessionId)));
+    }
     if (showLastMessage && isWorkerFallback(contextResult)) {
       const cachedFallback = readCachedRender(false);
       if (cachedFallback !== null) {
@@ -447,31 +570,38 @@ export const contextHandler: EventHandler = {
     if (isWorkerFallback(contextResult)) {
       // SessionStart context is synchronous, so a systemMessage here is shown
       // to the user: the once-per-session worker-outage notice, if any.
-      const outageNotice = await consumeWorkerOutageNotice(input.sessionId);
-      return outageNotice ? { ...emptyResult, systemMessage: outageNotice } : emptyResult;
+      return noticeOnlyResult(userNotice(await consumeWorkerOutageNotice(input.sessionId)));
     }
 
     let additionalContext: string;
     if (typeof contextResult === 'string') {
       additionalContext = contextResult.trim();
+      // Claude Code that loads RULES-AND-TOOLS.md through CLAUDE.md needs no pointer to it.
+      if (input.platform === 'claude-code') additionalContext = withoutLoadedRulesPointer(additionalContext);
     } else if (contextResult === undefined) {
       additionalContext = '';
     } else {
       logger.warn('HOOK', 'Context response was not a string', { type: typeof contextResult });
-      return emptyResult;
+      return { ...emptyResult, systemMessage: userNotice() ?? undefined };
     }
 
     let coloredTimeline = '';
     if (showTerminalOutput) {
       const colors = input.platform === 'claude-code';
-      const colorResult = serverRender
-        ? serverRender.terminal
-        : (showLastMessage ? null : readCachedRender(colors))
-          ?? await executeWithWorkerFallback<string>(colorApiPath, 'GET', undefined, workerOptions);
-      if (!isWorkerFallback(colorResult) && typeof colorResult === 'string') {
-        coloredTimeline = colorResult.trim();
-      } else if (showLastMessage && isWorkerFallback(colorResult)) {
-        coloredTimeline = readCachedRender(colors)?.trim() ?? '';
+      try {
+        const colorResult = serverRender
+          ? serverRender.terminal
+          : (showLastMessage ? null : readCachedRender(colors))
+            ?? await executeWithWorkerFallback<string>(colorApiPath, 'GET', undefined, workerOptions);
+        if (!isWorkerFallback(colorResult) && typeof colorResult === 'string') {
+          coloredTimeline = colorResult.trim();
+        } else if (showLastMessage && isWorkerFallback(colorResult)) {
+          coloredTimeline = readCachedRender(colors)?.trim() ?? '';
+        }
+      } catch (error) {
+        if (input.platform !== 'claude-code' || !isWorkerUnavailableError(error)) throw error;
+        await recordWorkerUnreachable();
+        workerOutageNotice = await consumeWorkerOutageNotice(input.sessionId);
       }
     }
 
@@ -504,16 +634,34 @@ export const contextHandler: EventHandler = {
     const viewerUrl = serverRuntime ? serverRuntime.serverBaseUrl : getViewerBaseUrl(port);
     const showsBanner = showTerminalOutput && Boolean(displayContent);
     // TeamBrain discovery: one line on the banner the user already reads, once
-    // per claude-mem version, and never once this install is in a team.
+    // per install, and never once this install is in a team.
     const teamBrainDiscoveryLine = showsBanner && !teamBrain && !hasShownTeamBrainDiscoveryNotice()
       ? TEAMBRAIN_DISCOVERY_LINE
       : null;
     if (teamBrainDiscoveryLine) markTeamBrainDiscoveryNoticeShown();
-    const systemMessage = composeSessionStartSystemMessage(
-      showsBanner ? displayContent : null,
-      sessionStartBannerHeader(viewerUrl, trialDaysLine, teamBrainDiscoveryLine),
-      workerOutageNotice,
-    );
+    const notice = userNotice(workerOutageNotice);
+    // Claude Code's session-start card named a file: once the banner is in it
+    // the card draws it, and the hook message is the closing line alone.
+    // The card is placed when Claude Code keeps the row that holds the hooks'
+    // context (src/mods/session-start-card/register.ts), and Claude Code makes
+    // that row only for context that is not empty: without any, the file stays
+    // unwritten and the whole banner goes in the hook message.
+    // The card can still fail to draw, so what is shown only once (the
+    // notices, the TeamBrain discovery line) stays in the hook message.
+    const cardDrawsBanner = showsBanner && additionalContext !== '' && input.sessionStartCardFile !== undefined
+      && writeSessionStartCardSlot(
+        input.sessionStartCardFile,
+        input.sessionId,
+        sessionStartCardText(displayContent, sessionStartBannerHeader(trialDaysLine, null, settings.CLAUDE_MEM_PRO_PLAN)),
+      );
+    const systemMessage = cardDrawsBanner
+      ? composeSessionStartCardSystemMessage(displayContent, viewerUrl, notice, teamBrainDiscoveryLine)
+      : composeSessionStartSystemMessage(
+        showsBanner ? displayContent : null,
+        sessionStartBannerHeader(trialDaysLine, teamBrainDiscoveryLine, settings.CLAUDE_MEM_PRO_PLAN),
+        viewerUrl,
+        notice,
+      );
 
     return {
       hookSpecificOutput: {

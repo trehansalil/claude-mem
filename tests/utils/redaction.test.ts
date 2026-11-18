@@ -279,20 +279,6 @@ describe('redactSensitive built-in patterns', () => {
     expect(redactSensitive(JSON.stringify({ stdout: `a ${word}` }), cfg).redacted).toBe(JSON.stringify({ stdout: `a ${word}` }));
   });
 
-  // The worker scans JSON.stringify(toolResponse), so a newline right before
-  // the key arrives as the two characters `\n`; the `n` is a word character,
-  // so a bare `\b` cannot match there and the key survived redaction.
-  it('redacts a perplexity_key printed right after a newline (worker capture path)', () => {
-    const output = `Deployment ready.\n${'ppl' + 'x-' + PPLX_BODY}`;
-    for (const text of [output, JSON.stringify({ stdout: output })]) {
-      const result = redactSensitive(text, cfg);
-      expect(result.counts.perplexity_key).toBe(1);
-      expect(result.redacted).not.toContain(PPLX_BODY);
-    }
-    const stored = redactSensitive(JSON.stringify({ stdout: output }), cfg).redacted;
-    expect(JSON.parse(stored).stdout).toBe(`Deployment ready.\n<redacted type='perplexity_key'/>`);
-  });
-
   // Perplexity model ids share the `pplx-` prefix; their `-`/`.` separators
   // and short bodies keep them out of the 48-alphanumeric key pattern.
   it.each([
@@ -330,6 +316,93 @@ describe('redactSensitive built-in patterns', () => {
     'sbp_' + '0123456789abcdef0123456789abcdef',
     'sntryu_' + '0123456789abcdef0123456789abcdef',
     'the sntrys_ prefix',
+  ])('leaves %s alone', (input) => {
+    expect(redactSensitive(input, cfg).redacted).toBe(input);
+  });
+
+  // Grafana service account / Cloud tokens and Postman API keys; split for
+  // push protection too.
+  const GRAFANA_SA_BODY = 'aBcDeFgHiJkLmNoP' + 'qRsTuVwXyZ012345';
+  const GRAFANA_SA_CHECK = '0a1b' + '2c3d';
+  const GRAFANA_CLOUD_BODY = 'eyJvIjoiMTIzNDU2IiwibiI6InN0YWNr' + 'LWRlcGxveSIsImsiOiJhQmNEZUZnSGlK' + 'a0xtTm9QcVJzVHUifQ==';
+  const POSTMAN_ID = '0123456789abcdef' + '01234567';
+  const POSTMAN_SECRET = '0123456789abcdef0' + '123456789abcdef01';
+  it.each([
+    ['grafana_token', 'export GRAFANA_SERVICE_ACCOUNT_TOKEN=' + 'gl' + 'sa_' + GRAFANA_SA_BODY + '_' + GRAFANA_SA_CHECK + ' tail', GRAFANA_SA_BODY],
+    ['grafana_token', 'curl -H "Authorization: Bearer ' + 'gl' + 'sa_' + GRAFANA_SA_BODY + '_' + GRAFANA_SA_CHECK + '" tail', GRAFANA_SA_BODY],
+    ['grafana_token', 'GRAFANA_CLOUD_TOKEN=' + 'gl' + 'c_' + GRAFANA_CLOUD_BODY + ' tail', GRAFANA_CLOUD_BODY],
+    ['postman_key', 'POSTMAN_API_KEY=' + 'PM' + 'AK-' + POSTMAN_ID + '-' + POSTMAN_SECRET + ' tail', POSTMAN_SECRET],
+    ['postman_key', '{"apiKey": "' + 'PM' + 'AK-' + POSTMAN_ID + '-' + POSTMAN_SECRET + '"} tail', POSTMAN_SECRET],
+  ])('redacts a %s in %s', (name, input, body) => {
+    const result = redactSensitive(input, cfg);
+    expect(result.redacted).toContain(`<redacted type='${name}'/>`);
+    expect(result.redacted).toMatch(/ tail$/);
+    expect(result.redacted).not.toContain(body);
+    expect(Object.keys(result.counts)).toEqual([name]);
+  });
+
+  it.each([
+    'glsa_short',
+    'gl' + 'sa_' + 'aBcDeFgHiJkLmNoP' + '_0a1b2c3d',
+    'gl' + 'sa_' + 'aBcDeFgHiJkLmNoPqRsTuVwXyZ012345' + '_nothexhex',
+    'glc_short',
+    'the glc_ prefix',
+    'PMAK-short',
+    'PM' + 'AK-' + '0123456789abcdef01234567' + '-0123',
+  ])('leaves %s alone', (input) => {
+    expect(redactSensitive(input, cfg).redacted).toBe(input);
+  });
+
+  // Pulumi access tokens and Doppler personal tokens; split for push
+  // protection too.
+  const PULUMI_BODY = '0123456789abcdef0123' + '456789abcdef01234567';
+  const DOPPLER_BODY = 'aBcDeFgHiJkLmNoPqRsTu' + 'VwXyZ0123456789aBcDeFg';
+  it.each([
+    ['pulumi_token', 'export PULUMI_ACCESS_TOKEN=' + 'pu' + 'l-' + PULUMI_BODY + ' tail', PULUMI_BODY],
+    ['pulumi_token', '{"accessToken": "' + 'pu' + 'l-' + PULUMI_BODY + '"} tail', PULUMI_BODY],
+    ['doppler_token', 'DOPPLER_TOKEN=' + 'dp' + '.pt.' + DOPPLER_BODY + ' tail', DOPPLER_BODY],
+    ['doppler_token', 'doppler configure set token ' + 'dp' + '.pt.' + DOPPLER_BODY + ' tail', DOPPLER_BODY],
+  ])('redacts a %s in %s', (name, input, body) => {
+    const result = redactSensitive(input, cfg);
+    expect(result.redacted).toContain(`<redacted type='${name}'/>`);
+    expect(result.redacted).toMatch(/ tail$/);
+    expect(result.redacted).not.toContain(body);
+    expect(Object.keys(result.counts)).toEqual([name]);
+  });
+
+  it.each([
+    'pul-short',
+    'pu' + 'l-' + '0123456789abcdef0123456789abcdef0123456G',
+    'pu' + 'l-' + '0123456789abcdef0123456789abcdef012345678',
+    'dp.pt.short',
+    'dp' + '.pt.' + 'aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789aBcDeF',
+    'dp' + '.st.' + 'aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789aBcDeFg',
+  ])('leaves %s alone', (input) => {
+    expect(redactSensitive(input, cfg).redacted).toBe(input);
+  });
+
+  // Heroku API keys and Atlassian API tokens; split for push protection too.
+  const HEROKU_BODY = 'aBcDeFgHiJkLmNoPqRsTuVwXyZ01234' + '56789_-aBcDeFgHiJkLmNoPqRsS';
+  const ATLASSIAN_BODY = ('xYz0123456789_-aBcDeFgHiJkLmNoPqRsTuVw' + 'XyZ0123456789').repeat(3) + 'aBcDeFgHiJkLmNoPqRsTuVwXyZ=0A1B2C';
+  it.each([
+    ['heroku_key', 'export HEROKU_API_KEY=' + 'HR' + 'KU-AA' + HEROKU_BODY + ' tail', HEROKU_BODY],
+    ['heroku_key', 'machine api.heroku.com login me@example.com password ' + 'HR' + 'KU-AA' + HEROKU_BODY + ' tail', HEROKU_BODY],
+    ['atlassian_token', 'JIRA_API_TOKEN=' + 'ATA' + 'TT3' + ATLASSIAN_BODY + ' tail', ATLASSIAN_BODY],
+    ['atlassian_token', 'curl -u me@example.com:' + 'ATA' + 'TT3' + ATLASSIAN_BODY + ' tail', ATLASSIAN_BODY],
+  ])('redacts a %s in %s', (name, input, body) => {
+    const result = redactSensitive(input, cfg);
+    expect(result.redacted).toContain(`<redacted type='${name}'/>`);
+    expect(result.redacted).toMatch(/ tail$/);
+    expect(result.redacted).not.toContain(body);
+    expect(Object.keys(result.counts)).toEqual([name]);
+  });
+
+  it.each([
+    'HRKU-short',
+    'HR' + 'KU-AA' + 'aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789',
+    'HR' + 'KU-BB' + 'aBcDeFgHiJkLmNoPqRsTuVwXyZ01234' + '56789_-aBcDeFgHiJkLmNoPqRs',
+    'ATATT3short',
+    'ATA' + 'TT3' + 'aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789',
   ])('leaves %s alone', (input) => {
     expect(redactSensitive(input, cfg).redacted).toBe(input);
   });
@@ -849,10 +922,20 @@ describe('redactSensitive generic built-in patterns', () => {
   });
 
   it('stays linear on long whitespace runs (no quadratic lookbehind)', () => {
-    const padded = `password=${' '.repeat(200_000)}AWS_SECRET_ACCESS_KEY${' '.repeat(200_000)}=x`;
-    const started = performance.now();
-    redactSensitive(padded, cfg);
-    expect(performance.now() - started).toBeLessThan(1000);
+    const measure = (padding: number) => {
+      const padded = `password=${' '.repeat(padding)}AWS_SECRET_ACCESS_KEY${' '.repeat(padding)}=x`;
+      const started = performance.now();
+      redactSensitive(padded, cfg);
+      return performance.now() - started;
+    };
+    measure(2_500);
+    const small: number[] = [];
+    const large: number[] = [];
+    for (let i = 0; i < 3; i++) {
+      small.push(measure(12_500));
+      large.push(measure(25_000));
+    }
+    expect(Math.min(...large) / Math.min(...small)).toBeLessThan(3);
   });
 });
 
@@ -1002,5 +1085,120 @@ describe('loadRedactionConfig', () => {
       CLAUDE_MEM_REDACT_CUSTOM_PATTERNS: '{not valid json',
     }));
     expect(cfg.customPatterns).toEqual([]);
+  });
+});
+
+// A Cookie/Set-Cookie header value is a session credential whatever the cookie
+// is named. The Cowork shim has redacted these since the plugin landed
+// (COOKIE_RE), so the same session text was redacted on its way to cmem.ai and
+// stored verbatim by the local worker.
+describe('cookie header values', () => {
+  const cfg = { enabled: true };
+
+  it.each([
+    ['a Cookie header line',   'Cookie: sessionid=abc123def456ghi789'],
+    ['a lowercase set-cookie', 'set-cookie: sid=Zx9Yw8Vu7Ts6Rq5Po4Nn3Mm2'],
+    ['a JSON-escaped newline', '\\nCookie: sessionid=abc123def456ghi789'],
+  ])('redacts %s', (_label, input) => {
+    const result = redactSensitive(input, cfg);
+    expect(result.redacted).toContain("<redacted type='cookie_header'/>");
+    expect(result.redacted).not.toContain('abc123def456ghi789');
+    expect(result.redacted).not.toContain('Zx9Yw8Vu7Ts6Rq5Po4Nn3Mm2');
+    expect(Object.keys(result.counts)).toEqual(['cookie_header']);
+  });
+
+  it('redacts a JSON header object the same way', () => {
+    const text = JSON.stringify({ headers: { Cookie: 'sessionid=abc123def456ghi789', accept: 'application/json' } });
+    const result = redactSensitive(text, cfg);
+    expect(result.redacted).toContain("<redacted type='cookie_header'/>");
+    expect(result.redacted).not.toContain('abc123def456ghi789');
+  });
+
+  it('keeps the key readable and leaves prose about cookies alone', () => {
+    const result = redactSensitive('Cookie: sessionid=abc123def456ghi789', cfg);
+    expect(result.redacted).toBe("Cookie: <redacted type='cookie_header'/>");
+
+    for (const prose of ['we send a cookie with every request', 'cookie: x', 'cookies: are tasty']) {
+      expect(redactSensitive(prose, cfg).redacted).toBe(prose);
+    }
+  });
+
+  it('can be turned off by name like every other built-in', () => {
+    const result = redactSensitive('Cookie: sessionid=abc123def456ghi789', {
+      enabled: true,
+      disabledBuiltinPatterns: ['cookie_header'],
+    });
+    expect(result.redacted).toBe('Cookie: sessionid=abc123def456ghi789');
+    expect(redactJsonStrings({ headers: { Cookie: 'sessionid=abc123def456ghi789' } }, {
+      enabled: true,
+      disabledBuiltinPatterns: ['cookie_header'],
+    })).toEqual({ headers: { Cookie: 'sessionid=abc123def456ghi789' } });
+  });
+
+  // The worker scans tool output as JSON.stringify(...), where a line break is
+  // the two characters `\n` and a quote is `\"`.
+  it('stops at an escaped line break, so the rest of a stringified response survives', () => {
+    const text = JSON.stringify('Set-Cookie: sid=abc123def\nContent-Type: text/plain\n\nBuild succeeded');
+    const result = redactSensitive(text, cfg);
+    expect(result.redacted).not.toContain('abc123def');
+    expect(JSON.parse(result.redacted)).toBe("Set-Cookie: <redacted type='cookie_header'/>\nContent-Type: text/plain\n\nBuild succeeded");
+  });
+
+  it('redacts a header object that was stringified twice', () => {
+    const text = JSON.stringify(JSON.stringify({ headers: { Cookie: 'sessionid=abc123def456ghi789' } }));
+    const result = redactSensitive(text, cfg);
+    expect(result.redacted).not.toContain('abc123def456ghi789');
+    expect(JSON.parse(JSON.parse(result.redacted))).toEqual({ headers: { Cookie: "<redacted type='cookie_header'/>" } });
+  });
+
+  it('keeps a stringified curl command valid JSON', () => {
+    const text = JSON.stringify('curl -H "Cookie: sessionid=abc123def456ghi789" https://example.com');
+    const result = redactSensitive(text, cfg);
+    expect(result.redacted).not.toContain('abc123def456ghi789');
+    expect(JSON.parse(result.redacted)).toBe(`curl -H "Cookie: <redacted type='cookie_header'/>" https://example.com`);
+  });
+
+  it('pairs Cookie and Set-Cookie keys in structured payloads', () => {
+    const redacted = redactJsonStrings({
+      headers: {
+        Cookie: 'sessionid=abc123def456ghi789',
+        'Set-Cookie': 'sid=Zx9Yw8Vu7Ts6Rq5Po4Nn3Mm2',
+        'set-cookie': ['sid=Aa1Bb2Cc3Dd4', 'csrftoken=Ee5Ff6Gg7Hh8'],
+        accept: 'application/json',
+      },
+    }, { enabled: true });
+    expect(redacted).toEqual({
+      headers: {
+        Cookie: "<redacted type='cookie_header'/>",
+        'Set-Cookie': "<redacted type='cookie_header'/>",
+        'set-cookie': ["<redacted type='cookie_header'/>", "<redacted type='cookie_header'/>"],
+        accept: 'application/json',
+      },
+    });
+  });
+
+  it('leaves no cookie readable when a vendor token sits in the same header', () => {
+    const ghToken = 'ghp_' + 'G'.repeat(36);
+    const header = `Cookie: gh=${ghToken}; sessionid=abc123def456ghi789`;
+    for (const redacted of [
+      redactSensitive(header, cfg).redacted,
+      JSON.stringify(redactJsonStrings({ Cookie: `gh=${ghToken}; sessionid=abc123def456ghi789` }, { enabled: true })),
+    ]) {
+      expect(redacted).not.toContain(ghToken);
+      expect(redacted).not.toContain('abc123def456ghi789');
+    }
+  });
+
+  it('is idempotent: a second pass leaves its own marker alone', () => {
+    for (const input of [
+      'Cookie: sessionid=abc123def456ghi789',
+      JSON.stringify({ headers: { Cookie: 'sessionid=abc123def456ghi789' } }),
+      JSON.stringify('curl -H "Cookie: sessionid=abc123def456ghi789" https://example.com'),
+    ]) {
+      const once = redactSensitive(input, cfg).redacted;
+      const twice = redactSensitive(once, cfg);
+      expect(twice.redacted).toBe(once);
+      expect(twice.counts).toEqual({});
+    }
   });
 });

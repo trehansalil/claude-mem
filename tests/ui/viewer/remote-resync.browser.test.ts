@@ -12,7 +12,10 @@ for (const scope of ['project', 'session']) {
       import React from 'react';
       import { createRoot } from 'react-dom/client';
       import { App } from './src/ui/viewer/App';
-      localStorage.setItem('claude-mem-welcome-dismissed', 'true');
+      import { setStoredWelcomeDismissed } from './src/ui/viewer/components/WelcomeCard';
+      setStoredWelcomeDismissed(true);
+      import { TIMING } from './src/ui/viewer/constants/timing';
+      TIMING.SSE_RECONNECT_DELAY_MS = 50;
       if (${JSON.stringify(scope)} === 'session') location.hash = '#/sessions/claude/owned-session';
       let aLoaded = 0;
       const originalFetch = window.fetch.bind(window);
@@ -39,8 +42,9 @@ for (const scope of ['project', 'session']) {
           await fetch('/ready');
           await until(() => has('MEMORY_1_END'), 'first page');
           if (${JSON.stringify(scope)} === 'project') {
-            const select = document.querySelector('select[aria-label="Filter memories by project"]');
-            select.value = 'A'; select.dispatchEvent(new Event('change', {bubbles:true}));
+            // The header's searchable Project filter: open it and choose the option.
+            const option = document.querySelector('.project-picker [role="option"][data-value="A"]');
+            document.querySelector('.project-picker-trigger').click(); option.click();
             await until(() => aLoaded > 0 && has('MEMORY_1_END') && !has('Loading more...'), 'project read');
           }
           scrollBottom();
@@ -117,10 +121,10 @@ for (const scope of ['project', 'session']) {
         rows.unshift({...rows[0],id:1001,title:'NEW_1001_END',created_at_epoch:200_000});
         title = 'UPDATED_SESSION_TITLE'; mutating = true;
         for (let i=0;i<20;i++) emit({type:'data_changed',kinds:['observation','mutation'],projects:['B']});
-        setTimeout(() => { countedMutation = true; }, 1000);
         return new Response('mutated');
       }
       if (url.pathname === '/disconnect') {
+        countedMutation = true;
         for (const stream of streams) { try { stream.close(); } catch {} } streams = new Set();
         return new Response('disconnected');
       }
@@ -133,7 +137,9 @@ for (const scope of ['project', 'session']) {
     } });
     let chrome: OwnedChrome | undefined;
     try {
-      chrome = launchChrome(server.url.href, { profilePrefix:'claude-mem-remote-resync-', extraFlags:['--window-size=900,700'] });
+      // Tall enough that every loaded row is drawn: the checks read the page text, and the
+      // list recycles rows outside the window once it passes 50 (FEED_WINDOW_THRESHOLD).
+      chrome = launchChrome(server.url.href, { profilePrefix:'claude-mem-remote-resync-', extraFlags:['--window-size=900,24000'] });
       await withTimeout(ready, 30000, 'Browser did not start');
       expect(await withTimeout(result, 30000, 'Remote reconciliation timed out')).toEqual({retained:true,refreshedTitle:true,older:true,recovered:true,noDuplicates:true});
       expect(afterMutationReads).toBeLessThanOrEqual(9);

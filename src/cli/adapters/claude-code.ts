@@ -1,6 +1,8 @@
 import type { PlatformAdapter, NormalizedHookInput, HookResult } from '../types.js';
 import { AdapterRejectedInput, isValidCwd } from './errors.js';
 import { resolveHookProjectPath } from '../../utils/project-name.js';
+import { withPersistedOutputTail } from './claude-code-persisted-output.js';
+import { SESSION_START_CARD_FILE_KEY } from '../../shared/session-start-card-slot.js';
 
 const MAX_AGENT_FIELD_LEN = 128;
 const pickAgentField = (v: unknown): string | undefined =>
@@ -41,8 +43,8 @@ const withGrokReadPath = (toolName: string | undefined, toolInput: unknown): unk
  * the stored row and the observer's <outcome>. The error text alone does not say
  * the call was interrupted.
  */
-const failedToolResponse = (r: Record<string, unknown>): { error: unknown; is_interrupt: boolean } | undefined =>
-  r.hook_event_name === 'PostToolUseFailure' ? { error: r.error, is_interrupt: r.is_interrupt === true } : undefined;
+const failedToolResponse = (r: Record<string, unknown>): { is_error: true; error: unknown; is_interrupt: boolean } | undefined =>
+  r.hook_event_name === 'PostToolUseFailure' ? { is_error: true, error: r.error, is_interrupt: r.is_interrupt === true } : undefined;
 
 /**
  * Read Qwen Code's `submitted_prompt` into the three states the handler needs.
@@ -81,11 +83,12 @@ export const claudeCodeAdapter: PlatformAdapter = {
       sessionSource: source === 'startup' || source === 'resume' || source === 'clear' || source === 'compact'
         ? source
         : undefined,
+      sessionStartCardFile: firstFilledString(r[SESSION_START_CARD_FILE_KEY]),
       prompt: firstFilledString(r.prompt, r.userPrompt),
       submittedPrompt: normalizeSubmittedPrompt(r),
       toolName,
       toolInput: withGrokReadPath(toolName, firstDefined(r.tool_input, r.toolInput)),
-      toolResponse: firstDefined(r.tool_response, r.toolResponse, r.toolResult) ?? failedToolResponse(r),
+      toolResponse: withPersistedOutputTail(firstDefined(r.tool_response, r.toolResponse, r.toolResult)) ?? failedToolResponse(r),
       toolUseId: firstFilledString(r.tool_use_id, r.toolUseId),
       transcriptPath: firstFilledString(r.transcript_path, r.transcriptPath),
       agentTranscriptPath: pickStringField(r.agent_transcript_path),

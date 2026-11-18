@@ -3,12 +3,13 @@ import { Database } from 'bun:sqlite';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { buildAgentView, readAgentRecords } from '../../src/services/work-view/agent-view.mjs';
 import { reduceWorkState } from '../../src/services/work-view/data-source.mjs';
 import { buildRefreshTask } from '../../src/services/work-view/refresh-task.js';
 import { applyGroupDecisions, groupIdFor, groupingInput, linkBackwards, readCandidates, readLedger, runCli, validateGroupingAnswer } from '../../src/services/work-view/request-groups.mjs';
 import { buildHumanRequests } from '../../src/services/work-view/request-projection.mjs';
-import { NO_PROJECT, pathsIn, projectFromToolPaths, withDerivedProjects, projectRoot, upgradedGroupRoot } from '../../src/services/work-view/session-project.mjs';
+import { NO_PROJECT, folderNeedsProject, pathsIn, projectFromToolPaths, withDerivedProjects, projectRoot, upgradedGroupRoot } from '../../src/services/work-view/session-project.mjs';
 import { everyRequestInOther, focusWriter } from '../helpers/fake-focus-writer.js';
 
 const DAY = 86400000, NOW = 100 * DAY;
@@ -19,8 +20,8 @@ const prompt = (id: number, sessionId: number, text: string, at: number, number 
 const link = (conversations: string[]) => [{ kind: 'agent-judgment', conversations, evidence: 'the later ask continues the earlier one' }];
 
 /** sdk_sessions and tool_uses with the cwd columns real databases have. */
-function database() {
-  const db = new Database(':memory:');
+function database(path = ':memory:') {
+  const db = new Database(path);
   db.exec(`CREATE TABLE sdk_sessions (id INTEGER PRIMARY KEY, platform_source TEXT, content_session_id TEXT, memory_session_id TEXT, project TEXT, user_prompt TEXT, started_at_epoch INTEGER, cwd TEXT, custom_title TEXT, status TEXT, completed_at_epoch INTEGER);
     CREATE TABLE user_prompts (id INTEGER PRIMARY KEY, session_db_id INTEGER, prompt_number INTEGER, prompt_text TEXT, created_at_epoch INTEGER);
     CREATE TABLE tool_uses (id INTEGER PRIMARY KEY, session_db_id INTEGER, tool_name TEXT, tool_input TEXT, cwd TEXT, created_at_epoch INTEGER);
@@ -317,6 +318,46 @@ const git = (cwd: string, ...args: string[]) => {
 };
 const gitRepo = (dir: string) => { mkdirSync(dir, { recursive: true }); git(dir, 'init', '-q'); git(dir, 'commit', '-q', '--allow-empty', '-m', 'init'); };
 
+describe('a grouping answer on the refresh\'s retry', () => {
+  const input = {
+    root: 'repo', proposedLinks: [], remaining: 0,
+    conversations: ['b', 'c', 'd', 'e'].map(id => ({ conversationKey: key(id), project: 'repo', startedAt: null, openingAsk: null, workLists: [] })),
+    openRequests: [{ groupId: groupIdFor(key('a')), title: 'Release cards', anchor: key('a'), anchorAsk: null, recentAsks: [], lastActivityAt: null }],
+  };
+
+  it('is cut to what apply accepts: no key outside the batch, no join without a link, no ignore reason past 200 characters', () => {
+    const answer = { groups: [
+      // The link names a conversation of another request (x); c is listed but linked to nothing.
+      { title: 'Release cards', conversations: [key('a'), key('b'), key('c'), key('x')], links: link([key('a'), key('b'), key('x')]) },
+      // An open request's anchor counts only when it comes first.
+      { title: 'Pricing', conversations: [key('d'), key('a')], links: link([key('d'), key('a')]) },
+    ], ignored: [{ conversation: key('e'), reason: 'Only a greeting. '.repeat(15) }, { conversation: key('y'), reason: 'From another batch.' }] };
+    expect(() => validateGroupingAnswer(answer, input)).toThrow('not asked about');
+    const coercedFields = new Set<string>();
+    const coerced = validateGroupingAnswer(answer, input, { coerce: true, coercedFields });
+    expect(coerced.groups.map(group => [group.title, group.conversations, group.links.map(entry => entry.conversations)])).toEqual([
+      ['Release cards', [key('a'), key('b')], [[key('a'), key('b')]]],
+      ['Release cards', [key('c')], []],
+      ['Pricing', [key('d')], []],
+    ]);
+    expect(coerced.ignored).toHaveLength(1);
+    expect(coerced.ignored[0].reason.length).toBeLessThanOrEqual(200);
+    expect(coerced.ignored[0].reason.endsWith('…')).toBe(true);
+    expect([...coercedFields]).toEqual(['groups[0]', 'groups[1]', 'ignored[0].reason', 'ignored[1]']);
+    expect(() => applyGroupDecisions(null, coerced, NOW)).not.toThrow();
+  });
+
+  it('a sound answer comes back as it was, with nothing named', () => {
+    const answer = { groups: [
+      { title: 'Release cards', conversations: [key('a'), key('b')], links: link([key('a'), key('b')]) },
+      { title: 'Pricing', conversations: [key('c'), key('d')], links: link([key('c'), key('d')]) },
+    ], ignored: [{ conversation: key('e'), reason: 'Only a greeting.' }] };
+    const coercedFields = new Set<string>();
+    expect(validateGroupingAnswer(answer, input, { coerce: true, coercedFields })).toEqual(answer);
+    expect(coercedFields.size).toBe(0);
+  });
+});
+
 describe('the real project of an agent scratch-folder session', () => {
   it('is named the way claude-mem names the checkout, so git-remote naming does not split one repo in two', () => {
     const root = mkdtempSync(join(tmpdir(), 'scratch-project-'));
@@ -332,6 +373,36 @@ describe('the real project of an agent scratch-folder session', () => {
       if (previous === undefined) delete process.env.CLAUDE_MEM_PROJECT_NAME_SOURCE; else process.env.CLAUDE_MEM_PROJECT_NAME_SOURCE = previous;
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  it('derives the project of a deleted temp checkout', () => {
+    const folder = mkdtempSync(join(tmpdir(), 'former-scratch-'));
+    rmSync(folder, { recursive: true });
+    expect(folderNeedsProject(folder, 'generated-task')).toBe(true);
+  });
+
+  it('uses the touched repository in the built request-progress skill after a temp checkout is removed', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'skill-project-'));
+    const path = join(dir, 'claude-mem.db');
+    try {
+      const repo = join(dir, 'product');
+      gitRepo(repo);
+      const checkout = join(dir, 'removed');
+      mkdirSync(checkout);
+      const db = database(path);
+      try {
+        addSession(db, 1, 'scratch', 'generated-task', 'Fix the release script', Date.now(), checkout);
+        db.prepare('INSERT INTO tool_uses (session_db_id, tool_name, tool_input) VALUES (?, ?, ?)')
+          .run(1, 'Read', JSON.stringify({ file_path: join(repo, 'README.md') }));
+      } finally { db.close(true); }
+      rmSync(checkout, { recursive: true });
+      const cli = fileURLToPath(new URL('../../plugin/skills/request-progress/scripts/request-groups.mjs', import.meta.url));
+      const result = Bun.spawnSync([process.execPath, cli, 'candidates', '--brief'], {
+        env: { ...process.env, CLAUDE_MEM_DATA_DIR: dir, CLAUDE_MEM_DB: path, CLAUDE_MEM_PROJECT_NAME_SOURCE: 'path' },
+      });
+      expect(result.exitCode, result.stderr.toString()).toBe(0);
+      expect(JSON.parse(result.stdout.toString()).candidates).toMatchObject([{ project: 'product' }]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
   it('reads native Windows paths and working folders on Windows', () => {

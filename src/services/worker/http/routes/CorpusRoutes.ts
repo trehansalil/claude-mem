@@ -5,14 +5,11 @@ import { BaseRouteHandler } from '../BaseRouteHandler.js';
 import { validateBody } from '../middleware/validateBody.js';
 import { CorpusStore, CORPUS_NAME_PATTERN, CORPUS_NAME_ERROR } from '../../knowledge/CorpusStore.js';
 import { CorpusBuilder } from '../../knowledge/CorpusBuilder.js';
-import { KnowledgeAgent } from '../../knowledge/KnowledgeAgent.js';
+import type { CorpusAgent } from '../../knowledge/CorpusAgent.js';
 import type { CorpusFilter } from '../../knowledge/types.js';
 import { logger } from '../../../../utils/logger.js';
 import { isForeignLoopbackBrowserWrite } from './SettingsRoutes.js';
 import { resolveDateBound } from '../../../../shared/date-bounds.js';
-
-const ALLOWED_CORPUS_TYPES = ['decision', 'bugfix', 'feature', 'refactor', 'discovery', 'change', 'security_alert', 'security_note', 'sensitive'] as const;
-const ALLOWED_CORPUS_TYPE_SET = new Set<string>(ALLOWED_CORPUS_TYPES);
 
 const stringArrayLike = z.preprocess((value) => {
   if (value === undefined || value === null || value === '') return undefined;
@@ -46,10 +43,9 @@ const buildCorpusSchema = z.object({
   name: z.string().min(1).regex(CORPUS_NAME_PATTERN, CORPUS_NAME_ERROR),
   description: z.string().optional(),
   project: z.string().optional(),
-  types: stringArrayLike.refine(
-    (arr) => arr === undefined || arr.every((t) => ALLOWED_CORPUS_TYPE_SET.has(t)),
-    { message: `types must contain only ${ALLOWED_CORPUS_TYPES.join(', ')}` }
-  ),
+  // Saved observations retain the type IDs of the mode that wrote them, even
+  // after the active mode changes. Match search's string filters, not a coding-only enum.
+  types: stringArrayLike,
   concepts: stringArrayLike,
   files: stringArrayLike,
   query: z.string().optional(),
@@ -77,6 +73,19 @@ interface CorpusOutcome {
 /** Comment-line heartbeat cadence for SSE mode (the MCP client's idle window is 30 s). */
 const DEFAULT_CORPUS_SSE_HEARTBEAT_INTERVAL_MS = 10_000;
 
+// A prime/query can persist the whole corpus after awaiting the SDK. Keep
+// every mutation of that corpus out until it settles, so an older snapshot
+// cannot replace a rebuild or recreate a corpus the owner just deleted.
+// Shared across route instances in the same worker; different names proceed.
+const activeCorpusOperations = new Set<string>();
+
+function corpusOperationKey(name: string): string {
+  // Case sensitivity belongs to the volume: macOS and mounted filesystems
+  // can resolve Alpha and alpha to one file too. Conservatively serialize
+  // these ASCII-name aliases everywhere, including before a file exists.
+  return name.trim().toLowerCase();
+}
+
 export interface CorpusRoutesOptions {
   sseHeartbeatIntervalMs?: number;
 }
@@ -92,15 +101,16 @@ function writeSseEvent(res: Response, eventName: 'result' | 'error', data: Recor
 
 /**
  * build / rebuild / prime / reprime / query can run for minutes (an Agent SDK
- * session over a whole corpus). With `Accept: text/event-stream` the route
- * answers at once with SSE: a `: ping` comment every heartbeat interval, then
- * exactly one terminal event — `result` (data = the JSON body the JSON mode
- * returns) or `error` (data = the JSON error body plus its HTTP `status`).
- * Without that header the route keeps its single JSON response.
+ * session over a whole corpus, or a provider answering one question about
+ * it). With `Accept: text/event-stream` the route answers at once with SSE: a
+ * `: ping` comment every heartbeat interval, then exactly one terminal event
+ * — `result` (data = the JSON body the JSON mode returns) or `error` (data =
+ * the JSON error body plus its HTTP `status`). Without that header the route
+ * keeps its single JSON response.
  *
  * Either way, a client that disconnects before the work settles aborts it
- * (the AbortController reaches the Agent SDK `query()`), so nobody pays for an
- * answer nobody is waiting on.
+ * (the AbortController reaches the agent), so nobody pays for an answer
+ * nobody is waiting on.
  */
 export class CorpusRoutes extends BaseRouteHandler {
   private readonly sseHeartbeatIntervalMs: number;
@@ -109,7 +119,7 @@ export class CorpusRoutes extends BaseRouteHandler {
   constructor(
     private corpusStore: CorpusStore,
     private corpusBuilder: CorpusBuilder,
-    private knowledgeAgent: KnowledgeAgent,
+    private knowledgeAgent: CorpusAgent,
     options: CorpusRoutesOptions = {}
   ) {
     super();
@@ -169,6 +179,7 @@ export class CorpusRoutes extends BaseRouteHandler {
   private async runLongCorpusWork(
     req: Request,
     res: Response,
+    name: string,
     work: (abortController: AbortController) => Promise<CorpusOutcome>
   ): Promise<void> {
     // Every mutating corpus route (build, rebuild, prime, query, reprime) runs
@@ -179,6 +190,28 @@ export class CorpusRoutes extends BaseRouteHandler {
       res.status(403).json({ error: 'Corpus work from a different localhost origin is not allowed' });
       return;
     }
+    if (this.rejectBusyCorpus(res, name)) return;
+    const key = corpusOperationKey(name);
+    activeCorpusOperations.add(key);
+    try {
+      await this.runAdmittedCorpusWork(req, res, work);
+    } finally {
+      // Client disconnect is not completion: a build may still be writing.
+      activeCorpusOperations.delete(key);
+    }
+  }
+
+  private rejectBusyCorpus(res: Response, name: string): boolean {
+    if (!activeCorpusOperations.has(corpusOperationKey(name))) return false;
+    res.status(409).json({ error: `Corpus "${name}" already has an operation in progress`, code: 'CORPUS_BUSY' });
+    return true;
+  }
+
+  private async runAdmittedCorpusWork(
+    req: Request,
+    res: Response,
+    work: (abortController: AbortController) => Promise<CorpusOutcome>
+  ): Promise<void> {
     const abortController = new AbortController();
     let workSettled = false;
     let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -261,7 +294,7 @@ export class CorpusRoutes extends BaseRouteHandler {
     // strategies, whose error handling turns it into a failed or unfiltered build.
     if (dateStart) resolveDateBound(dateStart, 'start');
     if (dateEnd) resolveDateBound(dateEnd, 'end');
-    return this.runLongCorpusWork(req, res, () => this.countCorpusBuild(() => this.buildCorpus(body, dateStart, dateEnd)));
+    return this.runLongCorpusWork(req, res, body.name, () => this.countCorpusBuild(() => this.buildCorpus(body, dateStart, dateEnd)));
   });
 
   private async buildCorpus(
@@ -273,7 +306,7 @@ export class CorpusRoutes extends BaseRouteHandler {
 
     const filter: CorpusFilter = {};
     if (project) filter.project = project;
-    if (types && types.length > 0) filter.types = types as CorpusFilter['types'];
+    if (types && types.length > 0) filter.types = types;
     if (concepts && concepts.length > 0) filter.concepts = concepts;
     if (files && files.length > 0) filter.files = files;
     if (query) filter.query = query;
@@ -310,6 +343,7 @@ export class CorpusRoutes extends BaseRouteHandler {
 
   private handleDeleteCorpus = this.wrapHandler((req: Request, res: Response): void => {
     const name = this.toStringParam(req.params.name);
+    if (this.rejectBusyCorpus(res, name)) return;
     const existed = this.corpusStore.delete(name);
 
     if (!existed) {
@@ -320,7 +354,7 @@ export class CorpusRoutes extends BaseRouteHandler {
     res.json({ success: true });
   });
 
-  private handleRebuildCorpus = this.wrapHandler((req: Request, res: Response) => this.runLongCorpusWork(req, res, () => this.countCorpusBuild(async () => {
+  private handleRebuildCorpus = this.wrapHandler((req: Request, res: Response) => this.runLongCorpusWork(req, res, this.toStringParam(req.params.name), () => this.countCorpusBuild(async () => {
     const name = this.toStringParam(req.params.name);
     const previousCorpus = this.corpusStore.read(name);
 
@@ -361,7 +395,7 @@ export class CorpusRoutes extends BaseRouteHandler {
     return previousCount >= 4 && newCount <= previousCount / 2;
   }
 
-  private handlePrimeCorpus = this.wrapHandler((req: Request, res: Response) => this.runLongCorpusWork(req, res, async (abortController) => {
+  private handlePrimeCorpus = this.wrapHandler((req: Request, res: Response) => this.runLongCorpusWork(req, res, this.toStringParam(req.params.name), async (abortController) => {
     const name = this.toStringParam(req.params.name);
     const corpus = this.corpusStore.read(name);
 
@@ -371,7 +405,7 @@ export class CorpusRoutes extends BaseRouteHandler {
     return { status: 200, body: { session_id: sessionId, name: corpus.name } };
   }));
 
-  private handleQueryCorpus = this.wrapHandler((req: Request, res: Response) => this.runLongCorpusWork(req, res, async (abortController) => {
+  private handleQueryCorpus = this.wrapHandler((req: Request, res: Response) => this.runLongCorpusWork(req, res, this.toStringParam(req.params.name), async (abortController) => {
     const name = this.toStringParam(req.params.name);
     const corpus = this.corpusStore.read(name);
 
@@ -379,10 +413,20 @@ export class CorpusRoutes extends BaseRouteHandler {
 
     const { question } = req.body;
     const result = await this.knowledgeAgent.query(corpus, question, { abortController });
-    return { status: 200, body: { answer: result.answer, session_id: result.session_id } };
+    return {
+      status: 200,
+      body: {
+        answer: result.answer,
+        session_id: result.session_id,
+        ...(result.observations_sent !== undefined && { observations_sent: result.observations_sent }),
+        ...(result.observations_matching !== undefined && { observations_matching: result.observations_matching }),
+        ...(result.observations_in_corpus !== undefined && { observations_in_corpus: result.observations_in_corpus }),
+        ...(result.observations_truncated !== undefined && { observations_truncated: result.observations_truncated }),
+      },
+    };
   }));
 
-  private handleReprimeCorpus = this.wrapHandler((req: Request, res: Response) => this.runLongCorpusWork(req, res, async (abortController) => {
+  private handleReprimeCorpus = this.wrapHandler((req: Request, res: Response) => this.runLongCorpusWork(req, res, this.toStringParam(req.params.name), async (abortController) => {
     const name = this.toStringParam(req.params.name);
     const corpus = this.corpusStore.read(name);
 

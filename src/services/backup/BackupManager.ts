@@ -1,4 +1,4 @@
-import { join, dirname } from 'path';
+import { basename, join } from 'path';
 import { existsSync, mkdirSync, readdirSync, renameSync, statSync, statfsSync, unlinkSync } from 'fs';
 import { DB_PATH, paths } from '../../shared/paths.js';
 import { logger } from '../../utils/logger.js';
@@ -16,7 +16,7 @@ export interface BackupManagerOptions {
   dbPath?: string;
   /** Snapshot target directory (defaults to paths.backups()). */
   backupsDir?: string;
-  /** Directory probed for free disk space (defaults to the db's directory). */
+  /** Directory probed for free disk space (defaults to the snapshot destination). */
   preflightDir?: string;
   /** Delay before the first scheduled run after start(). */
   initialDelayMs?: number;
@@ -28,6 +28,11 @@ export interface BackupSnapshotResult {
   path: string;
   bytes: number;
   createdAt: number;
+}
+
+export interface BackupRunResult extends BackupSnapshotResult {
+  /** The snapshot is complete, but pruning old snapshots failed. */
+  retentionError?: string;
 }
 
 export interface BackupStatus {
@@ -45,6 +50,9 @@ export interface BackupStatus {
  * the database.
  */
 const DEFAULT_INITIAL_DELAY_MS = 5 * 60_000;
+
+// Node and Bun turn delays above the signed 32-bit limit into 1 ms.
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 /** A snapshot still being written, or left behind by a crash mid-write. */
 const PARTIAL_SNAPSHOT_PATTERN = /^claude-mem-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z\.db\.partial(-wal|-shm|-journal)?$/;
@@ -79,18 +87,19 @@ export class BackupManager {
   private stopped = false;
   /** Single-flight: true while a snapshot cycle is in progress. */
   private running = false;
+  private readonly snapshots = new Map<AbortController, Promise<BackupSnapshotResult>>();
 
   private lastError: string | null = null;
   private nextRunAt: number | null = null;
 
   constructor(settings: BackupSettingKeys, options: BackupManagerOptions = {}) {
-    const intervalHours = Number.parseFloat(settings.CLAUDE_MEM_BACKUP_INTERVAL_HOURS ?? '');
-    this.intervalMs = (Number.isFinite(intervalHours) && intervalHours > 0 ? intervalHours : 24) * 3_600_000;
+    const intervalMs = Number.parseFloat(settings.CLAUDE_MEM_BACKUP_INTERVAL_HOURS ?? '') * 3_600_000;
+    this.intervalMs = Number.isFinite(intervalMs) && intervalMs > 0 ? intervalMs : 24 * 3_600_000;
     const retain = Number.parseInt(settings.CLAUDE_MEM_BACKUP_RETAIN_COUNT ?? '', 10);
     this.retainCount = Number.isFinite(retain) && retain > 0 ? retain : 7;
     this.dbPath = options.dbPath ?? DB_PATH;
     this.backupsDir = options.backupsDir ?? paths.backups();
-    this.preflightDir = options.preflightDir ?? dirname(this.dbPath);
+    this.preflightDir = options.preflightDir ?? this.backupsDir;
     this.initialDelayMs = options.initialDelayMs ?? DEFAULT_INITIAL_DELAY_MS;
     this.now = options.now ?? Date.now;
   }
@@ -107,13 +116,19 @@ export class BackupManager {
     });
   }
 
-  stop(): void {
+  async stop(): Promise<void> {
     this.stopped = true;
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
     }
     this.nextRunAt = null;
+    for (const controller of this.snapshots.keys()) {
+      controller.abort(new Error('Backup manager stopped'));
+    }
+    // A restart must not leave a child still writing a partial that the new
+    // manager can remove as crash debris. Wait for exit and partial cleanup.
+    await Promise.allSettled(this.snapshots.values());
   }
 
   /**
@@ -139,11 +154,28 @@ export class BackupManager {
    * connection, made standalone and quick_check-verified. Throws when no
    * verified snapshot could be produced, and leaves no partial file behind.
    */
-  async createSnapshot(): Promise<BackupSnapshotResult> {
-    const dbSize = statSync(this.dbPath).size;
-    this.assertDiskSpace(dbSize);
+  createSnapshot(): Promise<BackupSnapshotResult> {
+    if (this.stopped) return Promise.reject(new Error('Backup manager stopped'));
+    const controller = new AbortController();
+    const task = this.createOwnedSnapshot(controller.signal);
+    this.snapshots.set(controller, task);
+    const release = () => { this.snapshots.delete(controller); };
+    void task.then(release, release);
+    return task;
+  }
 
+  private async createOwnedSnapshot(signal: AbortSignal): Promise<BackupSnapshotResult> {
+    // Committed pages can still live only in the WAL. Counting just the main
+    // file substantially underestimates a snapshot until the next checkpoint.
+    let sourceBytes = statSync(this.dbPath).size;
+    try {
+      sourceBytes += statSync(`${this.dbPath}-wal`).size;
+    } catch (error: unknown) {
+      // A non-WAL database, or a concurrent checkpoint, has no sidecar.
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
     mkdirSync(this.backupsDir, { recursive: true });
+    this.assertDiskSpace(sourceBytes);
     const createdAt = this.now();
     const ts = new Date(createdAt).toISOString().replace(/[:.]/g, '-');
     const backupPath = join(this.backupsDir, `claude-mem-${ts}.db`);
@@ -154,11 +186,12 @@ export class BackupManager {
     const partialPath = `${backupPath}.partial`;
     this.removePartialSnapshots();
     try {
-      await runSqliteFileJob({ kind: 'snapshot', source: this.dbPath, target: partialPath });
+      await runSqliteFileJob({ kind: 'snapshot', source: this.dbPath, target: partialPath }, signal);
+      signal.throwIfAborted();
       renameSync(partialPath, backupPath);
     } catch (err: unknown) {
       const error = err instanceof Error ? err : new Error(String(err));
-      for (const leftover of [partialPath, `${partialPath}-wal`, `${partialPath}-shm`]) {
+      for (const leftover of [partialPath, `${partialPath}-wal`, `${partialPath}-shm`, `${partialPath}-journal`]) {
         if (existsSync(leftover)) unlinkSync(leftover);
       }
       logger.error('BACKUP', 'Snapshot failed; no snapshot was kept', { backupPath }, error);
@@ -166,7 +199,7 @@ export class BackupManager {
     }
 
     const bytes = statSync(backupPath).size;
-    logger.info('BACKUP', 'Snapshot created', { backupPath, dbSize, bytes });
+    logger.info('BACKUP', 'Snapshot created', { backupPath, sourceBytes, bytes });
     this.lastError = null;
     return { path: backupPath, bytes, createdAt };
   }
@@ -174,9 +207,13 @@ export class BackupManager {
   /**
    * Keep the retainCount most-recent snapshots; delete the rest. Sanitized
    * ISO filenames sort lexicographically, so name order is timestamp order.
+   * The snapshot just completed takes the first slot even if the clock moved
+   * backward; a successful run must not prune the data it has just saved.
    */
-  async applyRetention(): Promise<void> {
+  async applyRetention(completedSnapshot?: string): Promise<void> {
     const names = listSnapshotNames(this.backupsDir);
+    const completedIndex = completedSnapshot ? names.indexOf(basename(completedSnapshot)) : -1;
+    if (completedIndex > 0) names.unshift(...names.splice(completedIndex, 1));
     const pending = readPendingRestore()?.snapshot;
     const excess = names.slice(this.retainCount).filter(name => name !== pending);
     for (const name of excess) {
@@ -197,15 +234,22 @@ export class BackupManager {
   /**
    * One snapshot + retention cycle on demand (POST /api/backup/run).
    * Single-flight: returns `null` without doing anything when a cycle is
-   * already in progress (the route maps that to 409). Failures are recorded
-   * in lastError and rethrown so the caller can surface them.
+   * already in progress (the route maps that to 409). A snapshot failure is
+   * thrown. A later retention failure accompanies the completed snapshot.
    */
-  async runNow(): Promise<BackupSnapshotResult | null> {
+  async runNow(): Promise<BackupRunResult | null> {
     if (this.running) return null;
     this.running = true;
     try {
       const result = await this.createSnapshot();
-      await this.applyRetention();
+      try {
+        await this.applyRetention(result.path);
+      } catch (error) {
+        const normalized = error instanceof Error ? error : new Error(String(error));
+        this.lastError = normalized.message;
+        logger.error('BACKUP', 'Snapshot saved but retention failed', { backupPath: result.path }, normalized);
+        return { ...result, retentionError: normalized.message };
+      }
       return result;
     } catch (error) {
       const normalized = error instanceof Error ? error : new Error(String(error));
@@ -233,13 +277,24 @@ export class BackupManager {
   private schedule(delayMs: number): void {
     if (this.stopped) return;
     if (this.timer) clearTimeout(this.timer);
+    const dueAt = this.now() + delayMs;
+    this.nextRunAt = dueAt;
+    this.armTimer(dueAt);
+  }
+
+  private armTimer(dueAt: number): void {
+    const delayMs = Math.max(0, dueAt - this.now());
+    const wait = Math.min(delayMs, MAX_TIMER_DELAY_MS);
     const timer = setTimeout(() => {
       this.timer = null;
+      if (delayMs > wait) {
+        this.armTimer(dueAt);
+        return;
+      }
       void this.tick();
-    }, delayMs);
+    }, wait);
     (timer as { unref?: () => void }).unref?.(); // never hold the process open
     this.timer = timer;
-    this.nextRunAt = this.now() + delayMs;
   }
 
   private async tick(): Promise<void> {
@@ -251,15 +306,16 @@ export class BackupManager {
 
   /**
    * Disk pre-flight copied from CleanupV12_4_3: refuse to snapshot when free
-   * space is credibly below 1.2x the DB size + 100 MiB (VACUUM INTO writes a
+   * destination space is credibly below 1.2x the DB plus WAL size + 100 MiB
+   * (VACUUM INTO writes a
    * full copy, plus headroom so a snapshot never fills the disk the live DB
    * needs). statfs failures and non-credible readings (Bun <= 1.3.14
    * darwin-x64 returns a misaligned struct with bsize = 0,
    * https://github.com/oven-sh/bun/issues/31133) skip the gate rather than
    * block: a real out-of-space condition still surfaces from the write.
    */
-  private assertDiskSpace(dbSize: number): void {
-    const required = Math.ceil(dbSize * 1.2) + 100 * 1024 * 1024;
+  private assertDiskSpace(sourceBytes: number): void {
+    const required = Math.ceil(sourceBytes * 1.2) + 100 * 1024 * 1024;
 
     let fsStats: ReturnType<typeof statfsSync> | undefined;
     try {

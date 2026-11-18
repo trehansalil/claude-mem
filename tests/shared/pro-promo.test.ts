@@ -22,6 +22,10 @@ describe('pro trial promo copy', () => {
     expect(proTrialLine('welcome-hint')).toContain('https://cmem.ai/pro?from=welcome-hint');
   });
 
+  it('trims a plan before checking trial eligibility', () => {
+    expect(proTrialLine('context-banner', ' trial ')).toBe('');
+  });
+
   it('keeps the viewer mirror in sync with the Node-side copy', () => {
     expect(viewerPromo.PRO_TRIAL_MAX_DAYS).toBe(PRO_TRIAL_MAX_DAYS);
     expect(viewerPromo.PRO_TRIAL_LABEL).toBe(PRO_TRIAL_LABEL);

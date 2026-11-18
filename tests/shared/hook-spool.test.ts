@@ -1,33 +1,21 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from 'bun:test';
-import * as fs from 'fs';
+import * as fs from 'fs/promises';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, unlinkSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { basename, join } from 'path';
 import {
   HookSpool,
-  type HookSpoolConsumedMarkers,
   HOOK_SPOOL_RETRY_WINDOW_MS,
   migrateLegacySessionEndReplay,
   resolveHookSpoolDirectory,
   resolveLegacySessionEndReplayDirectory,
+  retainOldestEntries,
 } from '../../src/shared/hook-spool.js';
 import { logger } from '../../src/utils/logger.js';
 
 let dataDir: string;
 let savedDataDir: string | undefined;
 let loggerSpies: Array<ReturnType<typeof spyOn>> = [];
-
-function observation(toolUseId: string | undefined, toolName = 'Bash') {
-  return {
-    contentSessionId: 'session-1',
-    platformSource: 'claude',
-    toolName,
-    toolInput: { command: 'ls' },
-    toolResponse: { stdout: 'a' },
-    cwd: '/repo',
-    toolUseId,
-  };
-}
 
 function spoolFiles(spool: HookSpool): string[] {
   return readdirSync(spool.directory).filter(name => name.endsWith('.json'));
@@ -57,103 +45,126 @@ describe('HookSpool', () => {
     const spool = new HookSpool();
     expect(spool.directory).toBe(join(dataDir, 'state', 'hook-spool'));
     expect(resolveHookSpoolDirectory()).toBe(spool.directory);
-    spool.enqueue('observation', observation('toolu_1'));
+    spool.enqueue('session_end', { contentSessionId: 'session-1', platformSource: 'claude' });
     expect(spoolFiles(spool)).toHaveLength(1);
-    expect(spoolFiles(spool)[0]).toMatch(/^observation-[a-f0-9]{64}-toolu_1\.json$/);
-  });
-
-  it('retains identical host tool ids from different sessions and platforms', async () => {
-    const spool = new HookSpool();
-    const first = observation('call_1');
-    spool.enqueue('observation', first);
-    spool.enqueue('observation', { ...first, contentSessionId: 'session-2' });
-    spool.enqueue('observation', { ...first, platformSource: 'codex' });
-    // A repeat within the original scope replaces that event only.
-    spool.enqueue('observation', { ...first, platformSource: 'Claude Code', toolResponse: 'updated' });
-    expect(spoolFiles(spool)).toHaveLength(3);
-    const received: string[] = [];
-    await spool.drain(entry => {
-      received.push(`${entry.payload.contentSessionId}:${entry.payload.platformSource}`);
-      return true;
-    });
-    expect(received.sort()).toEqual(['session-1:claude', 'session-1:codex', 'session-2:claude']);
-  });
-
-  it('keeps an existing legacy handoff marker authoritative during upgrade', async () => {
-    const spool = new HookSpool();
-    mkdirSync(spool.directory, { recursive: true });
-    const legacyPath = join(spool.directory, 'observation-call_1.json');
-    writeFileSync(legacyPath, JSON.stringify({ kind: 'observation', payload: observation('call_1'), enqueuedAtEpochMs: Date.now() }));
-    const consumed = new Set(['observation-call_1']);
-    const markers: HookSpoolConsumedMarkers = {
-      isConsumed: key => consumed.has(key),
-      markConsumed: key => { consumed.add(key); },
-      clearConsumed: key => { consumed.delete(key); },
-      pruneConsumedBefore: () => {},
-    };
-    expect(spool.enqueue('observation', observation('call_1'))).toBe(legacyPath);
-    spool.enqueue('observation', { ...observation('call_1'), contentSessionId: 'other-session' });
-    const received: string[] = [];
-    await spool.drain(entry => { received.push(entry.payload.contentSessionId); return true; }, markers);
-    expect(received).toEqual(['other-session']);
-    expect(spoolFiles(spool)).toEqual([]);
-    expect(consumed.size).toBe(0);
   });
 
   it('drains in enqueue order, across kinds', async () => {
     const spool = new HookSpool();
-    spool.enqueue('observation', observation('toolu_b'), 3000);
-    spool.enqueue('observation', observation('toolu_a'), 1000);
-    spool.enqueue('summarize', { contentSessionId: 'session-1', platformSource: 'claude', lastAssistantMessage: 'done' }, 5000);
-    spool.enqueue('session_end', { contentSessionId: 'session-1', platformSource: 'claude' }, 6000);
+    spool.enqueue('session_end', { contentSessionId: 'session-b', platformSource: 'claude' }, 3000);
+    spool.enqueue('session_end', { contentSessionId: 'session-a', platformSource: 'claude' }, 1000);
+    spool.enqueue('subagent_stop', { contentSessionId: 'session-c', platformSource: 'claude', agentId: 'agent-1' }, 5000);
+    spool.enqueue('session_end', { contentSessionId: 'session-d', platformSource: 'claude' }, 6000);
 
     const seen: string[] = [];
     const result = await spool.drain(entry => {
-      seen.push(entry.kind === 'observation' ? `observation:${entry.payload.toolUseId}` : entry.kind);
+      seen.push(`${entry.kind}:${entry.payload.contentSessionId}`);
       return true;
     });
 
-    expect(seen).toEqual(['observation:toolu_a', 'observation:toolu_b', 'summarize', 'session_end']);
+    expect(seen).toEqual(['session_end:session-a', 'session_end:session-b', 'subagent_stop:session-c', 'session_end:session-d']);
     expect(result).toEqual({ drained: 4, retained: 0, quarantined: 0, expired: 0 });
     expect(spoolFiles(spool)).toEqual([]);
   });
 
-  it('keeps same-millisecond enqueues from one process in call order', () => {
-    const spool = new HookSpool();
-    spool.enqueue('observation', observation('toolu_z'));
-    spool.enqueue('observation', observation('toolu_y'));
-    spool.enqueue('observation', observation('toolu_x'));
-    expect(spool.entries().map(entry => (entry.payload as { toolUseId?: string }).toolUseId))
-      .toEqual(['toolu_z', 'toolu_y', 'toolu_x']);
+  it('retainOldestEntries keeps the oldest entries and counts the dropped ones', () => {
+    const files = [
+      { filename: 'b-2.json', path: '', entry: { enqueuedAtEpochMs: 20 } },
+      { filename: 'a-1.json', path: '', entry: { enqueuedAtEpochMs: 10 } },
+      { filename: 'c-3.json', path: '', entry: { enqueuedAtEpochMs: 30 } },
+      { filename: 'd-3.json', path: '', entry: { enqueuedAtEpochMs: 30 } },
+    ] as unknown as Parameters<typeof retainOldestEntries>[0];
+
+    expect(retainOldestEntries(files, 3)).toBe(1);
+    expect(files.map(file => file.filename)).toEqual(['a-1.json', 'b-2.json', 'c-3.json']);
   });
 
-  it('dedupes a re-enqueued event by overwriting its file and keeping its original position', () => {
+  it('drains only the oldest maxEntries and reports the rest as retained', async () => {
     const spool = new HookSpool();
-    spool.enqueue('observation', observation('toolu_dup'), 10_000);
-    spool.enqueue('observation', observation('toolu_later'), 20_000);
-    spool.enqueue('observation', observation('toolu_dup'), 30_000);
+    for (let index = 0; index < 40; index++) {
+      spool.enqueue('session_end', { contentSessionId: `session-${index}`, platformSource: 'claude' }, 1000 + index);
+    }
+
+    const seen: string[] = [];
+    const result = await spool.drain(entry => {
+      seen.push(entry.payload.contentSessionId);
+      return true;
+    }, undefined, { maxEntries: 2 });
+
+    expect(seen).toEqual(['session-0', 'session-1']);
+    expect(result).toEqual({ drained: 2, retained: 38, quarantined: 0, expired: 0 });
+  });
+
+  it('reads a backlog in parallel batches of at most 64 files, and no more than maxEntries', async () => {
+    const spool = new HookSpool();
+    for (let index = 0; index < 200; index++) {
+      spool.enqueue('session_end', { contentSessionId: `session-${index}`, platformSource: 'claude' }, 1000 + index);
+    }
+    const realReadFile = fs.readFile;
+    let inFlight = 0;
+    let peakInFlight = 0;
+    const readSpy = spyOn(fs, 'readFile').mockImplementation((async (...args: Parameters<typeof realReadFile>) => {
+      inFlight++;
+      peakInFlight = Math.max(peakInFlight, inFlight);
+      try {
+        await new Promise(resolve => setTimeout(resolve, 1));
+        return await realReadFile(...args);
+      } finally {
+        inFlight--;
+      }
+    }) as typeof realReadFile);
+
+    try {
+      const bounded = await spool.drain(() => true, undefined, { maxEntries: 16 });
+      expect(bounded).toEqual({ drained: 16, retained: 184, quarantined: 0, expired: 0 });
+      expect(peakInFlight).toBeGreaterThan(1);
+      expect(peakInFlight).toBeLessThanOrEqual(16);
+
+      peakInFlight = 0;
+      const unbounded = await spool.drain(() => true);
+      expect(unbounded).toEqual({ drained: 184, retained: 0, quarantined: 0, expired: 0 });
+      expect(peakInFlight).toBeGreaterThan(16);
+      expect(peakInFlight).toBeLessThanOrEqual(64);
+    } finally {
+      readSpy.mockRestore();
+    }
+  });
+
+  it('keeps same-millisecond enqueues from one process in call order', async () => {
+    const spool = new HookSpool();
+    for (const contentSessionId of ['session-z', 'session-y', 'session-x']) {
+      spool.enqueue('session_end', { contentSessionId, platformSource: 'claude' });
+    }
+    expect((await spool.entries()).map(entry => entry.payload.contentSessionId))
+      .toEqual(['session-z', 'session-y', 'session-x']);
+  });
+
+  it('dedupes a re-enqueued event by overwriting its file and keeping its original position', async () => {
+    const spool = new HookSpool();
+    const first = { contentSessionId: 'session-first', platformSource: 'claude' };
+    const path = spool.enqueue('session_end', first, 10_000);
+    spool.enqueue('session_end', { ...first, contentSessionId: 'session-later' }, 20_000);
+    expect(spool.enqueue('session_end', first, 30_000)).toBe(path);
 
     expect(spoolFiles(spool)).toHaveLength(2);
-    expect(spoolFiles(spool).filter(name => name.endsWith('-toolu_dup.json'))).toHaveLength(1);
-    expect(spoolFiles(spool).filter(name => name.endsWith('-toolu_later.json'))).toHaveLength(1);
-    expect(spool.entries().map(entry => (entry.payload as { toolUseId?: string }).toolUseId))
-      .toEqual(['toolu_dup', 'toolu_later']);
+    expect((await spool.entries()).map(entry => [entry.payload.contentSessionId, entry.enqueuedAtEpochMs]))
+      .toEqual([['session-first', 10_000], ['session-later', 20_000]]);
   });
 
-  it('dedupes events without a tool_use_id by a hash of kind + session + canonical payload', () => {
+  it('dedupes events by a hash of kind + session + canonical payload', () => {
     const spool = new HookSpool();
-    const summarize = { contentSessionId: 's', platformSource: 'Claude Code', lastAssistantMessage: 'hi', observedModel: 'm' };
-    spool.enqueue('summarize', summarize);
+    const stopped = { contentSessionId: 's', platformSource: 'Claude Code', agentId: 'agent-1' };
+    spool.enqueue('subagent_stop', stopped);
     // Same content, different key order and platform spelling → same file.
-    spool.enqueue('summarize', { observedModel: 'm', lastAssistantMessage: 'hi', platformSource: 'claude', contentSessionId: 's' });
+    spool.enqueue('subagent_stop', { agentId: 'agent-1', platformSource: 'claude', contentSessionId: 's' });
     expect(spoolFiles(spool)).toHaveLength(1);
-    expect(spoolFiles(spool)[0]).toMatch(/^summarize-[a-f0-9]{64}\.json$/);
+    expect(spoolFiles(spool)[0]).toMatch(/^subagent_stop-[a-f0-9]{64}\.json$/);
 
-    spool.enqueue('summarize', { ...summarize, lastAssistantMessage: 'different turn' });
+    spool.enqueue('subagent_stop', { ...stopped, agentId: 'agent-2' });
     expect(spoolFiles(spool)).toHaveLength(2);
 
-    // Different session, same text → distinct entries.
-    spool.enqueue('summarize', { ...summarize, contentSessionId: 'other' });
+    // Different session, same agent → distinct entries.
+    spool.enqueue('subagent_stop', { ...stopped, contentSessionId: 'other' });
     expect(spoolFiles(spool)).toHaveLength(3);
   });
 
@@ -170,14 +181,14 @@ describe('HookSpool', () => {
     });
 
     expect(result).toEqual({ drained: 1, retained: 2, quarantined: 0, expired: 0 });
-    expect(spool.entries().map(entry => entry.payload.contentSessionId)).toEqual(['unknown', 'throws']);
+    expect((await spool.entries()).map(entry => entry.payload.contentSessionId)).toEqual(['unknown', 'throws']);
   });
 
   it('moves a declined or failing entry past the retry window to expired/ with an error log, never deleting it', async () => {
     const spool = new HookSpool();
     const pastWindowEpochMs = Date.now() - HOOK_SPOOL_RETRY_WINDOW_MS - 60_000;
     const declinedPath = spool.enqueue('session_end', { contentSessionId: 'never-known', platformSource: 'claude' }, pastWindowEpochMs);
-    const failingPath = spool.enqueue('summarize', { contentSessionId: 'always-throws', platformSource: 'claude', lastAssistantMessage: 'x' }, pastWindowEpochMs + 1);
+    const failingPath = spool.enqueue('subagent_stop', { contentSessionId: 'always-throws', platformSource: 'claude', agentId: 'agent-1' }, pastWindowEpochMs + 1);
     // Inside the window: still retried.
     spool.enqueue('session_end', { contentSessionId: 'recent-unknown', platformSource: 'claude' }, Date.now() - 60_000);
 
@@ -187,19 +198,19 @@ describe('HookSpool', () => {
     });
 
     expect(result).toEqual({ drained: 0, retained: 1, quarantined: 0, expired: 2 });
-    expect(spool.entries().map(entry => entry.payload.contentSessionId)).toEqual(['recent-unknown']);
+    expect((await spool.entries()).map(entry => entry.payload.contentSessionId)).toEqual(['recent-unknown']);
     expect(readdirSync(spool.expiredDirectory).sort()).toEqual([basename(declinedPath), basename(failingPath)].sort());
 
     const expiryLogs = loggerSpies[3].mock.calls.filter(call => String(call[1]).includes('retry window'));
     expect(expiryLogs).toHaveLength(2);
     expect(expiryLogs[0][2]).toMatchObject({ kind: 'session_end', contentSessionId: 'never-known' });
     expect(expiryLogs[0][2].ageHours).toBeGreaterThanOrEqual(7 * 24);
-    expect(expiryLogs[1][2]).toMatchObject({ kind: 'summarize', contentSessionId: 'always-throws' });
+    expect(expiryLogs[1][2]).toMatchObject({ kind: 'subagent_stop', contentSessionId: 'always-throws' });
   });
 
   it('quarantines a corrupt file into corrupt/ with an error log instead of deleting it', async () => {
     const spool = new HookSpool();
-    spool.enqueue('observation', observation('toolu_ok'));
+    spool.enqueue('session_end', { contentSessionId: 'session-ok', platformSource: 'claude' });
     writeFileSync(join(spool.directory, 'observation-garbage.json'), '{not json');
     writeFileSync(join(spool.directory, 'mystery-kind.json'), JSON.stringify({ kind: 'mystery', payload: { contentSessionId: 's' }, enqueuedAtEpochMs: 1 }));
     // An interrupted atomic write's temp file is not an entry and is left alone.
@@ -211,7 +222,7 @@ describe('HookSpool', () => {
       return true;
     });
 
-    expect(accepted).toEqual(['observation']);
+    expect(accepted).toEqual(['session_end']);
     expect(result).toEqual({ drained: 1, retained: 0, quarantined: 2, expired: 0 });
     expect(readdirSync(spool.corruptDirectory).sort()).toEqual(['mystery-kind.json', 'observation-garbage.json']);
     expect(existsSync(join(spool.directory, '.observation-x.json.123.abc.tmp'))).toBe(true);
@@ -238,7 +249,7 @@ describe('HookSpool', () => {
     const spool = new HookSpool();
     mkdirSync(spool.directory, { recursive: true });
     writeFileSync(join(spool.directory, 'mystery-kind.json'), JSON.stringify({ kind: 'mystery', payload: { contentSessionId: 's' }, enqueuedAtEpochMs: 1 }));
-    const renameSpy = spyOn(fs, 'renameSync').mockImplementation(() => {
+    const renameSpy = spyOn(fs, 'rename').mockImplementation(() => {
       throw Object.assign(new Error('ENOENT: no such file or directory'), { code: 'ENOENT' });
     });
 
@@ -249,6 +260,79 @@ describe('HookSpool', () => {
       renameSpy.mockRestore();
     }
     expect(loggerSpies[3]).not.toHaveBeenCalled();
+  });
+
+  it('warns once per file, without an error log, when a locked corrupt file cannot be quarantined', async () => {
+    const spool = new HookSpool();
+    mkdirSync(spool.directory, { recursive: true });
+    const lockedPath = join(spool.directory, 'mystery-kind.json');
+    writeFileSync(lockedPath, JSON.stringify({ kind: 'mystery', payload: { contentSessionId: 's' }, enqueuedAtEpochMs: 1 }));
+    const realRename = fs.rename;
+    let locked = true;
+    const renameSpy = spyOn(fs, 'rename').mockImplementation(async (from, to) => {
+      if (locked) throw Object.assign(new Error('EPERM: operation not permitted, rename'), { code: 'EPERM' });
+      return realRename(from, to);
+    });
+
+    try {
+      for (let pass = 0; pass < 3; pass++) {
+        expect(await spool.drain(() => true)).toEqual({ drained: 0, retained: 0, quarantined: 0, expired: 0 });
+      }
+      expect(existsSync(lockedPath)).toBe(true);
+      expect(loggerSpies[3]).not.toHaveBeenCalled();
+      const lockedWarnings = loggerSpies[2].mock.calls.filter(call => String(call[1]).includes('is locked'));
+      expect(lockedWarnings).toHaveLength(1);
+      expect(lockedWarnings[0][2]).toMatchObject({ file: 'mystery-kind.json', reason: 'unknown kind "mystery"' });
+
+      locked = false;
+      expect(await spool.drain(() => true)).toEqual({ drained: 0, retained: 0, quarantined: 1, expired: 0 });
+      expect(readdirSync(spool.corruptDirectory)).toEqual(['mystery-kind.json']);
+    } finally {
+      renameSpy.mockRestore();
+    }
+  });
+
+  it('warns again for a locked corrupt file that left the spool and came back', async () => {
+    const spool = new HookSpool();
+    mkdirSync(spool.directory, { recursive: true });
+    const lockedPath = join(spool.directory, 'mystery-kind.json');
+    const corruptEntry = JSON.stringify({ kind: 'mystery', payload: { contentSessionId: 's' }, enqueuedAtEpochMs: 1 });
+    writeFileSync(lockedPath, corruptEntry);
+    const renameSpy = spyOn(fs, 'rename').mockImplementation(async () => {
+      throw Object.assign(new Error('EBUSY: resource busy or locked, rename'), { code: 'EBUSY' });
+    });
+    const lockedWarnings = () => loggerSpies[2].mock.calls.filter(call => String(call[1]).includes('is locked'));
+
+    try {
+      await spool.drain(() => true);
+      expect(lockedWarnings()).toHaveLength(1);
+
+      unlinkSync(lockedPath);
+      await spool.drain(() => true);
+
+      writeFileSync(lockedPath, corruptEntry);
+      await spool.drain(() => true);
+      expect(lockedWarnings()).toHaveLength(2);
+    } finally {
+      renameSpy.mockRestore();
+    }
+  });
+
+  it('still reports a quarantine failure that is not a lock with an error log', async () => {
+    const spool = new HookSpool();
+    mkdirSync(spool.directory, { recursive: true });
+    writeFileSync(join(spool.directory, 'mystery-kind.json'), JSON.stringify({ kind: 'mystery', payload: { contentSessionId: 's' }, enqueuedAtEpochMs: 1 }));
+    const renameSpy = spyOn(fs, 'rename').mockImplementation(async () => {
+      throw Object.assign(new Error('EROFS: read-only file system, rename'), { code: 'EROFS' });
+    });
+
+    try {
+      await spool.drain(() => true);
+    } finally {
+      renameSpy.mockRestore();
+    }
+    expect(loggerSpies[3]).toHaveBeenCalledTimes(1);
+    expect(loggerSpies[3].mock.calls[0][1]).toBe('Corrupt hook spool entry could not be quarantined; leaving it in place');
   });
 });
 
@@ -267,7 +351,7 @@ describe('migrateLegacySessionEndReplay', () => {
     expect(migrateLegacySessionEndReplay(spool)).toBe(1);
 
     expect(existsSync(legacyDirectory)).toBe(false);
-    expect(spool.entries()).toEqual([{
+    expect(await spool.entries()).toEqual([{
       kind: 'session_end',
       payload: { contentSessionId: 'legacy-session', platformSource: 'cursor' },
       enqueuedAtEpochMs: 1234,
