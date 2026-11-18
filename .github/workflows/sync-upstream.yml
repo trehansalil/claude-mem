@@ -8,6 +8,7 @@ on:
 permissions:
   contents: write
   actions: write
+  packages: read
 
 jobs:
   sync:
@@ -28,42 +29,48 @@ jobs:
           git merge upstream/main --ff-only || echo "Cannot fast-forward main, skipping branch sync"
           git push origin main --tags || echo "Push failed, may need manual resolution"
 
-      - name: Check for new tags
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check for unbuilt tags
         id: new_tags
         run: |
-          git fetch origin --tags
-          git fetch upstream --tags
+          git fetch upstream --tags --force
 
-          # Find tags in upstream that don't exist in origin
-          NEW_TAGS=""
+          # Tags can't be pushed to the fork (GITHUB_TOKEN lacks `workflows`),
+          # so "missing from origin" is meaningless. A tag needs a build iff
+          # its image is not already in GHCR. Build only the newest such tag
+          # to avoid racing on :latest.
+          LATEST=""
           for tag in $(git tag -l 'v*' --sort=-v:refname | head -5); do
-            if ! git ls-remote --tags origin "$tag" | grep -q "$tag"; then
-              NEW_TAGS="$tag $NEW_TAGS"
+            if ! docker buildx imagetools inspect "ghcr.io/trehansalil/claude-mem:${tag#v}" >/dev/null 2>&1; then
+              LATEST="$tag"
+              break
             fi
           done
 
-          if [ -n "$NEW_TAGS" ]; then
-            echo "new_tags=$NEW_TAGS" >> "$GITHUB_OUTPUT"
-            LATEST=$(echo "$NEW_TAGS" | tr ' ' '\n' | sort -V | tail -1)
+          if [ -n "$LATEST" ]; then
             echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
-            echo "Found new tags: $NEW_TAGS"
+            echo "Unbuilt tag: $LATEST"
           else
-            echo "No new tags found"
+            echo "All recent tags already built"
           fi
 
-      - name: Trigger Docker build for new tags
+      - name: Trigger Docker build for newest unbuilt tag
         if: steps.new_tags.outputs.latest != ''
         uses: actions/github-script@v7
         with:
           script: |
-            const tags = '${{ steps.new_tags.outputs.new_tags }}'.trim().split(/\s+/).filter(Boolean);
-            for (const tag of tags) {
-              console.log(`Triggering Docker build for ${tag}`);
-              await github.rest.actions.createWorkflowDispatch({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                workflow_id: 'docker-build.yml',
-                ref: 'main',
-                inputs: { version: tag }
-              });
-            }
+            const tag = '${{ steps.new_tags.outputs.latest }}';
+            console.log(`Triggering Docker build for ${tag}`);
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'docker-build.yml',
+              ref: 'main',
+              inputs: { version: tag }
+            });
