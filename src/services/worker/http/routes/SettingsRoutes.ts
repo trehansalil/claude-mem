@@ -18,6 +18,7 @@ import { parseContextCountValue } from '../../../../shared/context-count.js';
 import { OPENROUTER_REASONING_EFFORTS, parseOpenRouterReasoningEffort } from '../../OpenRouterProvider.js';
 import { parseOpenAICompatReasoning } from '../../reasoning-budget.js';
 import { parseProviderBySource } from '../../../../shared/provider-by-source.js';
+import { QUOTA_FALLBACK_OPTIONS } from '../../../../ui/provider-options.js';
 import { CODEX_REASONING_EFFORTS, isCodexReasoningEffort } from '../../CodexProvider.js';
 import { emitContextInvalidation, noteUserSettingsSaved } from '../../../../shared/context-invalidation.js';
 import { WORK_VIEW_AGENT_CHOICES } from '../../../work-view/refresh-task.js';
@@ -342,6 +343,7 @@ export class SettingsRoutes extends BaseRouteHandler {
       'CLAUDE_MEM_WORK_VIEW_CLAUDE_MODEL',
       'CLAUDE_MEM_WORK_VIEW_CODEX_MODEL',
       'CLAUDE_MEM_WORK_VIEW_GEMINI_MODEL',
+      'CLAUDE_MEM_WORK_VIEW_OPENCODE_MODEL',
       'CLAUDE_MEM_WORK_VIEW_API_MODEL',
       'CLAUDE_MEM_CORPUS_AGENT',
       'CLAUDE_MEM_LOG_LEVEL',
@@ -465,10 +467,8 @@ export class SettingsRoutes extends BaseRouteHandler {
 
     // Empty is valid: it means the default, the Anthropic plan. 'off' turns it off.
     if (settings.CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER) {
-      // The names provider-dispatch's QUOTA_FALLBACK_PROVIDERS accepts, plus QUOTA_FALLBACK_OFF.
-      const validFallbacks = ['claude', 'gemini', 'openrouter', 'openai-compatible', 'off'];
-      if (!validFallbacks.includes(settings.CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER)) {
-        return { valid: false, error: 'CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER must be "claude" (or empty, the default), "gemini", "openrouter", "openai-compatible", or "off"' };
+      if (!(QUOTA_FALLBACK_OPTIONS as readonly string[]).includes(settings.CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER)) {
+        return { valid: false, error: 'CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER must be empty (default) or one of: ' + QUOTA_FALLBACK_OPTIONS.join(', ') };
       }
     }
 
@@ -653,7 +653,7 @@ export class SettingsRoutes extends BaseRouteHandler {
 
     if (settings.CLAUDE_MEM_WORK_VIEW_AGENT !== undefined
       && !(WORK_VIEW_AGENT_CHOICES as readonly string[]).includes(settings.CLAUDE_MEM_WORK_VIEW_AGENT)) {
-      return { valid: false, error: 'CLAUDE_MEM_WORK_VIEW_AGENT must be empty (follow CLAUDE_MEM_PROVIDER), "claude-code", "codex", "gemini", "api", "off", or "all"' };
+      return { valid: false, error: 'CLAUDE_MEM_WORK_VIEW_AGENT must be empty (follow CLAUDE_MEM_PROVIDER), "claude-code", "codex", "gemini", "opencode", "api", "off", or "all"' };
     }
     if (settings.CLAUDE_MEM_CORPUS_AGENT !== undefined
       && !(CORPUS_AGENT_CHOICES as readonly string[]).includes(settings.CLAUDE_MEM_CORPUS_AGENT)) {
@@ -667,7 +667,7 @@ export class SettingsRoutes extends BaseRouteHandler {
       && (typeof settings.CLAUDE_MEM_WORK_VIEW_COPY_MODEL !== 'string' || settings.CLAUDE_MEM_WORK_VIEW_COPY_MODEL.length > 200)) {
       return { valid: false, error: 'CLAUDE_MEM_WORK_VIEW_COPY_MODEL must be a string of at most 200 characters' };
     }
-    for (const key of ['CLAUDE_MEM_WORK_VIEW_CLAUDE_MODEL', 'CLAUDE_MEM_WORK_VIEW_CODEX_MODEL', 'CLAUDE_MEM_WORK_VIEW_GEMINI_MODEL', 'CLAUDE_MEM_WORK_VIEW_API_MODEL'] as const) {
+    for (const key of ['CLAUDE_MEM_WORK_VIEW_CLAUDE_MODEL', 'CLAUDE_MEM_WORK_VIEW_CODEX_MODEL', 'CLAUDE_MEM_WORK_VIEW_GEMINI_MODEL', 'CLAUDE_MEM_WORK_VIEW_OPENCODE_MODEL', 'CLAUDE_MEM_WORK_VIEW_API_MODEL'] as const) {
       if (settings[key] !== undefined && (typeof settings[key] !== 'string' || settings[key].length > 200)) {
         return { valid: false, error: `${key} must be a string of at most 200 characters` };
       }
